@@ -17,7 +17,7 @@ from ssmrl.common.parser import parse_cfg
 from ssmrl.common.seed import set_seed
 from ssmrl.common.buffer import Buffer
 from ssmrl.envs import make_env
-from ssmrl.ssmrl import SSMRL
+from ssmrl.SSM_agent_v9 import SSMAgent
 from ssmrl.trainer.offline_trainer import OfflineTrainer
 from ssmrl.trainer.online_trainer import OnlineTrainer
 from ssmrl.common.logger import Logger
@@ -55,7 +55,7 @@ def train(cfg: dict):
     trainer = trainer_cls(
         cfg=cfg,
         env=make_env(cfg),
-        agent=TDMPC2(cfg),
+        agent=SSMAgent(cfg),
         buffer=Buffer(cfg),
         logger=Logger(cfg),
     )

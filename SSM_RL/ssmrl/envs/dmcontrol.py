@@ -11,7 +11,7 @@ from dm_control.suite.wrappers import action_scale
 from dm_env import StepType, specs
 import gymnasium as gym
 
-from tdmpc2.envs.tasks import cheetah, walker, hopper, reacher, ball_in_cup, pendulum, fish
+from ssmrl.envs.tasks import cheetah, walker, hopper, reacher, ball_in_cup, pendulum, fish
 
 
 class ExtendedTimeStep(NamedTuple):

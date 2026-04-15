@@ -6,7 +6,7 @@ import pandas as pd
 from termcolor import colored
 from omegaconf import OmegaConf
 
-from tdmpc2.common import TASK_SET
+from ssmrl.common import TASK_SET
 
 
 CONSOLE_FORMAT = [

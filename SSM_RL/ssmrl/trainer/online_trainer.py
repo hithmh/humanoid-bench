@@ -62,7 +62,7 @@ class OnlineTrainer(Trainer):
         td = TensorDict(
             dict(
                 obs=obs,
-                action=action.unsqueeze(0),
+                action=action[np.newaxis,:],
                 reward=reward.unsqueeze(0),
             ),
             batch_size=(1,),

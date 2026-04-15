@@ -343,24 +343,38 @@ class SSMAgent:
     # ------------------------------------------------------------------
     # Policy update (mirror SSMRL.update_pi)
     # ------------------------------------------------------------------
-    def update_pi(self, zs):
+    def update_pi(self, zs, A_diag, B_mat):
         """
         Update policy using a sequence of latent states.
 
+        The gradient path is:
+            zs (detached) → _pi(zs) → actions → model.next(zs, actions, A, B)
+            → z_next → Q_value(z_next)
+        so that the policy parameters receive gradients.
+
         Args:
-            zs: [T, batch, latent_dim]  (detached)
+            zs:     [T, batch, latent_dim]  (detached)
+            A_diag: [batch, latent_dim]     (detached)
+            B_mat:  [batch, latent_dim, act_dim] (detached)
         Returns:
             pi_loss (float)
         """
         self.pi_optim.zero_grad(set_to_none=True)
         self.model.track_critic_grad(False)
 
-        # Policy output
-        actions = self.model.pi(zs)  # [T, batch, act_dim]
-        # For each z, compute the critic value after taking the policy action
         T, B, _ = zs.shape
-        zs_flat = zs.reshape(T * B, -1)
-        vals = self.model.Q_value(zs_flat, target=False, return_type='max')
+
+        # Policy produces actions, then we forward through dynamics so that
+        # the gradient flows:  pi → action → next(z, action) → Q_value
+        actions = self.model.pi(zs)  # [T, B, act_dim]
+        z_next_list = []
+        for t in range(T):
+            z_next_t = self.model.next(zs[t], actions[t], A_diag, B_mat)
+            z_next_list.append(z_next_t)
+        z_next = torch.stack(z_next_list, dim=0)  # [T, B, D]
+
+        z_next_flat = z_next.reshape(T * B, -1)
+        vals = self.model.Q_value(z_next_flat, target=False, return_type='max')
         vals = vals.view(T, B, 1)
 
         self.scale.update(vals[0])
@@ -388,7 +402,7 @@ class SSMAgent:
     # TD target (mirror SSMRL._td_target)
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def _td_target(self, next_z, reward, done):
+    def _td_target(self, next_z, reward):
         """
         Compute TD target: r + gamma * (1 - done) * V(next_z).
 
@@ -403,7 +417,7 @@ class SSMAgent:
         z_flat = next_z.reshape(T * B, -1)
         next_val = self.model.Q_value(z_flat, target=True, return_type='max')
         next_val = next_val.view(T, B, 1)
-        return reward + self.discount * (1.0 - done) * next_val
+        return reward + self.discount * next_val
 
     # ------------------------------------------------------------------
     # Main update (mirror SSMRL.update)
@@ -422,19 +436,13 @@ class SSMAgent:
         # ---- Sample from buffer ----
         sample = buffer.sample()
         # Unpack – buffer may or may not include done
-        if len(sample) == 4:
-            obs, action, reward, _ = sample
-            done = torch.zeros_like(reward)
-        elif len(sample) == 5:
-            obs, action, reward, done, _ = sample
-        else:
-            obs, action, reward = sample[:3]
-            done = torch.zeros_like(reward)
+
+        obs, action, reward, _ = sample
 
         obs = obs.to(self.device)
         action = action.to(self.device)
         reward = reward.to(self.device)
-        done = done.to(self.device)
+
 
         # obs:    [horizon+1, batch, state_dim]
         # action: [horizon, batch, act_dim]
@@ -444,7 +452,7 @@ class SSMAgent:
         # ---- Compute targets (no grad) ----
         with torch.no_grad():
             next_mean, _ = self.model.encode(obs[1:])  # [H, B, D]
-            td_targets = self._td_target(next_mean, reward, done)
+            td_targets = self._td_target(next_mean, reward)
 
         # ---- Prepare for update ----
         self.model_optim.zero_grad(set_to_none=True)
@@ -532,7 +540,7 @@ class SSMAgent:
             )
         # Bellman: P(z) should match r(z) + gamma * (1-d) * P_target(z')
         r_pred_p = self.model.reward(z_for_p, Q_diag.detach(), q.detach())
-        p_target_val = r_pred_p + self.discount * (1.0 - done[0]) * self.model.Q_value(
+        p_target_val = r_pred_p + self.discount * self.model.Q_value(
             z_next_p, target=True, return_type='max'
         )
         p_pred_all = self.model.Q_value(z_for_p, target=False, return_type='all')
@@ -547,7 +555,7 @@ class SSMAgent:
         self.P_optim.step()
 
         # ---- Update policy ----
-        pi_loss = self.update_pi(zs.detach())
+        pi_loss = self.update_pi(zs.detach(), A_diag.detach(), B_mat.detach())
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()

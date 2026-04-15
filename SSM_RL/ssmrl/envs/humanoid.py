@@ -4,7 +4,7 @@ import sys
 import numpy as np
 import gymnasium as gym
 
-from tdmpc2.envs.wrappers.time_limit import TimeLimit
+from ssmrl.envs.wrappers.time_limit import TimeLimit
 
 
 class HumanoidWrapper(gym.Wrapper):
@@ -23,7 +23,7 @@ class HumanoidWrapper(gym.Wrapper):
         self.cfg = cfg
 
     def step(self, action):
-        obs, reward, done, truncated, info = self.env.step(action.copy())
+        obs, reward, done, truncated, info = self.env.step(action)
         obs = obs.astype(np.float32)
         return obs, reward, done, truncated, info
 

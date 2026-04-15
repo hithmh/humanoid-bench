@@ -68,6 +68,18 @@ vmin: -10
 vmax: +10
 
 
+# architecture
+model_size: ???
+num_enc_layers: 2
+enc_dim: 256
+num_channels: 32
+mlp_dim: 512
+latent_dim: 8
+task_dim: 96
+num_q: 5
+dropout: 0.01
+simnorm_dim: 8
+
 # logging
 wandb_project: humanoid-bench
 wandb_entity: robot-learning
