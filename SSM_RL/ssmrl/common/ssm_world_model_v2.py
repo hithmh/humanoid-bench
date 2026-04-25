@@ -150,9 +150,27 @@ class SSMWorldModel(nn.Module):
         self._q_net = _mlp(ctx_dim, encoder_hidden, latent_dim)
         self._b = nn.Parameter(torch.zeros(1))
 
-        # ---- Policy ----
-        self._pi = _mlp(latent_dim, policy_hidden, act_dim, output_act=nn.Tanh())
-        self._pi_target = deepcopy(self._pi).requires_grad_(False)
+        # ---- Policy (SAC-style stochastic: outputs mean + log_std) ----
+        log_std_min = getattr(cfg, 'log_std_min', -5)
+        log_std_max = getattr(cfg, 'log_std_max', 2)
+        self._log_std_min = log_std_min
+        self._log_std_max = log_std_max
+
+        # Shared trunk → mean head and log_std head
+        self._pi_trunk = _mlp(latent_dim, policy_hidden, policy_hidden[-1])
+        self._pi_mean_head = nn.Linear(policy_hidden[-1], act_dim)
+        self._pi_log_std_head = nn.Linear(policy_hidden[-1], act_dim)
+
+        # Bundle into a single module list for easy deepcopy / param access
+        self._pi = nn.ModuleList([self._pi_trunk, self._pi_mean_head, self._pi_log_std_head])
+
+        # Target copies (used by pi_target for Bellman backup)
+        self._pi_target_trunk = deepcopy(self._pi_trunk).requires_grad_(False)
+        self._pi_target_mean_head = deepcopy(self._pi_mean_head).requires_grad_(False)
+        self._pi_target_log_std_head = deepcopy(self._pi_log_std_head).requires_grad_(False)
+        self._pi_target = nn.ModuleList([
+            self._pi_target_trunk, self._pi_target_mean_head, self._pi_target_log_std_head
+        ])
 
         # ---- Ensemble P critics (quadratic value function) ----
         P_indices_init = torch.empty(num_ensembles, latent_dim)
@@ -184,7 +202,8 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     def train(self, mode=True):
         super().train(mode)
-        self._pi_target.train(False)
+        for m in self._pi_target:
+            m.train(False)
         return self
 
     # ------------------------------------------------------------------
@@ -273,18 +292,66 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     # Policy
     # ------------------------------------------------------------------
-    def pi(self, z, target=False):
+    def pi(self, z, target=False, deterministic=False, return_log_prob=False):
         """
-        Sample action from policy.
+        SAC-style stochastic policy.
+
+        Samples action via reparameterisation: a = tanh(mean + std * eps).
+        Log-probability accounts for the tanh squashing:
+            log π(a|z) = Σ [log N(u; mean, std) - log(1 - tanh²(u))]
 
         Args:
-            z: [batch, latent_dim]  or [T, batch, latent_dim]
-            target: use target policy network
+            z:               [..., latent_dim]
+            target:          use target network weights
+            deterministic:   if True, return tanh(mean) (eval / MPC use)
+            return_log_prob: if True, also return log π(a|z)
         Returns:
-            action: same leading dims, last dim = act_dim
+            action              [..., act_dim]           (always)
+            log_prob (optional) [..., 1]
         """
-        net = self._pi_target if target else self._pi
-        return net(z)
+        trunk       = self._pi_target[0] if target else self._pi_trunk
+        mean_head   = self._pi_target[1] if target else self._pi_mean_head
+        log_std_head = self._pi_target[2] if target else self._pi_log_std_head
+
+        h = trunk(z)
+        mean = mean_head(h)
+        log_std = log_std_head(h).clamp(self._log_std_min, self._log_std_max)
+        std = log_std.exp()
+
+        if deterministic:
+            action = torch.tanh(mean)
+            if return_log_prob:
+                # log-prob at the deterministic point
+                log_prob = self._gaussian_log_prob(mean, mean, std)
+                return action, log_prob
+            return action
+
+        # Reparameterised sample
+        eps = torch.randn_like(std)
+        u = mean + std * eps                  # pre-squash
+        action = torch.tanh(u)
+
+        if return_log_prob:
+            log_prob = self._gaussian_log_prob(u, mean, std)
+            return action, log_prob
+        return action
+
+    @staticmethod
+    def _gaussian_log_prob(u, mean, std):
+        """
+        Log prob of Gaussian with tanh squashing correction.
+            log π(a|z) = Σ [log N(u; μ, σ) - log(1 - tanh²(u))]
+        Returns: [..., 1]
+        """
+        log_prob_gaussian = (
+            -0.5 * ((u - mean) / std).pow(2)
+            - std.log()
+            - 0.5 * torch.tensor(2 * torch.pi).log().to(u.device)
+        )
+        # Tanh squashing correction (numerically stable)
+        log_det_jacobian = 2.0 * (torch.log(torch.tensor(2.0, device=u.device))
+                                  - u - F.softplus(-2.0 * u))
+        return (log_prob_gaussian - log_det_jacobian).sum(dim=-1, keepdim=True)
 
     # ------------------------------------------------------------------
     # Ensemble P-Critic (quadratic value)
@@ -349,5 +416,12 @@ class SSMWorldModel(nn.Module):
             self._P_indices_target.data.lerp_(self._P_indices.data, tau)
             self._p_target.data.lerp_(self._p.data, tau)
             self._pb_target.data.lerp_(self._pb.data, tau)
-            for p_tgt, p in zip(self._pi_target.parameters(), self._pi.parameters()):
-                p_tgt.data.lerp_(p.data, tau)
+            # Update all three policy heads
+            pi_pairs = [
+                (self._pi_target_trunk,        self._pi_trunk),
+                (self._pi_target_mean_head,    self._pi_mean_head),
+                (self._pi_target_log_std_head, self._pi_log_std_head),
+            ]
+            for tgt_mod, src_mod in pi_pairs:
+                for p_tgt, p in zip(tgt_mod.parameters(), src_mod.parameters()):
+                    p_tgt.data.lerp_(p.data, tau)

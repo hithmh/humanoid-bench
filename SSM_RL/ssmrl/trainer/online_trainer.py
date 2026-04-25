@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from tensordict.tensordict import TensorDict
 
-from tdmpc2.trainer.base import Trainer
+from ssmrl.trainer.base import Trainer
 
 
 class OnlineTrainer(Trainer):
@@ -29,6 +29,7 @@ class OnlineTrainer(Trainer):
         ep_rewards, ep_successes = [], []
         for i in range(self.cfg.eval_episodes):
             obs, done, ep_reward, t = self.env.reset()[0], False, 0, 0
+            self.agent.reset_for_control()
             if self.cfg.save_video:
                 self.logger.video.init(self.env, enabled=(i == 0))
             while not done:
@@ -62,7 +63,7 @@ class OnlineTrainer(Trainer):
         td = TensorDict(
             dict(
                 obs=obs,
-                action=action[np.newaxis,:],
+                action=action.unsqueeze(0),
                 reward=reward.unsqueeze(0),
             ),
             batch_size=(1,),
@@ -94,17 +95,21 @@ class OnlineTrainer(Trainer):
                     )
                     train_metrics.update(self.common_metrics())
 
+                    loss_keys = [k for k in train_metrics if 'loss' in k.lower()]
+                    loss_metrics = {k: train_metrics[k] for k in loss_keys}
                     results_metrics = {'return': train_metrics['episode_reward'],
                                        'episode_length': len(self._tds[1:]),
                                        'success': train_metrics['episode_success'],
                                        'success_subtasks': info['success_subtasks'],
-                                       'step': self._step,}
-                
+                                       'step': self._step,
+                                       **loss_metrics}
+
                     self.logger.log(train_metrics, "train")
                     self.logger.log(results_metrics, "results")
                     self._ep_idx = self.buffer.add(torch.cat(self._tds))
 
                 obs = self.env.reset()[0]
+                self.agent.reset_for_control()
                 self._tds = [self.to_td(obs)]
 
             # Collect experience
@@ -114,7 +119,9 @@ class OnlineTrainer(Trainer):
                 action = self.env.rand_act()
             obs, reward, done, truncated, info = self.env.step(action)
             done = done or truncated
-            self._tds.append(self.to_td(obs, action, reward))
+            ## transform action to tensor first
+            tensor_action = action if isinstance(action, torch.Tensor) else torch.from_numpy(action)
+            self._tds.append(self.to_td(obs, tensor_action, reward))
 
             # Update agent
             if self._step >= self.cfg.seed_steps:

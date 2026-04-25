@@ -17,7 +17,7 @@ from ssmrl.common.parser import parse_cfg
 from ssmrl.common.seed import set_seed
 from ssmrl.common.buffer import Buffer
 from ssmrl.envs import make_env
-from ssmrl.SSM_agent_v9 import SSMAgent
+# from ssmrl.SSM_agent_v9 import SSMAgent
 from ssmrl.trainer.offline_trainer import OfflineTrainer
 from ssmrl.trainer.online_trainer import OnlineTrainer
 from ssmrl.common.logger import Logger
@@ -50,6 +50,10 @@ def train(cfg: dict):
     cfg = parse_cfg(cfg)
     set_seed(cfg.seed)
     print(colored("Work dir:", "yellow", attrs=["bold"]), cfg.work_dir)
+    agent_name = cfg.agent_name
+    ## import SSM_agent from the python file specified by agent_name
+    agent_module = __import__(f"ssmrl.{agent_name}", fromlist=["SSMAgent"])
+    SSMAgent = getattr(agent_module, "SSMAgent")
 
     trainer_cls = OfflineTrainer if cfg.multitask else OnlineTrainer
     trainer = trainer_cls(

@@ -2,21 +2,23 @@ defaults:
     - override hydra/launcher: submitit_local
 
 # environment
-task: dog-run
+task: humanoid_h1hand-sit_simple-v0
 obs: state
+exp_name: transformer6layer-target_encoder_used
+agent_name: SSM_agent_v11
 
 # evaluation
 checkpoint: ???
 eval_episodes: 1
-eval_freq: 50000
+eval_freq: 10000
 
 # training
 steps: 10_000_000
 batch_size: 256
-reward_coef: 0.1
-value_coef: 0.1
-consistency_coef: 20
-rho: 0.5
+reward_coef: 1.0
+value_coef: 1e-2
+consistency_coef: 1e-2
+rho: 1.0
 lr: 3e-4
 enc_lr_scale: 0.3
 grad_clip_norm: 20
@@ -25,37 +27,36 @@ discount_denom: 5
 discount_min: 0.95
 discount_max: 0.995
 buffer_size: 3_000_000
-exp_name: default
+
 data_dir: ???
 
 # ssm agent
-gamma: 0.995
-encoder_struct: [256, 256]
-policy_struct: [256, 256]
 num_ensembles: 3
-control_horizon: 4
-history_horizon: 6
+
+
 
 # ssm transformer
 transformer_d_model: 128
 transformer_num_heads: 4
 transformer_dff: 512
-transformer_num_layers: 2
+transformer_num_layers: 6
 transformer_dropout: 0.1
+history_horizon: 6
 
 # ssm controller
 apply_action_constraints: true
 
 # planning
+solver: SCS
 mpc: true
 iterations: 6
 num_samples: 512
-num_elites: 64
-num_pi_trajs: 24
-horizon: 3
+horizon: 4
+control_horizon: 4
 min_std: 0.05
 max_std: 2
 temperature: 0.5
+u_penalty: 1e-2
 
 # actor
 log_std_min: -10
@@ -74,7 +75,7 @@ num_enc_layers: 2
 enc_dim: 256
 num_channels: 32
 mlp_dim: 512
-latent_dim: 8
+latent_dim: 256
 task_dim: 96
 num_q: 5
 dropout: 0.01
@@ -82,9 +83,9 @@ simnorm_dim: 8
 
 # logging
 wandb_project: humanoid-bench
-wandb_entity: robot-learning
+wandb_entity: minghao-han
 wandb_silent: false
-disable_wandb: true
+disable_wandb: false
 save_csv: true
 
 # misc

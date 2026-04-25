@@ -125,9 +125,11 @@ class SSMWorldModel(nn.Module):
         self.history_horizon = history_horizon
         self.num_ensembles = num_ensembles
 
-        # ---- Variational encoder: obs → (mean, log_sigma) ----
+        # ---- Deterministic encoder: obs → latent ----
         self._encoder_mean = _mlp(state_dim, encoder_hidden, latent_dim)
-        self._encoder_log_sigma = _mlp(state_dim, encoder_hidden, latent_dim)
+        self._encoder_mean_target = deepcopy(self._encoder_mean)
+        for p in self._encoder_mean_target.parameters():
+            p.requires_grad_(False)
 
         # ---- Transformer context encoder ----
         self._transformer = TransformerContextEncoder(
@@ -148,11 +150,32 @@ class SSMWorldModel(nn.Module):
         # ---- Quadratic reward heads ----
         self._Q_net = _mlp(ctx_dim, encoder_hidden, latent_dim, output_act=_ShiftedELU())
         self._q_net = _mlp(ctx_dim, encoder_hidden, latent_dim)
+        # Action-quadratic reward terms: a^T diag(R) a + r^T a
+        self._R_net = _mlp(ctx_dim, encoder_hidden, act_dim, output_act=_ShiftedELU())
+        self._r_net = _mlp(ctx_dim, encoder_hidden, act_dim)
         self._b = nn.Parameter(torch.zeros(1))
 
-        # ---- Policy ----
-        self._pi = _mlp(latent_dim, policy_hidden, act_dim, output_act=nn.Tanh())
-        self._pi_target = deepcopy(self._pi).requires_grad_(False)
+        # ---- Policy (SAC-style stochastic: outputs mean + log_std) ----
+        log_std_min = getattr(cfg, 'log_std_min', -5)
+        log_std_max = getattr(cfg, 'log_std_max', 2)
+        self._log_std_min = log_std_min
+        self._log_std_max = log_std_max
+
+        # Shared trunk → mean head and log_std head
+        self._pi_trunk = _mlp(latent_dim, policy_hidden, policy_hidden[-1])
+        self._pi_mean_head = nn.Linear(policy_hidden[-1], act_dim)
+        self._pi_log_std_head = nn.Linear(policy_hidden[-1], act_dim)
+
+        # Bundle into a single module list for easy deepcopy / param access
+        self._pi = nn.ModuleList([self._pi_trunk, self._pi_mean_head, self._pi_log_std_head])
+
+        # Target copies (used by pi_target for Bellman backup)
+        self._pi_target_trunk = deepcopy(self._pi_trunk).requires_grad_(False)
+        self._pi_target_mean_head = deepcopy(self._pi_mean_head).requires_grad_(False)
+        self._pi_target_log_std_head = deepcopy(self._pi_log_std_head).requires_grad_(False)
+        self._pi_target = nn.ModuleList([
+            self._pi_target_trunk, self._pi_target_mean_head, self._pi_target_log_std_head
+        ])
 
         # ---- Ensemble P critics (quadratic value function) ----
         P_indices_init = torch.empty(num_ensembles, latent_dim)
@@ -167,10 +190,21 @@ class SSMWorldModel(nn.Module):
         nn.init.uniform_(pb_init, -0.1, 0.1)
         self._pb = nn.Parameter(pb_init)
 
+        # Action-quadratic critic terms: a^T diag(K_i) a + k_i^T a (per ensemble)
+        K_indices_init = torch.empty(num_ensembles, act_dim)
+        nn.init.xavier_uniform_(K_indices_init)
+        self._K_indices = nn.Parameter(K_indices_init)
+
+        k_init = torch.empty(num_ensembles, act_dim, 1)
+        nn.init.xavier_uniform_(k_init)
+        self._k = nn.Parameter(k_init)
+
         # Target copies
         self._P_indices_target = nn.Parameter(P_indices_init.clone(), requires_grad=False)
         self._p_target = nn.Parameter(p_init.clone(), requires_grad=False)
         self._pb_target = nn.Parameter(pb_init.clone(), requires_grad=False)
+        self._K_indices_target = nn.Parameter(K_indices_init.clone(), requires_grad=False)
+        self._k_target = nn.Parameter(k_init.clone(), requires_grad=False)
 
     # ------------------------------------------------------------------
     # Properties
@@ -184,25 +218,25 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     def train(self, mode=True):
         super().train(mode)
-        self._pi_target.train(False)
+        for m in self._pi_target:
+            m.train(False)
         return self
 
     # ------------------------------------------------------------------
     # Encoding
     # ------------------------------------------------------------------
-    def encode(self, obs):
+    def encode(self, obs, target=False):
         """
-        Encode observations → latent (mean, sigma).
+        Encode observations → latent (deterministic).
 
         Args:
-            obs: [batch, state_dim] or [T, batch, state_dim]
+            obs:    [batch, state_dim] or [T, batch, state_dim]
+            target: if True, use the target (EMA) encoder
         Returns:
-            mean, sigma   (same leading shape as obs, last dim = latent_dim)
+            z   (same leading shape as obs, last dim = latent_dim)
         """
-        mean = self._encoder_mean(obs)
-        log_sigma = self._encoder_log_sigma(obs).clamp(-2, 2)
-        sigma = log_sigma.exp()
-        return mean, sigma
+        encoder = self._encoder_mean_target if target else self._encoder_mean
+        return encoder(obs)
 
     def encode_context(self, state_history, action_history, current_obs):
         """
@@ -215,8 +249,10 @@ class SSMWorldModel(nn.Module):
         Returns:
             A_diag: [batch, latent_dim]          (diagonal of A)
             B:      [batch, latent_dim, act_dim]
-            Q_diag: [batch, latent_dim]          (diagonal of Q)
-            q:      [batch, latent_dim]
+            Q_diag: [batch, latent_dim]          (diagonal of Q, PSD)
+            q:      [batch, latent_dim]          (state linear reward)
+            R_diag: [batch, act_dim]             (diagonal of R, PSD action quadratic)
+            r_lin:  [batch, act_dim]             (action linear reward)
         """
         ctx_input = torch.cat([state_history, action_history], dim=-1)
         transformer_out = self._transformer(ctx_input)  # [batch, d_model]
@@ -228,8 +264,10 @@ class SSMWorldModel(nn.Module):
 
         Q_diag = self._Q_net(encoder_in)  # [batch, latent_dim]
         q = self._q_net(encoder_in)       # [batch, latent_dim]
+        R_diag = self._R_net(encoder_in)  # [batch, act_dim]
+        r_lin = self._r_net(encoder_in)   # [batch, act_dim]
 
-        return A_diag, B, Q_diag, q
+        return A_diag, B, Q_diag, q, R_diag, r_lin
 
     # ------------------------------------------------------------------
     # Dynamics
@@ -253,51 +291,115 @@ class SSMWorldModel(nn.Module):
         return Az + Bu
 
     # ------------------------------------------------------------------
-    # Reward (quadratic)
+    # Reward (quadratic in z and a)
     # ------------------------------------------------------------------
-    def reward(self, z, Q_diag, q):
+    def reward(self, z, a, Q_diag, q, R_diag, r_lin):
         """
-        Compute quadratic reward: z^T diag(Q) z + q^T z + b
+        Compute quadratic reward:
+            r = -(z^T diag(Q) z + q^T z + a^T diag(R) a + r_lin^T a + b)
 
         Args:
             z:      [batch, latent_dim]
-            Q_diag: [batch, latent_dim]
-            q:      [batch, latent_dim]
+            a:      [batch, act_dim]
+            Q_diag: [batch, latent_dim]  (state quadratic diagonal, PSD)
+            q:      [batch, latent_dim]  (state linear)
+            R_diag: [batch, act_dim]     (action quadratic diagonal, PSD)
+            r_lin:  [batch, act_dim]     (action linear)
         Returns:
             r: [batch, 1]
         """
-        quad = (Q_diag * z * z).sum(dim=-1, keepdim=True)
-        lin = (q * z).sum(dim=-1, keepdim=True)
-        return -(quad + lin + self._b)
+        z_quad = (Q_diag * z * z).sum(dim=-1, keepdim=True)
+        z_lin  = (q * z).sum(dim=-1, keepdim=True)
+        a_quad = (R_diag * a * a).sum(dim=-1, keepdim=True)
+        a_lin  = (r_lin * a).sum(dim=-1, keepdim=True)
+        return -(z_quad + z_lin + a_quad + a_lin + self._b)
 
     # ------------------------------------------------------------------
     # Policy
     # ------------------------------------------------------------------
-    def pi(self, z, target=False):
+    def pi(self, z, target=False, deterministic=False, return_log_prob=False):
         """
-        Sample action from policy.
+        SAC-style stochastic policy.
+
+        Samples action via reparameterisation: a = tanh(mean + std * eps).
+        Log-probability accounts for the tanh squashing:
+            log π(a|z) = Σ [log N(u; mean, std) - log(1 - tanh²(u))]
 
         Args:
-            z: [batch, latent_dim]  or [T, batch, latent_dim]
-            target: use target policy network
+            z:               [..., latent_dim]
+            target:          use target network weights
+            deterministic:   if True, return tanh(mean) (eval / MPC use)
+            return_log_prob: if True, also return log π(a|z)
         Returns:
-            action: same leading dims, last dim = act_dim
+            action              [..., act_dim]           (always)
+            log_prob (optional) [..., 1]
         """
-        net = self._pi_target if target else self._pi
-        return net(z)
+        trunk       = self._pi_target[0] if target else self._pi_trunk
+        mean_head   = self._pi_target[1] if target else self._pi_mean_head
+        log_std_head = self._pi_target[2] if target else self._pi_log_std_head
+
+        h = trunk(z)
+        mean = mean_head(h)
+        log_std = log_std_head(h).clamp(self._log_std_min, self._log_std_max)
+        std = log_std.exp()
+
+        if deterministic:
+            action = torch.tanh(mean)
+            if return_log_prob:
+                # log-prob at the deterministic point
+                log_prob = self._gaussian_log_prob(mean, mean, std)
+                return action, log_prob
+            return action
+
+        # Reparameterised sample
+        eps = torch.randn_like(std)
+        u = mean + std * eps                  # pre-squash
+        action = torch.tanh(u)
+
+        if return_log_prob:
+            log_prob = self._gaussian_log_prob(u, mean, std)
+            return action, log_prob
+        return action
+
+    def get_pi_std(self, z, target=False):
+        """Helper to get policy std (for exploration diagnostics)."""
+        trunk       = self._pi_target[0] if target else self._pi_trunk
+        log_std_head = self._pi_target[2] if target else self._pi_log_std_head
+        h = trunk(z)
+        log_std = log_std_head(h).clamp(self._log_std_min, self._log_std_max)
+        return log_std.exp()
+
+    @staticmethod
+    def _gaussian_log_prob(u, mean, std):
+        """
+        Log prob of Gaussian with tanh squashing correction.
+            log π(a|z) = Σ [log N(u; μ, σ) - log(1 - tanh²(u))]
+        Returns: [..., 1]
+        """
+        log_prob_gaussian = (
+            -0.5 * ((u - mean) / std).pow(2)
+            - std.log()
+            - 0.5 * torch.tensor(2 * torch.pi).log().to(u.device)
+        )
+        # Tanh squashing correction (numerically stable)
+        log_det_jacobian = 2.0 * (torch.log(torch.tensor(2.0, device=u.device))
+                                  - u - F.softplus(-2.0 * u))
+        return (log_prob_gaussian - log_det_jacobian).sum(dim=-1, keepdim=True)
 
     # ------------------------------------------------------------------
     # Ensemble P-Critic (quadratic value)
     # ------------------------------------------------------------------
-    def Q_value(self, z, target=False, return_type='max'):
+    def Q_value(self, z, a, target=False, return_type='max'):
         """
-        Compute ensemble quadratic critic value.
+        Compute ensemble quadratic critic value Q(z, a).
+
+        Q_i(z,a) = -(z^T diag(P_i) z + p_i^T z + a^T diag(K_i) a + k_i^T a + pb_i)
 
         Args:
             z: [batch, latent_dim]
+            a: [batch, act_dim]
             target: whether to use target parameters
-            return_type: 'max' (pessimistic, take max across ensemble),
-                         'all' (return all), 'min', 'avg'
+            return_type: 'max', 'min', 'avg', 'all'
         Returns:
             If 'max'/'min'/'avg': [batch, 1]
             If 'all': [batch, num_ensembles]
@@ -305,19 +407,28 @@ class SSMWorldModel(nn.Module):
         P_idx = self._P_indices_target if target else self._P_indices
         p_vec = self._p_target if target else self._p
         pb_val = self._pb_target if target else self._pb
+        K_idx = self._K_indices_target if target else self._K_indices
+        k_vec = self._k_target if target else self._k
 
-        # P_idx: [E, D],  z: [B, D]
-        P_diag = F.relu(P_idx)  # ensure PSD diagonal
-        # quadratic: z^T diag(P) z  →  (P_diag * z^2).sum  →  [B, E]
-        quad = torch.einsum('bd,ed->be', z * z, P_diag)
+        # State quadratic: z^T diag(P) z → [B, E]
+        P_diag = F.relu(P_idx)
+        z_quad = torch.einsum('bd,ed->be', z * z, P_diag)
 
-        # linear: p^T z  →  [B, E]
+        # State linear: p^T z → [B, E]
         p_sq = p_vec.squeeze(-1)  # [E, D]
-        lin = torch.einsum('bd,ed->be', z, p_sq)
+        z_lin = torch.einsum('bd,ed->be', z, p_sq)
 
-        # constant: pb  →  [E] broadcast to [B, E]
-        pb_sq = pb_val.squeeze(-1)  # [E]
-        all_vals = -(quad + lin + pb_sq.unsqueeze(0))
+        # Action quadratic: a^T diag(K) a → [B, E]
+        K_diag = F.relu(K_idx)
+        a_quad = torch.einsum('bd,ed->be', a * a, K_diag)
+
+        # Action linear: k^T a → [B, E]
+        k_sq = k_vec.squeeze(-1)  # [E, A]
+        a_lin = torch.einsum('bd,ed->be', a, k_sq)
+
+        # Constant: pb → [E] broadcast to [B, E]
+        pb_sq = pb_val.squeeze(-1)
+        all_vals = -(z_quad + z_lin + a_quad + a_lin + pb_sq.unsqueeze(0))
 
         if return_type == 'all':
             return all_vals
@@ -335,19 +446,30 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     def track_critic_grad(self, mode=True):
         """Enable / disable gradients for P-critic parameters."""
-        for p in [self._P_indices, self._p, self._pb]:
+        for p in [self._P_indices, self._p, self._pb, self._K_indices, self._k]:
             p.requires_grad_(mode)
 
     # ------------------------------------------------------------------
     # Soft target updates
     # ------------------------------------------------------------------
     def soft_update_targets(self, tau=None):
-        """Polyak-average update of target P-params and target policy."""
+        """Polyak-average update of target encoder, P-params and target policy."""
         if tau is None:
             tau = self.cfg.tau
         with torch.no_grad():
+            # Encoder target
+            for p_tgt, p in zip(self._encoder_mean_target.parameters(),
+                                 self._encoder_mean.parameters()):
+                p_tgt.data.lerp_(p.data, tau)
             self._P_indices_target.data.lerp_(self._P_indices.data, tau)
             self._p_target.data.lerp_(self._p.data, tau)
             self._pb_target.data.lerp_(self._pb.data, tau)
-            for p_tgt, p in zip(self._pi_target.parameters(), self._pi.parameters()):
-                p_tgt.data.lerp_(p.data, tau)
+            # Update all three policy heads
+            pi_pairs = [
+                (self._pi_target_trunk,        self._pi_trunk),
+                (self._pi_target_mean_head,    self._pi_mean_head),
+                (self._pi_target_log_std_head, self._pi_log_std_head),
+            ]
+            for tgt_mod, src_mod in pi_pairs:
+                for p_tgt, p in zip(tgt_mod.parameters(), src_mod.parameters()):
+                    p_tgt.data.lerp_(p.data, tau)

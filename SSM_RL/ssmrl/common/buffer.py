@@ -25,7 +25,7 @@ class Buffer:
             traj_key="episode",
             truncated_key=None,
         )
-        self._batch_size = cfg.batch_size * (cfg.horizon + 1)
+        self._batch_size = cfg.batch_size * (cfg.horizon + cfg.history_horizon + 1)
         self._num_eps = 0
 
     @property
@@ -112,5 +112,5 @@ class Buffer:
 
     def sample(self):
         """Sample a batch of subsequences from the buffer."""
-        td = self._buffer.sample().view(-1, self.cfg.horizon + 1).permute(1, 0)
+        td = self._buffer.sample().view(-1, self.cfg.horizon+self.cfg.history_horizon + 1).permute(1, 0)
         return self._prepare_batch(td)

@@ -1,5 +1,5 @@
 """
-SSM Agent v9 – rewritten following the architecture of ``ssmrl.py`` (SSMRL / TD-MPC2).
+SSM Agent v11 – rewritten following the architecture of ``ssmrl.py`` (SSMRL / TD-MPC2).
 
 This is a **standalone PyTorch class** (no TensorFlow, no ``base_agent`` inheritance).
 It preserves the SSM-specific components from the original TF implementation:
@@ -22,7 +22,7 @@ from cvxpy import Variable, Parameter, Problem, Minimize, quad_form, hstack, SCS
 import cvxpy
 
 
-from ssmrl.common.ssm_world_model import SSMWorldModel
+from ssmrl.common.ssm_world_model_v3 import SSMWorldModel
 from ssmrl.common.scale import RunningScale
 
 
@@ -57,23 +57,22 @@ class SSMAgent:
         self.model_optim = torch.optim.Adam([
             {'params': self.model._encoder_mean.parameters(),
              'lr': lr * enc_lr_scale},
-            {'params': self.model._encoder_log_sigma.parameters()},
             {'params': self.model._transformer.parameters()},
             {'params': self.model._A_net.parameters()},
             {'params': self.model._B_net.parameters()},
             {'params': self.model._Q_net.parameters()},
             {'params': self.model._q_net.parameters()},
             {'params': [self.model._b]},
-        ], lr=lr)
-
-        # Group 2 – P-critic parameters
-        self.P_optim = torch.optim.Adam([
             {'params': [self.model._P_indices, self.model._p, self.model._pb]},
         ], lr=lr)
 
-        # Group 3 – policy
+
+        # Group 2 – policy (all three heads)
         self.pi_optim = torch.optim.Adam(
-            self.model._pi.parameters(), lr=lr, eps=1e-5
+            list(self.model._pi_trunk.parameters())
+            + list(self.model._pi_mean_head.parameters())
+            + list(self.model._pi_log_std_head.parameters()),
+            lr=lr, eps=1e-5
         )
 
         self.model.eval()
@@ -164,20 +163,15 @@ class SSMAgent:
         obs_t = torch.tensor(x0, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         # Encode
-        mean, sigma = self.model.encode(obs_t)
-        if eval_mode:
-            z = mean
-        else:
-            z = mean + sigma * torch.randn_like(sigma)
+        z = self.model.encode(obs_t)
 
         # Decide action
         if len(self.state_history) < self.history_horizon:
             # Not enough history for transformer – use policy net
-            u_norm = self.model.pi(z)[0].cpu().numpy()
+            u_norm = self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy()
         else:
             # Attempt CVXPY planning
-            u_norm = self._plan_cvxpy(z, x0, mean, eval_mode)
-
+            u_norm = self._plan_cvxpy(z, x0, z, eval_mode)
         # Update history
         self.action_history.append(u_norm.copy())
         self.state_history.append(x0.copy())
@@ -233,9 +227,15 @@ class SSMAgent:
 
         if (self._prob.status not in ('optimal', 'optimal_inaccurate')
                 or self._u_var[:, 0].value is None):
-            return self.model.pi(z)[0].cpu().numpy()
+            return self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy()
         else:
-            return np.array(self._u_var[:, 0].value, dtype=np.float32)
+            u = np.array(self._u_var[:, 0].value, dtype=np.float32)
+            if not eval_mode:
+                std = self.model.get_pi_std(z)[0]
+                epsilon = std * torch.randn(self.cfg.action_dim, device=std.device)
+                epsilon = epsilon.detach().cpu().numpy()
+                u += epsilon
+            return np.clip(u, -1, 1)
 
     def _get_critic_numpy(self):
         """Extract P-critic parameters as numpy arrays."""
@@ -361,9 +361,9 @@ class SSMAgent:
 
         T, B, _ = zs.shape
 
-        # Policy produces actions, then we forward through dynamics so that
-        # the gradient flows:  pi → action → next(z, action) → Q_value
-        actions = self.model.pi(zs)  # [T, B, act_dim]
+        # Policy produces actions + log-probs (SAC stochastic); gradient flows through
+        # reparameterised samples → next(z, action) → Q_value.
+        actions, log_probs = self.model.pi(zs, return_log_prob=True)  # [T, B, act_dim], [T, B, 1]
         z_next_list = []
         for t in range(T):
             z_next_t = self.model.next(zs[t], actions[t], A_diag, B_mat)
@@ -382,13 +382,17 @@ class SSMAgent:
             torch.tensor(self.rho, device=self.device),
             torch.arange(T, device=self.device, dtype=torch.float32),
         )
-        # Minimise critic value (maximise reward; for cost-based envs this means
-        # minimising the value).  Following ssmrl.py pi_loss structure.
-        pi_loss = -(vals.mean(dim=(1, 2)) * rho).mean()
+        # SAC loss: maximise (Q - alpha * log_pi)
+        pi_loss = -(
+            (vals - self.entropy_coef * log_probs).mean(dim=(1, 2)) * rho
+        ).mean()
 
         pi_loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            self.model._pi.parameters(), self.grad_clip_norm
+            list(self.model._pi_trunk.parameters())
+            + list(self.model._pi_mean_head.parameters())
+            + list(self.model._pi_log_std_head.parameters()),
+            self.grad_clip_norm
         )
         self.pi_optim.step()
         self.model.track_critic_grad(True)
@@ -448,21 +452,20 @@ class SSMAgent:
 
         # ---- Compute targets (no grad) ----
         with torch.no_grad():
-            next_mean, _ = self.model.encode(obs[1:])  # [H, B, D]
+            next_mean = self.model.encode(obs[1:])  # [H, B, D]
             td_targets = self._td_target(next_mean, reward)
 
         # ---- Prepare for update ----
         self.model_optim.zero_grad(set_to_none=True)
-        self.P_optim.zero_grad(set_to_none=True)
         self.model.train()
 
         B = obs.shape[1]
         D = self.latent_dim
 
         # ---- Encode first obs ----
-        mean_0, sigma_0 = self.model.encode(obs[self.history_horizon])  # [B, D]
-        z = mean_0
-        z_random = mean_0 + sigma_0 * torch.randn_like(sigma_0)
+        z = self.model.encode(obs[self.history_horizon])  # [B, D]
+        z_target = self.model.encode(obs[self.history_horizon+1], target=True)
+        z_random = z
 
         # ---- Build context for transformer ----
         ctx_state = obs[:self.history_horizon]
@@ -494,28 +497,25 @@ class SSMAgent:
             reward_loss += F.mse_loss(r_pred, reward[t+self.history_horizon]) * (self.rho ** t)
 
         # ---- Value loss (P-critic) ----
-        value_loss = torch.tensor(0.0, device=self.device)
-        for t in range(H):
-            z_t = zs[t]
-            all_vals = self.model.Q_value(z_t, target=False, return_type='all')
-            # all_vals: [B, E]
-            for e in range(self.num_ensembles):
-                value_loss += (
-                    F.mse_loss(
-                        all_vals[:, e:e+1],
-                        td_targets[t+self.history_horizon],
-                    ) * (self.rho ** t)
-                )
+        z_for_p = zs[0]
+        # Bellman: P(z) should match r(z) + gamma * (1-d) * P_target(z')
 
+        p_target_val = reward[self.history_horizon] + self.discount * self.model.Q_value(
+            z_target, target=True, return_type='min'
+        )
+        p_pred_all = self.model.Q_value(z_for_p, target=False, return_type='all')
+        p_loss = F.mse_loss(
+            p_pred_all, p_target_val.detach().expand_as(p_pred_all)
+        )
         # Normalise
         consistency_loss = consistency_loss / H
         reward_loss = reward_loss / H
-        value_loss = value_loss / (H * self.num_ensembles)
+        value_loss = p_loss
 
         total_loss = (
             self.consistency_coef * consistency_loss
             + self.reward_coef * reward_loss
-            # + self.value_coef * value_loss
+            + self.value_coef * value_loss
         )
 
         # ---- Backward & step (world model) ----
@@ -525,29 +525,6 @@ class SSMAgent:
         )
         self.model_optim.step()
 
-        # ---- P-critic update (separate, like the TF version) ----
-        # Re-compute P-loss with fresh graph
-        self.P_optim.zero_grad(set_to_none=True)
-        with torch.no_grad():
-            z_for_p = zs[0].detach()
-            z_next_p = self.model.next(
-                z_for_p, self.model._pi_target(z_for_p), A_diag.detach(), B_mat.detach()
-            )
-        # Bellman: P(z) should match r(z) + gamma * (1-d) * P_target(z')
-        r_pred_p = self.model.reward(z_for_p, Q_diag.detach(), q.detach())
-        p_target_val = r_pred_p + self.discount * self.model.Q_value(
-            z_next_p, target=True, return_type='min'
-        )
-        p_pred_all = self.model.Q_value(z_for_p, target=False, return_type='all')
-        p_loss = F.mse_loss(
-            p_pred_all, p_target_val.detach().expand_as(p_pred_all)
-        )
-        p_loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            [self.model._P_indices, self.model._p, self.model._pb],
-            self.grad_clip_norm,
-        )
-        self.P_optim.step()
 
         # ---- Update policy ----
         pi_loss = self.update_pi(zs.detach(), A_diag.detach(), B_mat.detach())
