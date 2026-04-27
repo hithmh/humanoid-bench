@@ -2,10 +2,10 @@ defaults:
     - override hydra/launcher: submitit_local
 
 # environment
-task: humanoid_h1hand-sit_simple-v0
+task: humanoid_h1-sit_simple-v0
 obs: state
-exp_name: transformer6layer-target_encoder_used
-agent_name: SSM_agent_v11
+exp_name: u_in_reward-pi_update_updated
+agent_name: SSM_agent_v12
 
 # evaluation
 checkpoint: ???
@@ -39,7 +39,7 @@ num_ensembles: 3
 transformer_d_model: 128
 transformer_num_heads: 4
 transformer_dff: 512
-transformer_num_layers: 6
+transformer_num_layers: 2
 transformer_dropout: 0.1
 history_horizon: 6
 

@@ -464,6 +464,8 @@ class SSMWorldModel(nn.Module):
             self._P_indices_target.data.lerp_(self._P_indices.data, tau)
             self._p_target.data.lerp_(self._p.data, tau)
             self._pb_target.data.lerp_(self._pb.data, tau)
+            self._K_indices_target.data.lerp_(self._K_indices.data, tau)
+            self._k_target.data.lerp_(self._k.data, tau)
             # Update all three policy heads
             pi_pairs = [
                 (self._pi_target_trunk,        self._pi_trunk),
