@@ -4,8 +4,8 @@ defaults:
 # environment
 task: humanoid_h1-sit_simple-v0
 obs: state
-exp_name: u_in_reward-pi_update_updated
-agent_name: SSM_agent_v12
+exp_name: jax-based-qpax-latent=512
+agent_name: SSM_agent_v14
 
 # evaluation
 checkpoint: ???
@@ -39,7 +39,7 @@ num_ensembles: 3
 transformer_d_model: 128
 transformer_num_heads: 4
 transformer_dff: 512
-transformer_num_layers: 2
+transformer_num_layers: 6
 transformer_dropout: 0.1
 history_horizon: 6
 
@@ -51,8 +51,8 @@ solver: SCS
 mpc: true
 iterations: 6
 num_samples: 512
-horizon: 4
-control_horizon: 4
+horizon: 8
+control_horizon: 8
 min_std: 0.05
 max_std: 2
 temperature: 0.5
@@ -75,11 +75,13 @@ num_enc_layers: 2
 enc_dim: 256
 num_channels: 32
 mlp_dim: 512
-latent_dim: 256
+latent_dim: 512
 task_dim: 96
 num_q: 5
 dropout: 0.01
 simnorm_dim: 8
+policy_struct: [256, 256]
+encoder_struct: [512, 512]
 
 # logging
 wandb_project: humanoid-bench
