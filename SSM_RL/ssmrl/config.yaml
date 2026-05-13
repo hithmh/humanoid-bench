@@ -4,8 +4,9 @@ defaults:
 # environment
 task: humanoid_h1-sit_simple-v0
 obs: state
-exp_name: jax-based-qpax-latent=512
-agent_name: SSM_agent_v14
+exp_name: param_perturb-ucb-H=8-A_no_output_act
+#agent_name: SSM_agent_v15_const
+agent_name: SSM_agent_v17
 
 # evaluation
 checkpoint: ???
@@ -16,7 +17,7 @@ eval_freq: 10000
 steps: 10_000_000
 batch_size: 256
 reward_coef: 1.0
-value_coef: 1e-2
+value_coef: 1e0
 consistency_coef: 1e-2
 rho: 1.0
 lr: 3e-4

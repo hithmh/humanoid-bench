@@ -39,7 +39,7 @@ import jax.numpy as jnp
 import qpax  # pip install qpax
 
 
-from ssmrl.common.ssm_world_model_v3 import SSMWorldModel
+from ssmrl.common.ssm_world_model_v5 import SSMWorldModel
 from ssmrl.common.scale import RunningScale
 
 
@@ -80,7 +80,9 @@ class SSMAgent:
             {'params': self.model._Q_net.parameters()},
             {'params': self.model._q_net.parameters()},
             {'params': [self.model._b]},
-            {'params': [self.model._P_indices, self.model._p, self.model._pb]},
+            {'params': self.model._P_indices_net.parameters()},
+            {'params': self.model._p_net.parameters()},
+            {'params': self.model._pb_net.parameters()},
         ], lr=lr)
 
 
@@ -233,7 +235,7 @@ class SSMAgent:
         action_t = torch.tensor(action_seq, device=self.device).unsqueeze(0)
         obs_t    = torch.tensor(x0, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-        A_diag, B, Q_diag, q = self.model.encode_context(state_t, action_t, obs_t)
+        A_diag, B, Q_diag, q, encoder_in = self.model.encode_context(state_t, action_t, obs_t)
 
         # ---- Parameter noise for exploration ----
         if not eval_mode:
@@ -246,10 +248,11 @@ class SSMAgent:
         q_t      = q[0]         # (D,)
         z_t      = z[0]         # (D,)
 
-        # Critic params
-        P_diags_t = F.relu(self.model._P_indices)   # (E, D)
-        p_t       = self.model._p.squeeze(-1)        # (E, D)
-        pb_t      = self.model._pb.squeeze(-1)       # (E,)
+        # Critic params from MLP heads conditioned on encoder_in
+        E, D = self.num_ensembles, self.latent_dim
+        P_diags_t = F.relu(self.model._P_indices_net(encoder_in)).view(E, D)   # (E, D)
+        p_t       = self.model._p_net(encoder_in).view(E, D)                   # (E, D)
+        pb_t      = self.model._pb_net(encoder_in).squeeze(0)                  # (E,)
 
         # ---- PyTorch → JAX (zero-copy DLPack on CUDA) ----
         def to_jax(t: torch.Tensor):
@@ -461,19 +464,20 @@ class SSMAgent:
     # ------------------------------------------------------------------
     # Policy update (mirror SSMRL.update_pi)
     # ------------------------------------------------------------------
-    def update_pi(self, zs, A_diag, B_mat):
+    def update_pi(self, zs, A_diag, B_mat, encoder_in):
         """
         Update policy using a sequence of latent states.
 
         The gradient path is:
             zs (detached) → _pi(zs) → actions → model.next(zs, actions, A, B)
-            → z_next → Q_value(z_next)
+            → z_next → Q_value(z_next, encoder_in)
         so that the policy parameters receive gradients.
 
         Args:
-            zs:     [T, batch, latent_dim]  (detached)
-            A_diag: [batch, latent_dim]     (detached)
-            B_mat:  [batch, latent_dim, act_dim] (detached)
+            zs:         [T, batch, latent_dim]  (detached)
+            A_diag:     [batch, latent_dim]     (detached)
+            B_mat:      [batch, latent_dim, act_dim] (detached)
+            encoder_in: [batch, ctx_dim]        (detached)
         Returns:
             pi_loss (float)
         """
@@ -492,7 +496,9 @@ class SSMAgent:
         z_next = torch.stack(z_next_list, dim=0)  # [T, B, D]
 
         z_next_flat = z_next.reshape(T * B, -1)
-        vals = self.model.Q_value(z_next_flat, target=False, return_type='min')
+        # Expand encoder_in from [B, ctx_dim] to [T*B, ctx_dim]
+        enc_in_flat = encoder_in.unsqueeze(0).expand(T, -1, -1).reshape(T * B, -1)
+        vals = self.model.Q_value(z_next_flat, enc_in_flat, target=False, return_type='min')
         vals = vals.view(T, B, 1)
 
         self.scale.update(vals[0])
@@ -524,20 +530,21 @@ class SSMAgent:
     # TD target (mirror SSMRL._td_target)
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def _td_target(self, next_z, reward):
+    def _td_target(self, next_z, reward, encoder_in):
         """
-        Compute TD target: r + gamma * (1 - done) * V(next_z).
+        Compute TD target: r + gamma * V_target(next_z).
 
         Args:
-            next_z: [T, batch, latent_dim]
-            reward:  [T, batch, 1]
-            done:    [T, batch, 1]
+            next_z:     [T, batch, latent_dim]
+            reward:     [T, batch, 1]
+            encoder_in: [batch, ctx_dim]
         Returns:
             td_target: [T, batch, 1]
         """
         T, B, _ = next_z.shape
         z_flat = next_z.reshape(T * B, -1)
-        next_val = self.model.Q_value(z_flat, target=True, return_type='min')
+        enc_in_flat = encoder_in.unsqueeze(0).expand(T, -1, -1).reshape(T * B, -1)
+        next_val = self.model.Q_value(z_flat, enc_in_flat, target=True, return_type='min')
         next_val = next_val.view(T, B, 1)
         return reward + self.discount * next_val
 
@@ -574,7 +581,13 @@ class SSMAgent:
         # ---- Compute targets (no grad) ----
         with torch.no_grad():
             next_mean = self.model.encode(obs[1:])  # [H, B, D]
-            td_targets = self._td_target(next_mean, reward)
+            # Build encoder_in for target computation using history
+            ctx_state_tgt = obs[:self.history_horizon].permute(1, 0, 2)
+            ctx_action_tgt = action[:self.history_horizon].permute(1, 0, 2)
+            _, _, _, _, encoder_in = self.model.encode_context(
+                ctx_state_tgt, ctx_action_tgt, obs[self.history_horizon]
+            )
+            td_targets = self._td_target(next_mean, reward, encoder_in)
 
         # ---- Prepare for update ----
         self.model_optim.zero_grad(set_to_none=True)
@@ -594,7 +607,7 @@ class SSMAgent:
         ## rearrange the dimension from  [history_horizon, batch, state_dim] to  [batch, history_horizon, state_dim]
         ctx_state = ctx_state.permute(1, 0, 2)
         ctx_action = ctx_action.permute(1, 0, 2)
-        A_diag, B_mat, Q_diag, q = self.model.encode_context(
+        A_diag, B_mat, Q_diag, q, encoder_in = self.model.encode_context(
             ctx_state, ctx_action, obs[self.history_horizon]
         )
 
@@ -622,9 +635,9 @@ class SSMAgent:
         # Bellman: P(z) should match r(z) + gamma * (1-d) * P_target(z')
 
         p_target_val = reward[self.history_horizon] + self.discount * self.model.Q_value(
-            z_target, target=True, return_type='min'
+            z_target, encoder_in, target=True, return_type='min'
         )
-        p_pred_all = self.model.Q_value(z_for_p, target=False, return_type='all')
+        p_pred_all = self.model.Q_value(z_for_p, encoder_in, target=False, return_type='all')
         p_loss = F.mse_loss(
             p_pred_all, p_target_val.detach().expand_as(p_pred_all)
         )
@@ -648,7 +661,7 @@ class SSMAgent:
 
 
         # ---- Update policy ----
-        pi_loss = self.update_pi(zs.detach(), A_diag.detach(), B_mat.detach())
+        pi_loss = self.update_pi(zs.detach(), A_diag.detach(), B_mat.detach(), encoder_in.detach())
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()
