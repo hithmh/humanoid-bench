@@ -4,9 +4,10 @@ defaults:
 # environment
 task: humanoid_h1-sit_simple-v0
 obs: state
-exp_name: param_perturb-ucb-H=8-A_no_output_act
+#exp_name: param_perturb-ucb-H=8-real_ensemble-10
+exp_name: H=16-no_discount_plan
 #agent_name: SSM_agent_v15_const
-agent_name: SSM_agent_v17
+agent_name: SSM_agent_v18
 
 # evaluation
 checkpoint: ???
@@ -32,7 +33,7 @@ buffer_size: 3_000_000
 data_dir: ???
 
 # ssm agent
-num_ensembles: 3
+num_ensembles: 10
 
 
 
@@ -52,7 +53,7 @@ solver: SCS
 mpc: true
 iterations: 6
 num_samples: 512
-horizon: 8
+horizon: 16
 control_horizon: 8
 min_std: 0.05
 max_std: 2

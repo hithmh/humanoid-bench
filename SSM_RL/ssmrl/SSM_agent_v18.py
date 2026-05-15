@@ -39,7 +39,7 @@ import jax.numpy as jnp
 import qpax  # pip install qpax
 
 
-from ssmrl.common.ssm_world_model_v5 import SSMWorldModel
+from ssmrl.common.ssm_world_model_v6 import SSMWorldModel
 from ssmrl.common.scale import RunningScale
 
 
@@ -79,6 +79,8 @@ class SSMAgent:
             {'params': self.model._B_net.parameters()},
             {'params': self.model._Q_net.parameters()},
             {'params': self.model._q_net.parameters()},
+            {'params': self.model._R_net.parameters()},
+            {'params': self.model._r_net.parameters()},
             {'params': [self.model._b]},
             {'params': self.model._critic_ensemble.parameters()},
         ], lr=lr)
@@ -197,9 +199,9 @@ class SSMAgent:
         return u
 
     @torch.no_grad()
-    def _perturb_encoded_params(self, A_diag, B, Q_diag, q):
+    def _perturb_encoded_params(self, A_diag, B, Q_diag, q, R_diag, r_vec):
         """
-        Add relative Gaussian noise to encoded SSM parameters (A_diag, B, Q_diag, q)
+        Add relative Gaussian noise to encoded SSM parameters (A_diag, B, Q_diag, q, R_diag, r_vec)
         for exploration.  Noise magnitude is proportional to each tensor's mean
         absolute value, so the perturbation is scale-invariant.
 
@@ -211,11 +213,11 @@ class SSMAgent:
             scale = t.abs().mean() + 1e-6
             return t + std * scale * torch.randn_like(t)
 
-        # Q_diag must stay non-negative so that Tᵤᵀ diag(Q_diag) Tᵤ remains PSD.
-        # P_diags is already guarded by F.relu in _plan_jax; Q_diag is not.
+        # Q_diag / R_diag must stay non-negative so that the quadratic forms remain PSD.
         noisy_Q_diag = _noisy(Q_diag).clamp(min=0.0)
+        noisy_R_diag = _noisy(R_diag).clamp(min=0.0)
 
-        return _noisy(A_diag), _noisy(B), noisy_Q_diag, _noisy(q)
+        return _noisy(A_diag), _noisy(B), noisy_Q_diag, _noisy(q), noisy_R_diag, _noisy(r_vec)
 
     def _plan_jax(self, z: torch.Tensor, x0: np.ndarray, eval_mode: bool):
         """
@@ -233,30 +235,39 @@ class SSMAgent:
         action_t = torch.tensor(action_seq, device=self.device).unsqueeze(0)
         obs_t    = torch.tensor(x0, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-        A_diag, B, Q_diag, q, encoder_in = self.model.encode_context(state_t, action_t, obs_t)
+        A_diag, B, Q_diag, q, R_diag, r_vec, encoder_in = self.model.encode_context(
+            state_t, action_t, obs_t)
 
         # ---- Parameter noise for exploration ----
         if not eval_mode:
-            A_diag, B, Q_diag, q = self._perturb_encoded_params(A_diag, B, Q_diag, q)
+            A_diag, B, Q_diag, q, R_diag, r_vec = self._perturb_encoded_params(
+                A_diag, B, Q_diag, q, R_diag, r_vec)
 
         # Extract single-sample tensors
         A_diag_t = A_diag[0]   # (D,)
         B_t      = B[0]         # (D, nU)
         Q_diag_t = Q_diag[0]   # (D,)
         q_t      = q[0]         # (D,)
+        R_diag_t = R_diag[0]   # (nU,)
+        r_vec_t  = r_vec[0]    # (nU,)
         z_t      = z[0]         # (D,)
 
         # Critic params from ensemble MLPs conditioned on encoder_in
-        E, D = self.num_ensembles, self.latent_dim
+        E, D, nU = self.num_ensembles, self.latent_dim, self.act_dim
         P_diags_list, p_list, pb_list = [], [], []
+        Rc_diags_list, rc_list = [], []
         for net in self.model._critic_ensemble:
-            out = net(encoder_in)                        # [1, 2D+1]
-            P_diags_list.append(F.relu(out[:, :D]))      # [1, D]
-            p_list.append(out[:, D:2*D])                 # [1, D]
-            pb_list.append(out[:, 2*D:])                 # [1, 1]
-        P_diags_t = torch.cat(P_diags_list, dim=0)      # [E, D]
-        p_t       = torch.cat(p_list,       dim=0)      # [E, D]
+            out = net(encoder_in)                              # [1, 2D+1+2*nU]
+            P_diags_list.append(F.relu(out[:, :D]))            # [1, D]
+            p_list.append(out[:, D:2*D])                       # [1, D]
+            pb_list.append(out[:, 2*D:2*D+1])                  # [1, 1]
+            Rc_diags_list.append(F.relu(out[:, 2*D+1:2*D+1+nU]))  # [1, nU]
+            rc_list.append(out[:, 2*D+1+nU:])                  # [1, nU]
+        P_diags_t = torch.cat(P_diags_list, dim=0)            # [E, D]
+        p_t       = torch.cat(p_list,       dim=0)            # [E, D]
         pb_t      = torch.cat(pb_list,      dim=0).squeeze(-1)  # [E]
+        Rc_diags_t = torch.cat(Rc_diags_list, dim=0)          # [E, nU]
+        rc_t       = torch.cat(rc_list,       dim=0)          # [E, nU]
 
         # ---- PyTorch → JAX (zero-copy DLPack on CUDA) ----
         def to_jax(t: torch.Tensor):
@@ -270,9 +281,13 @@ class SSMAgent:
                 to_jax(B_t),
                 to_jax(Q_diag_t),
                 to_jax(q_t),
+                to_jax(R_diag_t),
+                to_jax(r_vec_t),
                 to_jax(P_diags_t),
                 to_jax(p_t),
                 to_jax(pb_t),
+                to_jax(Rc_diags_t),
+                to_jax(rc_t),
                 self._a_low_jax,
                 self._a_high_jax,
             )
@@ -306,9 +321,9 @@ class SSMAgent:
             min   ½ U^T Q_qp U + c_qp^T U
             s.t.  G U ≤ h   (box constraints on each u_t)
 
-        The ensemble terminal cost ``max_i V_i`` is approximated by the ensemble
-        *average* to keep the terminal term quadratic (strict QP).
-        A small ridge (1e-6 I) is added to Q_qp for numerical stability.
+        Stage reward:  r(z_t, u_t) = -(z_t^T diag(Q_r) z_t + q_r^T z_t
+                                        + u_t^T diag(R_r) u_t + r_r^T u_t + b)
+        Terminal cost (Q-value): Q(z_H, u_H) UCB over ensemble.
         """
         D   = self.latent_dim
         nU  = self.act_dim
@@ -323,20 +338,27 @@ class SSMAgent:
         n = CH * nU   # total QP decision-variable size
 
         def _build_and_solve(z0, A_diag, B, Q_diag, q_vec,
-                             P_diags, p_mat, pb_vec, a_low, a_high):
+                             R_diag_r, r_vec_r,
+                             P_diags, p_mat, pb_vec,
+                             Rc_diags, rc_mat,
+                             a_low, a_high):
             """
             Args
             ----
-            z0      : (D,)      initial latent state
-            A_diag  : (D,)      diagonal of dynamics matrix A
-            B       : (D, nU)   input matrix
-            Q_diag  : (D,)      diagonal of stage state-cost matrix
-            q_vec   : (D,)      linear state-cost coefficient
-            P_diags : (E, D)    diagonal of terminal state-critic per ensemble
-            p_mat   : (E, D)    linear terminal state-critic coefficient
-            pb_vec  : (E,)      terminal critic bias (constant, included for completeness)
-            a_low   : (nU,)     per-dim action lower bound
-            a_high  : (nU,)     per-dim action upper bound
+            z0        : (D,)       initial latent state
+            A_diag    : (D,)       diagonal of dynamics matrix A
+            B         : (D, nU)    input matrix
+            Q_diag    : (D,)       diagonal of stage state-cost matrix
+            q_vec     : (D,)       linear state-cost coefficient
+            R_diag_r  : (nU,)      diagonal of stage action-cost matrix (reward)
+            r_vec_r   : (nU,)      linear action-cost coefficient (reward)
+            P_diags   : (E, D)     diagonal of terminal state-critic per ensemble
+            p_mat     : (E, D)     linear terminal state-critic coefficient
+            pb_vec    : (E,)       terminal critic bias
+            Rc_diags  : (E, nU)    diagonal of terminal action-critic per ensemble
+            rc_mat    : (E, nU)    linear terminal action-critic coefficient
+            a_low     : (nU,)      per-dim action lower bound
+            a_high    : (nU,)      per-dim action upper bound
 
             Returns
             -------
@@ -346,7 +368,6 @@ class SSMAgent:
             # ----------------------------------------------------------
             # 1. State trajectory matrices (unrolled, compile-time loops)
             # ----------------------------------------------------------
-            # z_{t+1} = f_list[t] + T_u_list[t] @ U_flat
             f_list   = []
             T_u_list = []
 
@@ -390,7 +411,13 @@ class SSMAgent:
                 Q_qp = Q_qp + (discount ** t) * 2.0 * (Tu.T @ QTu)
                 c_qp = c_qp + (discount ** t) * (2.0 * (QTu.T @ f) + Tu.T @ q_vec)
 
-                # Stage control cost: u_penalty * ||u||^2  (block k_u)
+                # Stage action cost: u_t^T diag(R_r) u_t + r_r^T u_t  (block k_u)
+                Q_qp = Q_qp.at[s_u:e_u, s_u:e_u].add(
+                    (discount ** t) * 2.0 * jnp.diag(R_diag_r))
+                c_qp = c_qp.at[s_u:e_u].add(
+                    (discount ** t) * r_vec_r)
+
+                # Stage control regularisation: u_penalty * ||u||^2  (block k_u)
                 Q_qp = Q_qp.at[s_u:e_u, s_u:e_u].add(
                     (discount ** t) * 2.0 * u_penalty * jnp.eye(nU))
 
@@ -398,9 +425,7 @@ class SSMAgent:
             Tu_H = T_u_list[H - 1]   # (D, n)
             f_H  = f_list[H - 1]     # (D,)
 
-            # Latent-Space UCB: mean + beta * std over ensemble
-            # This gives an optimistic upper bound on the terminal value,
-            # encouraging the agent to explore uncertain regions of state space.
+            # Latent-Space UCB for state part
             P_mean = jnp.mean(P_diags, axis=0)                         # (D,)
             P_std  = jnp.std( P_diags, axis=0)                         # (D,)
             P_ucb  = P_mean + ucb_beta * P_std                         # (D,)
@@ -412,6 +437,24 @@ class SSMAgent:
             PTu  = P_ucb[:, None] * Tu_H                               # (D, n)
             Q_qp = Q_qp + (discount ** H) * 2.0 * (Tu_H.T @ PTu)
             c_qp = c_qp + (discount ** H) * (2.0 * (PTu.T @ f_H) + Tu_H.T @ p_ucb)
+
+            # Terminal action cost UCB – action part of Q(z_H, u_H)
+            # u_H corresponds to the last control block: indices [s_u_H : e_u_H]
+            s_u_H = (CH - 1) * nU
+            e_u_H = CH * nU
+
+            Rc_mean = jnp.mean(Rc_diags, axis=0)                       # (nU,)
+            Rc_std  = jnp.std( Rc_diags, axis=0)                       # (nU,)
+            Rc_ucb  = Rc_mean + ucb_beta * Rc_std                      # (nU,)
+
+            rc_mean = jnp.mean(rc_mat, axis=0)                         # (nU,)
+            rc_std  = jnp.std( rc_mat, axis=0)                         # (nU,)
+            rc_ucb  = rc_mean + ucb_beta * rc_std                      # (nU,)
+
+            Q_qp = Q_qp.at[s_u_H:e_u_H, s_u_H:e_u_H].add(
+                (discount ** H) * 2.0 * jnp.diag(Rc_ucb))
+            c_qp = c_qp.at[s_u_H:e_u_H].add(
+                (discount ** H) * rc_ucb)
 
             # Ridge for numerical stability
             Q_qp = Q_qp + 1e-6 * jnp.eye(n)
@@ -470,17 +513,16 @@ class SSMAgent:
     # ------------------------------------------------------------------
     def update_pi(self, z0, A_diag, B_mat, encoder_in):
         """
-        Update policy using a single forward step from z0.
+        Update policy using Q(z0, action) directly (SAC-style).
 
         The gradient path is:
-            z0 (detached) → pi(z0) → action → model.next(z0, action, A, B)
-            → z_next → Q_value(z_next, encoder_in)
-        so that the policy parameters receive gradients.
+            z0 (detached) → pi(z0) → action → Q_value(z0, action, encoder_in)
+        so that the policy parameters receive gradients through the action.
 
         Args:
             z0:         [batch, latent_dim]          (detached, first latent state)
-            A_diag:     [batch, latent_dim]          (detached)
-            B_mat:      [batch, latent_dim, act_dim] (detached)
+            A_diag:     [batch, latent_dim]          (detached, unused but kept for API compat)
+            B_mat:      [batch, latent_dim, act_dim] (detached, unused but kept for API compat)
             encoder_in: [batch, ctx_dim]             (detached)
         Returns:
             pi_loss (float)
@@ -488,14 +530,11 @@ class SSMAgent:
         self.pi_optim.zero_grad(set_to_none=True)
         self.model.track_critic_grad(False)
 
-        # Single-step: sample action from policy at z0
+        # Sample action from policy at z0
         action, log_prob = self.model.pi(z0, return_log_prob=True)  # [B, act_dim], [B, 1]
 
-        # One dynamics step
-        z_next = self.model.next(z0, action, A_diag, B_mat)         # [B, D]
-
-        # Q value at z_next (critic grad frozen)
-        val = self.model.Q_value(z_next, encoder_in, target=False, return_type='min')  # [B, 1]
+        # Q value at (z0, action) — critic grad frozen
+        val = self.model.Q_value(z0, action, encoder_in, target=False, return_type='min')  # [B, 1]
 
         self.scale.update(val)
         val = self.scale(val)
@@ -533,7 +572,9 @@ class SSMAgent:
         T, B, _ = next_z.shape
         z_flat = next_z.reshape(T * B, -1)
         enc_in_flat = encoder_in.unsqueeze(0).expand(T, -1, -1).reshape(T * B, -1)
-        next_val = self.model.Q_value(z_flat, enc_in_flat, target=True, return_type='min')
+        # Sample next action from target policy for Q(z, a)
+        a_next = self.model.pi(z_flat, target=True, deterministic=True)
+        next_val = self.model.Q_value(z_flat, a_next, enc_in_flat, target=True, return_type='min')
         next_val = next_val.view(T, B, 1)
         return reward + self.discount * next_val
 
@@ -553,18 +594,11 @@ class SSMAgent:
         """
         # ---- Sample from buffer ----
         sample = buffer.sample()
-        # Unpack – buffer may or may not include done
-
         obs, action, reward, _ = sample
         obs = obs.to(self.device)
         action = action.to(self.device)
         reward = reward.to(self.device)
 
-
-
-        # obs:    [horizon+1, batch, state_dim]
-        # action: [horizon, batch, act_dim]
-        # reward: [horizon, batch, 1]
         H = self.horizon  # horizon
 
         # ---- Compute targets (no grad) ----
@@ -573,7 +607,7 @@ class SSMAgent:
             # Build encoder_in for target computation using history
             ctx_state_tgt = obs[:self.history_horizon].permute(1, 0, 2)
             ctx_action_tgt = action[:self.history_horizon].permute(1, 0, 2)
-            _, _, _, _, encoder_in = self.model.encode_context(
+            _, _, _, _, _, _, encoder_in = self.model.encode_context(
                 ctx_state_tgt, ctx_action_tgt, obs[self.history_horizon]
             )
             td_targets = self._td_target(next_mean, reward, encoder_in)
@@ -596,7 +630,7 @@ class SSMAgent:
         ## rearrange the dimension from  [history_horizon, batch, state_dim] to  [batch, history_horizon, state_dim]
         ctx_state = ctx_state.permute(1, 0, 2)
         ctx_action = ctx_action.permute(1, 0, 2)
-        A_diag, B_mat, Q_diag, q, encoder_in = self.model.encode_context(
+        A_diag, B_mat, Q_diag, q, R_diag, r_vec, encoder_in = self.model.encode_context(
             ctx_state, ctx_action, obs[self.history_horizon]
         )
 
@@ -616,17 +650,24 @@ class SSMAgent:
         # ---- Reward predictions ----
         reward_loss = torch.tensor(0.0, device=self.device)
         for t in range(H):
-            r_pred = self.model.reward(z_randoms[t+1], Q_diag, q)
+            r_pred = self.model.reward(
+                z_randoms[t+1], action[t+self.history_horizon],
+                Q_diag, q, R_diag, r_vec
+            )
             reward_loss += F.mse_loss(r_pred, reward[t+self.history_horizon]) * (self.rho ** t)
 
         # ---- Value loss (P-critic) ----
         z_for_p = zs[0]
-        # Bellman: P(z) should match r(z) + gamma * (1-d) * P_target(z')
+        # Sample action from target policy at z_target for Q(z_target, a_target)
+        with torch.no_grad():
+            a_target = self.model.pi(z_target, target=True, deterministic=True)
 
         p_target_val = reward[self.history_horizon] + self.discount * self.model.Q_value(
-            z_target, encoder_in, target=True, return_type='min'
+            z_target, a_target, encoder_in, target=True, return_type='min'
         )
-        p_pred_all = self.model.Q_value(z_for_p, encoder_in, target=False, return_type='all')
+        # Sample action from current policy at z_for_p for Q(z_for_p, a)
+        a_for_p = self.model.pi(z_for_p.detach(), deterministic=True)
+        p_pred_all = self.model.Q_value(z_for_p, a_for_p, encoder_in, target=False, return_type='all')
         p_loss = F.mse_loss(
             p_pred_all, p_target_val.detach().expand_as(p_pred_all)
         )
