@@ -1,31 +1,35 @@
 """
-SSM Agent v14 – JAX + qpax GPU-accelerated MPC.
+SSM Agent v19 - transformer-conditioned SSM-RL with JAX/qpax MPC.
 
-Architecture is identical to v11 except for the inference-time controller:
-  * MPC cost is evaluated entirely in JAX (JIT-compiled, runs on GPU/CPU)
-  * The QP is solved by ``qpax`` (pure-JAX interior-point QP solver)
-  * Dynamics constraints are analytically eliminated: the full state trajectory
-    is expressed as a linear function of the stacked control sequence U,
-    reducing the MPC to a single dense QP in U only.
-  * The ensemble terminal cost ``max_i V_i(z)`` is replaced by a latent-space
-    UCB: ``mean_i V_i(z) + beta * std_i V_i(z)``, encouraging optimistic
-    exploration into uncertain regions of state space.  ``beta`` is controlled
-    by ``cfg.ucb_beta`` (default 1.0).
-  * Zero-copy PyTorch ↔ JAX tensor bridge via ``torch.utils.dlpack`` /
-    ``jax.dlpack`` when both tensors live on the same CUDA device.
-  * ``jax.jit`` compiles the full matrix-build + solve once; subsequent calls
-    are fast.
+This agent wraps ``SSMWorldModel`` and provides both model learning and
+inference-time control. During inference, recent state/action history is used
+by ``encode_context`` to produce local linear SSM parameters, reconstruction
+matrix ``C``, reward quadratics, and critic context. Until enough history is
+available, or if the QP solver fails, actions come from the learned policy.
 
-QP form passed to qpax:
-  min   ½ U^T Q_qp U + c_qp^T U
-  s.t.  G U ≤ h   (per-step box constraints on actions)
+MPC controller:
+  * The finite-horizon control problem is assembled in JAX and JIT-compiled.
+  * ``qpax`` solves the dense QP over the stacked action sequence only.
+  * Diagonal latent dynamics are analytically unrolled, eliminating equality
+    dynamics constraints:
+      z_{t+1} = A^{t+1} * z_0 + T_u[t] @ U_flat
+  * Per-step action bounds are encoded as box inequalities ``G U <= h``.
+  * The terminal Q cost uses the critic ensemble mean plus
+    ``cfg.ucb_beta`` times the ensemble standard deviation for state and action
+    quadratic terms.
+  * Training-time exploration perturbs encoded SSM/reward parameters by
+    relative Gaussian noise (``cfg.param_noise_std``) and adds policy-standard-
+    deviation action noise after planning.
+  * PyTorch tensors are passed to JAX through DLPack before the JIT solve.
 
-State trajectory (A is diagonal):
-  z_{t+1} = A^{t+1} ⊙ z_0  +  T_u[t] @ U_flat
+QP form passed to ``qpax``:
+  min   0.5 * U^T Q_qp U + c_qp^T U
+  s.t.  G U <= h
 
-Training loop (``update``) mirrors ``SSMRL.update`` from ``ssmrl.py``:
-  sample buffer → encode → latent rollout → consistency / reward / value losses
-  → update world model → update policy → soft-update targets.
+Training loop:
+  sample replay buffer -> encode context -> latent rollout -> optimize
+  consistency, reward, critic value, and observation reconstruction losses ->
+  update SAC-style policy with entropy regularization -> soft-update targets.
 """
 
 import copy
