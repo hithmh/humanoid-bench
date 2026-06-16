@@ -5,6 +5,7 @@ import torch
 from tensordict.tensordict import TensorDict
 
 from ssmrl.trainer.base import Trainer
+from ssmrl.common.reward_visualization import log_reward_visualization_to_wandb
 
 
 class OnlineTrainer(Trainer):
@@ -73,6 +74,10 @@ class OnlineTrainer(Trainer):
     def train(self):
         """Train a TD-MPC2 agent."""
         train_metrics, done, eval_next = {}, True, True
+
+        # Get reward visualization frequency from config
+        reward_viz_freq = getattr(self.cfg, 'reward_viz_freq', self.cfg.eval_freq)
+
         while self._step <= self.cfg.steps:
             # Evaluate agent periodically
             if self._step % self.cfg.eval_freq == 0:
@@ -133,6 +138,20 @@ class OnlineTrainer(Trainer):
                 for _ in range(num_updates):
                     _train_metrics = self.agent.update(self.buffer)
                 train_metrics.update(_train_metrics)
+
+                # Log reward prediction visualization
+                if self._step % reward_viz_freq == 0 and self._step > self.cfg.seed_steps:
+                    try:
+                        reward_preds = self.agent.compute_reward_predictions(self.buffer, num_samples=1)
+                        log_reward_visualization_to_wandb(
+                            self.logger._wandb,
+                            reward_preds['actual_rewards'],
+                            reward_preds['predicted_rewards'],
+                            step=self._step,
+                            save_dir=self.logger._log_dir if hasattr(self.logger, '_log_dir') else None
+                        )
+                    except Exception as e:
+                        print(f"Warning: Failed to log reward visualization: {e}")
 
             self._step += 1
 

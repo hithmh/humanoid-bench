@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 from tdmpc2.common.buffer import Buffer
 from tdmpc2.trainer.base import Trainer
+from ssmrl.common.reward_visualization import log_reward_visualization_to_wandb
 
 
 class OfflineTrainer(Trainer):
@@ -85,6 +86,10 @@ class OfflineTrainer(Trainer):
 
         print(f"Training agent for {self.cfg.steps} iterations...")
         metrics = {}
+
+        # Get reward visualization frequency from config
+        reward_viz_freq = getattr(self.cfg, 'reward_viz_freq', self.cfg.eval_freq)
+
         for i in range(self.cfg.steps):
             # Update agent
             train_metrics = self.agent.update(self.buffer)
@@ -102,5 +107,19 @@ class OfflineTrainer(Trainer):
                     if i > 0:
                         self.logger.save_agent(self.agent, identifier=f"{i}")
                 self.logger.log(metrics, "pretrain")
+
+            # Log reward prediction visualization
+            if i % reward_viz_freq == 0 and i > 0:
+                try:
+                    reward_preds = self.agent.compute_reward_predictions(self.buffer, num_samples=1)
+                    log_reward_visualization_to_wandb(
+                        self.logger._wandb,
+                        reward_preds['actual_rewards'],
+                        reward_preds['predicted_rewards'],
+                        step=i,
+                        save_dir=self.logger._log_dir if hasattr(self.logger, '_log_dir') else None
+                    )
+                except Exception as e:
+                    print(f"Warning: Failed to log reward visualization: {e}")
 
         self.logger.finish(self.agent)

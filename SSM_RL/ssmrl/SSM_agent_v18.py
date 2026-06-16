@@ -86,9 +86,10 @@ class SSMAgent:
         ], lr=lr)
 
 
-        # Group 2 – policy (all three heads)
+        # Group 2 – policy (all three heads) + encoder (so pi_loss can shape representations)
         self.pi_optim = torch.optim.Adam(
-            list(self.model._pi_trunk.parameters())
+            list(self.model._encoder_mean.parameters())
+            + list(self.model._pi_trunk.parameters())
             + list(self.model._pi_mean_head.parameters())
             + list(self.model._pi_log_std_head.parameters()),
             lr=lr, eps=1e-5
@@ -417,9 +418,9 @@ class SSMAgent:
                 c_qp = c_qp.at[s_u:e_u].add(
                     (discount ** t) * r_vec_r)
 
-                # Stage control regularisation: u_penalty * ||u||^2  (block k_u)
-                Q_qp = Q_qp.at[s_u:e_u, s_u:e_u].add(
-                    (discount ** t) * 2.0 * u_penalty * jnp.eye(nU))
+                # # Stage control regularisation: u_penalty * ||u||^2  (block k_u)
+                # Q_qp = Q_qp.at[s_u:e_u, s_u:e_u].add(
+                #     (discount ** t) * 2.0 * u_penalty * jnp.eye(nU))
 
             # Terminal cost – ensemble UCB: mean + beta * std  (optimistic planning)
             Tu_H = T_u_list[H - 1]   # (D, n)
@@ -544,7 +545,8 @@ class SSMAgent:
 
         pi_loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            list(self.model._pi_trunk.parameters())
+            list(self.model._encoder_mean.parameters())
+            + list(self.model._pi_trunk.parameters())
             + list(self.model._pi_mean_head.parameters())
             + list(self.model._pi_log_std_head.parameters()),
             self.grad_clip_norm
@@ -666,7 +668,7 @@ class SSMAgent:
             z_target, a_target, encoder_in, target=True, return_type='min'
         )
         # Sample action from current policy at z_for_p for Q(z_for_p, a)
-        a_for_p = self.model.pi(z_for_p.detach(), deterministic=True)
+        a_for_p = self.model.pi(z_for_p, deterministic=True)
         p_pred_all = self.model.Q_value(z_for_p, a_for_p, encoder_in, target=False, return_type='all')
         p_loss = F.mse_loss(
             p_pred_all, p_target_val.detach().expand_as(p_pred_all)
@@ -689,9 +691,9 @@ class SSMAgent:
         )
         self.model_optim.step()
 
-
-        # ---- Update policy ----
-        pi_loss = self.update_pi(zs[0].detach(), A_diag.detach(), B_mat.detach(), encoder_in.detach())
+        # ---- Update policy (re-encode to get a fresh graph through the encoder) ----
+        z0_pi = self.model.encode(obs[self.history_horizon])   # fresh graph, no detach
+        pi_loss = self.update_pi(z0_pi, A_diag.detach(), B_mat.detach(), encoder_in.detach())
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()

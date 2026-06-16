@@ -2,12 +2,13 @@ defaults:
     - override hydra/launcher: submitit_local
 
 # environment
-task: humanoid_h1-sit_simple-v0
+#task: humanoid_h1-sit_simple-v0
+task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: H=16-no_discount_plan
+exp_name: H=16-latent=32-plan_no_discount
 #agent_name: SSM_agent_v15_const
-agent_name: SSM_agent_v18
+agent_name: SSM_agent_v21
 
 # evaluation
 checkpoint: ???
@@ -77,7 +78,7 @@ num_enc_layers: 2
 enc_dim: 256
 num_channels: 32
 mlp_dim: 512
-latent_dim: 512
+latent_dim: 32
 task_dim: 96
 num_q: 5
 dropout: 0.01
