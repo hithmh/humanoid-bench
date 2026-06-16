@@ -1,41 +1,31 @@
 """
-SSM Agent v18 - PyTorch SSM-RL with a JAX/qpax MPC inference controller.
+SSM Agent v14 – JAX + qpax GPU-accelerated MPC.
 
-The agent wraps ``SSMWorldModel`` from ``ssm_world_model_v6`` and exposes the
-same high-level training/control API as ``SSMRL``:
-  * The world model encodes observations into a latent state, conditions SSM
-    dynamics/reward parameters on a transformer history, rolls out diagonal-A
-    latent dynamics, and trains an ensemble quadratic Q critic.
-  * The model optimizer updates the encoder, transformer, dynamics/reward
-    heads, reward bias, and critic ensemble with consistency, reward, and
-    TD-style critic losses.
-  * The policy optimizer updates the encoder and stochastic policy heads with
-    a SAC-style objective, maximizing critic value while penalizing log-prob.
-  * Target encoder/policy/critic components are used for TD targets and are
-    soft-updated after each training step.
-
-Inference uses the learned policy until ``history_horizon`` observations and
-actions are available.  After that, it attempts a JIT-compiled JAX MPC solve:
-  * The context encoder produces A, B, stage reward-cost terms, and a context
-    embedding for critic parameters.
-  * During training-mode control, relative Gaussian noise is added to encoded
-    SSM parameters and sampled policy noise is added to the planned action for
-    exploration.
-  * Dynamics constraints are analytically eliminated, expressing the full
-    latent trajectory as a linear function of the stacked control vector.
-  * The resulting dense box-constrained QP is solved by ``qpax`` with per-step
-    action bounds from ``cfg.a_bound_low`` and ``cfg.a_bound_high``.
-  * The QP currently uses undiscounted stage costs; terminal ensemble UCB
-    critic terms and the numerical ridge are present in the solver but disabled.
-  * PyTorch tensors are transferred to JAX through DLPack before the solve.
-  * If the QP fails or does not converge, control falls back to the policy.
+Architecture is identical to v11 except for the inference-time controller:
+  * MPC cost is evaluated entirely in JAX (JIT-compiled, runs on GPU/CPU)
+  * The QP is solved by ``qpax`` (pure-JAX interior-point QP solver)
+  * Dynamics constraints are analytically eliminated: the full state trajectory
+    is expressed as a linear function of the stacked control sequence U,
+    reducing the MPC to a single dense QP in U only.
+  * The ensemble terminal cost ``max_i V_i(z)`` is replaced by a latent-space
+    UCB: ``mean_i V_i(z) + beta * std_i V_i(z)``, encouraging optimistic
+    exploration into uncertain regions of state space.  ``beta`` is controlled
+    by ``cfg.ucb_beta`` (default 1.0).
+  * Zero-copy PyTorch ↔ JAX tensor bridge via ``torch.utils.dlpack`` /
+    ``jax.dlpack`` when both tensors live on the same CUDA device.
+  * ``jax.jit`` compiles the full matrix-build + solve once; subsequent calls
+    are fast.
 
 QP form passed to qpax:
-  min   0.5 * U^T Q_qp U + c_qp^T U   (assembled from stage costs)
-  s.t.  G U <= h   (box constraints on each action block)
+  min   ½ U^T Q_qp U + c_qp^T U
+  s.t.  G U ≤ h   (per-step box constraints on actions)
 
-State trajectory with diagonal A:
-  z_{t+1} = A^{t+1} * z_0 + T_u[t] @ U_flat
+State trajectory (A is diagonal):
+  z_{t+1} = A^{t+1} ⊙ z_0  +  T_u[t] @ U_flat
+
+Training loop (``update``) mirrors ``SSMRL.update`` from ``ssmrl.py``:
+  sample buffer → encode → latent rollout → consistency / reward / value losses
+  → update world model → update policy → soft-update targets.
 """
 
 import copy
@@ -49,7 +39,7 @@ import jax.numpy as jnp
 import qpax  # pip install qpax
 
 
-from ssmrl.common.ssm_world_model_v6 import SSMWorldModel
+from ssmrl.common.ssm_world_model_v9 import SSMWorldModel
 from ssmrl.common.scale import RunningScale
 
 
@@ -92,13 +82,13 @@ class SSMAgent:
             {'params': self.model._R_net.parameters()},
             {'params': self.model._r_net.parameters()},
             {'params': [self.model._b]},
-            {'params': self.model._critic_ensemble.parameters()},
+            {'params': self.model._q_func.parameters()},
         ], lr=lr)
 
 
-        # Group 2 – policy (all three heads) + encoder (so pi_loss can shape representations)
+        # Group 2 – policy (separate encoder + all three heads)
         self.pi_optim = torch.optim.Adam(
-            list(self.model._encoder_mean.parameters())
+            list(self.model._pi_encoder.parameters())
             + list(self.model._pi_trunk.parameters())
             + list(self.model._pi_mean_head.parameters())
             + list(self.model._pi_log_std_head.parameters()),
@@ -201,6 +191,7 @@ class SSMAgent:
         else:
             # Attempt JAX/qpax planning
             u_norm = self._plan_jax(z, x0, eval_mode)
+            # u_norm = self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy()
         # Update history
         self.action_history.append(u_norm.copy())
         self.state_history.append(x0.copy())
@@ -246,39 +237,34 @@ class SSMAgent:
         action_t = torch.tensor(action_seq, device=self.device).unsqueeze(0)
         obs_t    = torch.tensor(x0, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-        A_diag, B, Q_diag, q, R_diag, r_vec, encoder_in = self.model.encode_context(
+        A_diag_seq, B, Q_diag_seq, q_seq, R_diag_seq, r_seq, encoder_in = self.model.encode_context(
             state_t, action_t, obs_t)
 
         # ---- Parameter noise for exploration ----
         if not eval_mode:
-            A_diag, B, Q_diag, q, R_diag, r_vec = self._perturb_encoded_params(
-                A_diag, B, Q_diag, q, R_diag, r_vec)
+            std = float(getattr(self.cfg, 'param_noise_std', 0.02))
+            def _noisy(t):
+                scale = t.abs().mean() + 1e-6
+                return t + std * scale * torch.randn_like(t)
+            def _noisy_clamp(t):
+                scale = t.abs().mean() + 1e-6
+                return (t + std * scale * torch.randn_like(t)).clamp(min=0.0)
+            A_diag_seq = _noisy(A_diag_seq)
+            B = _noisy(B)
+            Q_diag_seq = _noisy_clamp(Q_diag_seq)
+            q_seq = _noisy(q_seq)
+            R_diag_seq = _noisy_clamp(R_diag_seq)
+            r_seq = _noisy(r_seq)
 
         # Extract single-sample tensors
-        A_diag_t = A_diag[0]   # (D,)
-        B_t      = B[0]         # (D, nU)
-        Q_diag_t = Q_diag[0]   # (D,)
-        q_t      = q[0]         # (D,)
-        R_diag_t = R_diag[0]   # (nU,)
-        r_vec_t  = r_vec[0]    # (nU,)
-        z_t      = z[0]         # (D,)
+        A_diag_seq_t = A_diag_seq[0]    # (H, D)
+        B_t          = B[0]              # (D, nU)
+        Q_diag_seq_t = Q_diag_seq[0]    # (H, D)
+        q_seq_t      = q_seq[0]          # (H, D)
+        R_diag_seq_t = R_diag_seq[0]    # (H, nU)
+        r_seq_t      = r_seq[0]          # (H, nU)
+        z_t          = z[0]              # (D,)
 
-        # Critic params from ensemble MLPs conditioned on encoder_in
-        E, D, nU = self.num_ensembles, self.latent_dim, self.act_dim
-        P_diags_list, p_list, pb_list = [], [], []
-        Rc_diags_list, rc_list = [], []
-        for net in self.model._critic_ensemble:
-            out = net(encoder_in)                              # [1, 2D+1+2*nU]
-            P_diags_list.append(F.relu(out[:, :D]))            # [1, D]
-            p_list.append(out[:, D:2*D])                       # [1, D]
-            pb_list.append(out[:, 2*D:2*D+1])                  # [1, 1]
-            Rc_diags_list.append(F.relu(out[:, 2*D+1:2*D+1+nU]))  # [1, nU]
-            rc_list.append(out[:, 2*D+1+nU:])                  # [1, nU]
-        P_diags_t = torch.cat(P_diags_list, dim=0)            # [E, D]
-        p_t       = torch.cat(p_list,       dim=0)            # [E, D]
-        pb_t      = torch.cat(pb_list,      dim=0).squeeze(-1)  # [E]
-        Rc_diags_t = torch.cat(Rc_diags_list, dim=0)          # [E, nU]
-        rc_t       = torch.cat(rc_list,       dim=0)          # [E, nU]
 
         # ---- PyTorch → JAX (zero-copy DLPack on CUDA) ----
         def to_jax(t: torch.Tensor):
@@ -288,17 +274,12 @@ class SSMAgent:
         try:
             U_sol, converged = self._jax_solve_mpc(
                 to_jax(z_t),
-                to_jax(A_diag_t),
+                to_jax(A_diag_seq_t),
                 to_jax(B_t),
-                to_jax(Q_diag_t),
-                to_jax(q_t),
-                to_jax(R_diag_t),
-                to_jax(r_vec_t),
-                to_jax(P_diags_t),
-                to_jax(p_t),
-                to_jax(pb_t),
-                to_jax(Rc_diags_t),
-                to_jax(rc_t),
+                to_jax(Q_diag_seq_t),
+                to_jax(q_seq_t),
+                to_jax(R_diag_seq_t),
+                to_jax(r_seq_t),
                 self._a_low_jax,
                 self._a_high_jax,
             )
@@ -340,37 +321,28 @@ class SSMAgent:
         nU  = self.act_dim
         H   = self.horizon
         CH  = H
-        E   = self.num_ensembles
         discount = self.discount
-        discount = 1
+        discount = 1.0
         u_penalty = float(getattr(self.cfg, 'u_penalty', 0.0))
-        ucb_beta  = float(getattr(self.cfg, 'ucb_beta', 1.0))
 
         self._control_horizon = CH
         n = CH * nU   # total QP decision-variable size
 
-        def _build_and_solve(z0, A_diag, B, Q_diag, q_vec,
-                             R_diag_r, r_vec_r,
-                             P_diags, p_mat, pb_vec,
-                             Rc_diags, rc_mat,
+        def _build_and_solve(z0, A_diag_seq, B, Q_diag_seq, q_seq,
+                             R_diag_seq, r_seq,
                              a_low, a_high):
             """
             Args
             ----
-            z0        : (D,)       initial latent state
-            A_diag    : (D,)       diagonal of dynamics matrix A
-            B         : (D, nU)    input matrix
-            Q_diag    : (D,)       diagonal of stage state-cost matrix
-            q_vec     : (D,)       linear state-cost coefficient
-            R_diag_r  : (nU,)      diagonal of stage action-cost matrix (reward)
-            r_vec_r   : (nU,)      linear action-cost coefficient (reward)
-            P_diags   : (E, D)     diagonal of terminal state-critic per ensemble
-            p_mat     : (E, D)     linear terminal state-critic coefficient
-            pb_vec    : (E,)       terminal critic bias
-            Rc_diags  : (E, nU)    diagonal of terminal action-critic per ensemble
-            rc_mat    : (E, nU)    linear terminal action-critic coefficient
-            a_low     : (nU,)      per-dim action lower bound
-            a_high    : (nU,)      per-dim action upper bound
+            z0          : (D,)       initial latent state
+            A_diag_seq  : (H, D)     per-step diagonal of dynamics matrix A
+            B           : (D, nU)    input matrix
+            Q_diag_seq  : (H, D)     per-step diagonal of stage state-cost matrix
+            q_seq       : (H, D)     per-step linear state-cost coefficient
+            R_diag_seq  : (H, nU)    per-step diagonal of stage action-cost matrix
+            r_seq       : (H, nU)    per-step linear action-cost coefficient
+            a_low       : (nU,)      per-dim action lower bound
+            a_high      : (nU,)      per-dim action upper bound
 
             Returns
             -------
@@ -378,13 +350,17 @@ class SSMAgent:
             converged : bool
             """
             # ----------------------------------------------------------
-            # 1. State trajectory matrices (unrolled, compile-time loops)
+            # 1. State trajectory matrices (per-step A_diag)
             # ----------------------------------------------------------
             f_list   = []
             T_u_list = []
 
             for t in range(H):
-                f_list.append((A_diag ** (t + 1)) * z0)
+                # f_t = A_0 * A_1 * ... * A_t * z0  (element-wise cumulative product)
+                A_cum = jnp.ones(D)
+                for s in range(t + 1):
+                    A_cum = A_cum * A_diag_seq[s]
+                f_list.append(A_cum * z0)
 
                 T_u_t = jnp.zeros((D, n))
                 for k in range(CH):
@@ -392,13 +368,20 @@ class SSMAgent:
                     e_k = (k + 1) * nU
                     if k < CH - 1:
                         if k <= t:
-                            coeff = (A_diag ** (t - k))[:, None] * B   # (D, nU)
+                            # coeff = A_{k+1} * ... * A_t * B  (element-wise)
+                            A_prod = jnp.ones(D)
+                            for s in range(k + 1, t + 1):
+                                A_prod = A_prod * A_diag_seq[s]
+                            coeff = A_prod[:, None] * B   # (D, nU)
                             T_u_t = T_u_t.at[:, s_k:e_k].set(coeff)
                     else:
                         # Last ZOH block
                         accum = jnp.zeros((D, nU))
                         for j in range(CH - 1, t + 1):
-                            accum = accum + (A_diag ** (t - j))[:, None] * B
+                            A_prod = jnp.ones(D)
+                            for s in range(j + 1, t + 1):
+                                A_prod = A_prod * A_diag_seq[s]
+                            accum = accum + A_prod[:, None] * B
                         T_u_t = T_u_t.at[:, s_k:e_k].set(accum)
 
                 T_u_list.append(T_u_t)
@@ -418,58 +401,28 @@ class SSMAgent:
                 Tu  = T_u_list[t]   # (D, n)
                 f   = f_list[t]     # (D,)
 
-                # Stage state cost: z^T diag(Q) z + q^T z
-                QTu  = Q_diag[:, None] * Tu          # (D, n)
+                # Stage state cost: z^T diag(Q[t]) z + q[t]^T z  (per-step Q and q)
+                Q_t = Q_diag_seq[t]              # (D,)
+                q_t = q_seq[t]                   # (D,)
+                QTu  = Q_t[:, None] * Tu          # (D, n)
                 Q_qp = Q_qp + (discount ** t) * 2.0 * (Tu.T @ QTu)
-                c_qp = c_qp + (discount ** t) * (2.0 * (QTu.T @ f) + Tu.T @ q_vec)
+                c_qp = c_qp + (discount ** t) * (2.0 * (QTu.T @ f) + Tu.T @ q_t)
 
-                # Stage action cost: u_t^T diag(R_r) u_t + r_r^T u_t  (block k_u)
+                # Stage action cost: u_t^T diag(R[t]) u_t + r[t]^T u_t  (per-step, block k_u)
                 Q_qp = Q_qp.at[s_u:e_u, s_u:e_u].add(
-                    (discount ** t) * 2.0 * jnp.diag(R_diag_r))
+                    (discount ** t) * 2.0 * jnp.diag(R_diag_seq[t]))
                 c_qp = c_qp.at[s_u:e_u].add(
-                    (discount ** t) * r_vec_r)
+                    (discount ** t) * r_seq[t])
 
                 # # Stage control regularisation: u_penalty * ||u||^2  (block k_u)
                 # Q_qp = Q_qp.at[s_u:e_u, s_u:e_u].add(
                 #     (discount ** t) * 2.0 * u_penalty * jnp.eye(nU))
 
-            # # Terminal cost – ensemble UCB: mean + beta * std  (optimistic planning)
-            # Tu_H = T_u_list[H - 1]   # (D, n)
-            # f_H  = f_list[H - 1]     # (D,)
-            #
-            # # Latent-Space UCB for state part
-            # P_mean = jnp.mean(P_diags, axis=0)                         # (D,)
-            # P_std  = jnp.std( P_diags, axis=0)                         # (D,)
-            # P_ucb  = P_mean + ucb_beta * P_std                         # (D,)
-            #
-            # p_mean = jnp.mean(p_mat, axis=0)                           # (D,)
-            # p_std  = jnp.std( p_mat, axis=0)                           # (D,)
-            # p_ucb  = p_mean + ucb_beta * p_std                         # (D,)
-            #
-            # PTu  = P_ucb[:, None] * Tu_H                               # (D, n)
-            # Q_qp = Q_qp + (discount ** H) * 2.0 * (Tu_H.T @ PTu)
-            # c_qp = c_qp + (discount ** H) * (2.0 * (PTu.T @ f_H) + Tu_H.T @ p_ucb)
-            #
-            # # Terminal action cost UCB – action part of Q(z_H, u_H)
-            # # u_H corresponds to the last control block: indices [s_u_H : e_u_H]
-            # s_u_H = (CH - 1) * nU
-            # e_u_H = CH * nU
-            #
-            # Rc_mean = jnp.mean(Rc_diags, axis=0)                       # (nU,)
-            # Rc_std  = jnp.std( Rc_diags, axis=0)                       # (nU,)
-            # Rc_ucb  = Rc_mean + ucb_beta * Rc_std                      # (nU,)
-            #
-            # rc_mean = jnp.mean(rc_mat, axis=0)                         # (nU,)
-            # rc_std  = jnp.std( rc_mat, axis=0)                         # (nU,)
-            # rc_ucb  = rc_mean + ucb_beta * rc_std                      # (nU,)
-            #
-            # Q_qp = Q_qp.at[s_u_H:e_u_H, s_u_H:e_u_H].add(
-            #     (discount ** H) * 2.0 * jnp.diag(Rc_ucb))
-            # c_qp = c_qp.at[s_u_H:e_u_H].add(
-            #     (discount ** H) * rc_ucb)
+            # Note: Terminal cost Q(z_H, u_H) is now handled by a separate MLP
+            # and not included in the QP. The MPC only optimizes the stage costs.
 
-            # # Ridge for numerical stability
-            # Q_qp = Q_qp + 1e-6 * jnp.eye(n)
+            # Ridge for numerical stability
+            Q_qp = Q_qp + 1e-6 * jnp.eye(n)
 
             # ----------------------------------------------------------
             # 3. Inequality constraints: a_low ≤ u_t ≤ a_high  ∀t
@@ -556,7 +509,7 @@ class SSMAgent:
 
         pi_loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            list(self.model._encoder_mean.parameters())
+            list(self.model._pi_encoder.parameters())
             + list(self.model._pi_trunk.parameters())
             + list(self.model._pi_mean_head.parameters())
             + list(self.model._pi_log_std_head.parameters()),
@@ -614,16 +567,16 @@ class SSMAgent:
 
         H = self.horizon  # horizon
 
-        # ---- Compute targets (no grad) ----
-        with torch.no_grad():
-            next_mean = self.model.encode(obs[1:])  # [H, B, D]
-            # Build encoder_in for target computation using history
-            ctx_state_tgt = obs[:self.history_horizon].permute(1, 0, 2)
-            ctx_action_tgt = action[:self.history_horizon].permute(1, 0, 2)
-            _, _, _, _, _, _, encoder_in = self.model.encode_context(
-                ctx_state_tgt, ctx_action_tgt, obs[self.history_horizon]
-            )
-            td_targets = self._td_target(next_mean, reward, encoder_in)
+        # # ---- Compute targets (no grad) ----
+        # with torch.no_grad():
+        next_mean = self.model.encode(obs[1:])  # [H, B, D]
+        #     # Build encoder_in for target computation using history
+        #     ctx_state_tgt = obs[:self.history_horizon].permute(1, 0, 2)
+        #     ctx_action_tgt = action[:self.history_horizon].permute(1, 0, 2)
+        #     _, _, _, _, _, _, encoder_in = self.model.encode_context(
+        #         ctx_state_tgt, ctx_action_tgt, obs[self.history_horizon]
+        #     )
+        #     td_targets = self._td_target(next_mean, reward, encoder_in)
 
         # ---- Prepare for update ----
         self.model_optim.zero_grad(set_to_none=True)
@@ -634,7 +587,7 @@ class SSMAgent:
 
         # ---- Encode first obs ----
         z = self.model.encode(obs[self.history_horizon])  # [B, D]
-        z_target = self.model.encode(obs[self.history_horizon+1], target=True)
+        z_target = self.model.encode(obs[self.history_horizon+ H], target=True)
         z_random = z
 
         # ---- Build context for transformer ----
@@ -643,7 +596,7 @@ class SSMAgent:
         ## rearrange the dimension from  [history_horizon, batch, state_dim] to  [batch, history_horizon, state_dim]
         ctx_state = ctx_state.permute(1, 0, 2)
         ctx_action = ctx_action.permute(1, 0, 2)
-        A_diag, B_mat, Q_diag, q, R_diag, r_vec, encoder_in = self.model.encode_context(
+        A_diag_seq, B_mat, Q_diag_seq, q_seq, R_diag_seq, r_seq, encoder_in = self.model.encode_context(
             ctx_state, ctx_action, obs[self.history_horizon]
         )
 
@@ -654,8 +607,8 @@ class SSMAgent:
         z_randoms[0] = z_random
         consistency_loss = torch.tensor(0.0, device=self.device)
         for t in range(H):
-            z = self.model.next(z, action[t+self.history_horizon], A_diag, B_mat)
-            z_random = self.model.next(z_random, action[t+self.history_horizon], A_diag, B_mat)
+            z = self.model.next(z, action[t+self.history_horizon], A_diag_seq[:, t, :], B_mat)
+            z_random = self.model.next(z_random, action[t+self.history_horizon], A_diag_seq[:, t, :], B_mat)
             consistency_loss += F.mse_loss(z, next_mean[t+self.history_horizon]) * (self.rho ** t)
             zs[t + 1] = z
             z_randoms[t + 1] = z_random
@@ -665,29 +618,27 @@ class SSMAgent:
         for t in range(H):
             r_pred = self.model.reward(
                 z_randoms[t+1], action[t+self.history_horizon],
-                Q_diag, q, R_diag, r_vec
+                Q_diag_seq[:, t, :], q_seq[:, t, :], R_diag_seq[:, t, :], r_seq[:, t, :]
             )
             reward_loss += F.mse_loss(r_pred, reward[t+self.history_horizon]) * (self.rho ** t)
 
-        # ---- Value loss (P-critic) ----
-        z_for_p = zs[0]
+        # ---- Value loss (Q-function) ----
+        z_for_q = self.model.encode(obs[self.history_horizon + H-1])
         # Sample action from target policy at z_target for Q(z_target, a_target)
         with torch.no_grad():
             a_target = self.model.pi(z_target, target=True, deterministic=True)
 
-        p_target_val = reward[self.history_horizon] + self.discount * self.model.Q_value(
-            z_target, a_target, encoder_in, target=True, return_type='min'
+        q_target_val = reward[self.history_horizon] + self.discount * self.model.Q_value(
+            z_target, a_target, encoder_in, target=True
         )
-        # Sample action from current policy at z_for_p for Q(z_for_p, a)
-        a_for_p = self.model.pi(z_for_p, deterministic=True)
-        p_pred_all = self.model.Q_value(z_for_p, a_for_p, encoder_in, target=False, return_type='all')
-        p_loss = F.mse_loss(
-            p_pred_all, p_target_val.detach().expand_as(p_pred_all)
-        )
+        # Sample action from current policy at z_for_q for Q(z_for_q, a)
+        a_for_q = action[self.history_horizon + H-1]
+        q_pred = self.model.Q_value(z_for_q, a_for_q, encoder_in, target=False)
+        q_loss = F.mse_loss(q_pred, q_target_val.detach())
         # Normalise
         consistency_loss = consistency_loss / H
         reward_loss = reward_loss / H
-        value_loss = p_loss
+        value_loss = q_loss
 
         total_loss = (
             self.consistency_coef * consistency_loss
@@ -704,7 +655,7 @@ class SSMAgent:
 
         # ---- Update policy (re-encode to get a fresh graph through the encoder) ----
         z0_pi = self.model.encode(obs[self.history_horizon])   # fresh graph, no detach
-        pi_loss = self.update_pi(z0_pi, A_diag.detach(), B_mat.detach(), encoder_in.detach())
+        pi_loss = self.update_pi(z0_pi, A_diag_seq.detach(), B_mat.detach(), encoder_in.detach())
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()
@@ -715,9 +666,77 @@ class SSMAgent:
             'consistency_loss': float(consistency_loss.item()),
             'reward_loss': float(reward_loss.item()),
             'value_loss': float(value_loss.item()),
-            'p_loss': float(p_loss.item()),
+            'q_loss': float(q_loss.item()),
             'pi_loss': pi_loss,
             'total_loss': float(total_loss.item()),
             'grad_norm': float(grad_norm),
             'pi_scale': float(self.scale.value),
+        }
+
+    # ------------------------------------------------------------------
+    # Reward prediction visualization
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def compute_reward_predictions(self, buffer, num_samples=1):
+        """
+        Compute predicted vs actual rewards for visualization.
+
+        Args:
+            buffer: replay buffer
+            num_samples: number of samples to compute predictions for
+
+        Returns:
+            dict with 'actual_rewards' and 'predicted_rewards' arrays (numpy)
+        """
+        self.model.eval()
+
+        actual_rewards_list = []
+        predicted_rewards_list = []
+
+        for _ in range(num_samples):
+            # Sample from buffer
+            sample = buffer.sample()
+            obs, action, reward, _ = sample
+            obs = obs.to(self.device)
+            action = action.to(self.device)
+            reward = reward.to(self.device)
+
+            H = self.horizon
+            B = obs.shape[1]
+
+            # Build context
+            ctx_state = obs[:self.history_horizon].permute(1, 0, 2)
+            ctx_action = action[:self.history_horizon].permute(1, 0, 2)
+            A_diag_seq, B_mat, Q_diag_seq, q_seq, R_diag_seq, r_seq, encoder_in = self.model.encode_context(
+                ctx_state, ctx_action, obs[self.history_horizon]
+            )
+
+            # Get initial latent state
+            z = self.model.encode(obs[self.history_horizon])
+
+            # Rollout and predict rewards
+            predicted_rewards = []
+            for t in range(H):
+                z = self.model.next(z, action[t+self.history_horizon], A_diag_seq[:, t, :], B_mat)
+                r_pred = self.model.reward(
+                    z, action[t+self.history_horizon],
+                    Q_diag_seq[:, t, :], q_seq[:, t, :], R_diag_seq[:, t, :], r_seq[:, t, :]
+                )
+                predicted_rewards.append(r_pred.detach().cpu().numpy())
+
+            # Stack predictions
+            predicted_rewards = np.concatenate(predicted_rewards, axis=0)  # (H*B, 1)
+            actual_rewards = reward[self.history_horizon:self.history_horizon+H].detach().cpu().numpy()  # (H, B, 1)
+            actual_rewards = actual_rewards.reshape(-1, 1)
+
+            actual_rewards_list.append(actual_rewards)
+            predicted_rewards_list.append(predicted_rewards)
+
+        # Concatenate all samples
+        actual_rewards_all = np.concatenate(actual_rewards_list, axis=0)
+        predicted_rewards_all = np.concatenate(predicted_rewards_list, axis=0)
+
+        return {
+            'actual_rewards': actual_rewards_all.flatten(),
+            'predicted_rewards': predicted_rewards_all.flatten(),
         }

@@ -6,9 +6,9 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: H=16-latent=32-plan_no_discount
+exp_name: H=16-latent=32-plan_no_discount-no_terminal
 #agent_name: SSM_agent_v15_const
-agent_name: SSM_agent_v21
+agent_name: SSM_agent_v18
 
 # evaluation
 checkpoint: ???
