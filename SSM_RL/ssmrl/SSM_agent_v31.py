@@ -32,12 +32,12 @@ Training loop:
   update SAC-style policy with entropy regularization -> soft-update targets.
 """
 
+import os
 import copy
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-# ---- JAX stack (required) -----------------------------------------------
 import jax
 import jax.numpy as jnp
 import qpax  # pip install qpax
@@ -59,6 +59,7 @@ class SSMAgent:
     def __init__(self, cfg):
         self.cfg = cfg
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._jax_has_cuda = any(d.platform in ('cuda', 'gpu') for d in jax.devices())
 
         # World model
         self.model = SSMWorldModel(cfg).to(self.device)
@@ -294,7 +295,7 @@ class SSMAgent:
         # otherwise copy through CPU so CUDA Torch + CPU-only JAX still works.
         def to_jax(t: torch.Tensor):
             t = t.detach().contiguous()
-            if t.is_cuda and not any(d.platform in ('cuda', 'gpu') for d in jax.devices()):
+            if t.is_cuda and not self._jax_has_cuda:
                 return jnp.asarray(t.cpu().numpy())
             try:
                 return jax.dlpack.from_dlpack(t)
