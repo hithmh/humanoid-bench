@@ -25,9 +25,33 @@ class OnlineTrainer(Trainer):
             total_time=time() - self._start_time,
         )
 
+    def control_metrics(self):
+        if hasattr(self.agent, 'get_control_metrics'):
+            return self.agent.get_control_metrics()
+        return {'qpax_solver_failures': 0}
+
+    @staticmethod
+    def average_control_metrics(metrics_list):
+        if not metrics_list:
+            return {'qpax_solver_failures': 0}
+        keys = set().union(*(metrics.keys() for metrics in metrics_list))
+        averaged = {}
+        for key in keys:
+            values = [metrics.get(key, 0) for metrics in metrics_list]
+            if all(isinstance(value, (int, float, np.number)) for value in values):
+                averaged[key] = np.nanmean(values)
+            else:
+                string_values = []
+                for value in values:
+                    value = str(value)
+                    if value and value not in {'0', 'none'} and value not in string_values:
+                        string_values.append(value)
+                averaged[key] = ' | '.join(string_values)
+        return averaged
+
     def eval(self):
         """Evaluate a TD-MPC2 agent."""
-        ep_rewards, ep_successes = [], []
+        ep_rewards, ep_successes, ep_control_metrics = [], [], []
         for i in range(self.cfg.eval_episodes):
             obs, done, ep_reward, t = self.env.reset()[0], False, 0, 0
             self.agent.reset_for_control()
@@ -43,13 +67,16 @@ class OnlineTrainer(Trainer):
                     self.logger.video.record(self.env)
             ep_rewards.append(ep_reward)
             ep_successes.append(info["success"])
+            ep_control_metrics.append(self.control_metrics())
             if self.cfg.save_video:
                 # self.logger.video.save(self._step)
                 self.logger.video.save(self._step, key='results/video')
-        return dict(
+        metrics = dict(
             episode_reward=np.nanmean(ep_rewards),
             episode_success=np.nanmean(ep_successes),
         )
+        metrics.update(self.average_control_metrics(ep_control_metrics))
+        return metrics
 
     def to_td(self, obs, action=None, reward=None):
         """Creates a TensorDict for a new episode."""
@@ -85,6 +112,7 @@ class OnlineTrainer(Trainer):
 
             # Reset environment
             if done:
+                control_metrics = self.control_metrics()
                 if eval_next:
                     eval_metrics = self.eval()
                     eval_metrics.update(self.common_metrics())
@@ -97,6 +125,7 @@ class OnlineTrainer(Trainer):
                             [td["reward"] for td in self._tds[1:]]
                         ).sum(),
                         episode_success=info["success"],
+                        **control_metrics,
                     )
                     train_metrics.update(self.common_metrics())
 
@@ -107,6 +136,7 @@ class OnlineTrainer(Trainer):
                                        'success': train_metrics['episode_success'],
                                        'success_subtasks': info['success_subtasks'],
                                        'step': self._step,
+                                       **control_metrics,
                                        **loss_metrics}
 
                     self.logger.log(train_metrics, "train")

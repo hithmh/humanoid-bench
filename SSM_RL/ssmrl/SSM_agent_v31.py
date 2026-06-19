@@ -43,7 +43,7 @@ import jax.numpy as jnp
 import qpax  # pip install qpax
 
 
-from ssmrl.common.ssm_world_model_v9 import SSMWorldModel
+from ssmrl.common.ssm_world_model_v10 import SSMWorldModel
 from ssmrl.common.scale import RunningScale
 
 
@@ -90,10 +90,9 @@ class SSMAgent:
         ], lr=lr)
 
 
-        # Group 2 – policy (separate encoder + all three heads)
+        # Group 2 - raw-observation policy trunk and action heads
         self.pi_optim = torch.optim.Adam(
-            list(self.model._pi_encoder.parameters())
-            + list(self.model._pi_trunk.parameters())
+            list(self.model._pi_trunk.parameters())
             + list(self.model._pi_mean_head.parameters())
             + list(self.model._pi_log_std_head.parameters()),
             lr=lr, eps=1e-5
@@ -124,9 +123,10 @@ class SSMAgent:
         self.shift_u = np.zeros(self.act_dim)
         self.scale_u = np.ones(self.act_dim)
 
-        # History buffers for inference (transformer context)
+        # History buffers and episode-scoped control diagnostics
         self.state_history = []
         self.action_history = []
+        self._reset_qpax_diagnostics()
 
         # Build JAX + qpax MPC controller
         self._build_jax_controller()
@@ -190,12 +190,12 @@ class SSMAgent:
 
         # Decide action
         if len(self.state_history) < self.history_horizon:
-            # Not enough history for transformer – use policy net
-            u_norm = self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy()
+            # Not enough history for transformer - use policy net on raw obs
+            u_norm = self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy()
         else:
             # Attempt JAX/qpax planning
             u_norm = self._plan_jax(z, x0, eval_mode)
-            # u_norm = self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy()
+            # u_norm = self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy()
         # Update history
         self.action_history.append(u_norm.copy())
         self.state_history.append(x0.copy())
@@ -205,13 +205,11 @@ class SSMAgent:
         return u
 
     @torch.no_grad()
-    def _perturb_encoded_params(self, A_diag, B, Q_diag, q, R_diag, r_vec):
+    def _perturb_encoded_params(self, A_diag, B, Q, q, R, r_vec):
         """
-        Add relative Gaussian noise to encoded SSM parameters (A_diag, B, Q_diag, q, R_diag, r_vec)
-        for exploration.  Noise magnitude is proportional to each tensor's mean
-        absolute value, so the perturbation is scale-invariant.
-
-        Controlled by ``cfg.param_noise_std`` (default 0.02).
+        Add relative Gaussian noise to encoded SSM parameters for exploration.
+        Full quadratic matrices are perturbed by congruence transforms,
+        preserving PSD structure.
         """
         std = float(getattr(self.cfg, 'param_noise_std', 0.02))
 
@@ -219,11 +217,13 @@ class SSMAgent:
             scale = t.abs().mean() + 1e-6
             return t + std * scale * torch.randn_like(t)
 
-        # Q_diag / R_diag must stay non-negative so that the quadratic forms remain PSD.
-        noisy_Q_diag = _noisy(Q_diag).clamp(min=0.0)
-        noisy_R_diag = _noisy(R_diag).clamp(min=0.0)
+        def _noisy_psd(M: torch.Tensor) -> torch.Tensor:
+            dim = M.shape[-1]
+            eye = torch.eye(dim, device=M.device, dtype=M.dtype)
+            S = eye.expand(*M.shape[:-2], dim, dim) + std * torch.randn_like(M)
+            return S @ M @ S.transpose(-1, -2)
 
-        return _noisy(A_diag), _noisy(B), noisy_Q_diag, _noisy(q), noisy_R_diag, _noisy(r_vec)
+        return _noisy(A_diag), _noisy(B), _noisy_psd(Q), _noisy(q), _noisy_psd(R), _noisy(r_vec)
 
     def _plan_jax(self, z: torch.Tensor, x0: np.ndarray, eval_mode: bool):
         """
@@ -241,63 +241,103 @@ class SSMAgent:
         action_t = torch.tensor(action_seq, device=self.device).unsqueeze(0)
         obs_t    = torch.tensor(x0, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-        A_diag_seq, B, Q_diag_seq, q_seq, R_diag_seq, r_seq, encoder_in = self.model.encode_context(
+        A_diag_seq, B, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
             state_t, action_t, obs_t)
 
-        # ---- Parameter noise for exploration ----
-        if not eval_mode:
-            std = float(getattr(self.cfg, 'param_noise_std', 0.02))
-            def _noisy(t):
-                scale = t.abs().mean() + 1e-6
-                return t + std * scale * torch.randn_like(t)
-            def _noisy_clamp(t):
-                scale = t.abs().mean() + 1e-6
-                return (t + std * scale * torch.randn_like(t)).clamp(min=0.0)
-            A_diag_seq = _noisy(A_diag_seq)
-            B = _noisy(B)
-            Q_diag_seq = _noisy_clamp(Q_diag_seq)
-            q_seq = _noisy(q_seq)
-            R_diag_seq = _noisy_clamp(R_diag_seq)
-            r_seq = _noisy(r_seq)
+        # # ---- Parameter noise for exploration ----
+        # if not eval_mode:
+        #     std = float(getattr(self.cfg, 'param_noise_std', 0.02))
+        #     def _noisy(t):
+        #         scale = t.abs().mean() + 1e-6
+        #         return t + std * scale * torch.randn_like(t)
+        #     def _noisy_psd(M):
+        #         dim = M.shape[-1]
+        #         eye = torch.eye(dim, device=M.device, dtype=M.dtype)
+        #         S = eye.expand(*M.shape[:-2], dim, dim) + std * torch.randn_like(M)
+        #         return S @ M @ S.transpose(-1, -2)
+        #     A_diag_seq = _noisy(A_diag_seq)
+        #     B = _noisy(B)
+        #     Q_seq = _noisy_psd(Q_seq)
+        #     q_seq = _noisy(q_seq)
+        #     R_seq = _noisy_psd(R_seq)
+        #     r_seq = _noisy(r_seq)
 
         # Extract single-sample tensors
         A_diag_seq_t = A_diag_seq[0]    # (H, D)
         B_t          = B[0]              # (D, nU)
-        Q_diag_seq_t = Q_diag_seq[0]    # (H, D)
+        Q_seq_t      = Q_seq[0]          # (H, D, D)
         q_seq_t      = q_seq[0]          # (H, D)
-        R_diag_seq_t = R_diag_seq[0]    # (H, nU)
+        R_seq_t      = R_seq[0]          # (H, nU, nU)
         r_seq_t      = r_seq[0]          # (H, nU)
         z_t          = z[0]              # (D,)
 
 
-        # ---- PyTorch → JAX (zero-copy DLPack on CUDA) ----
+        self.qpax_solver_attempts += 1
+        input_tensors = {
+            'z': z_t,
+            'A': A_diag_seq_t,
+            'B': B_t,
+            'Q': Q_seq_t,
+            'q': q_seq_t,
+            'R': R_seq_t,
+            'r': r_seq_t,
+        }
+        bad_inputs = [name for name, tensor in input_tensors.items()
+                      if not torch.isfinite(tensor).all().item()]
+        if bad_inputs:
+            self._record_qpax_failure('input_nonfinite', ','.join(bad_inputs))
+            for name in bad_inputs:
+                self.qpax_nonfinite_inputs[name] += 1
+            return self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy()
+
+        # ---- PyTorch -> JAX. Use DLPack when both libraries share a backend;
+        # otherwise copy through CPU so CUDA Torch + CPU-only JAX still works.
         def to_jax(t: torch.Tensor):
-            return jax.dlpack.from_dlpack(
-                torch.utils.dlpack.to_dlpack(t.detach().contiguous()))
+            t = t.detach().contiguous()
+            if t.is_cuda and not any(d.platform in ('cuda', 'gpu') for d in jax.devices()):
+                return jnp.asarray(t.cpu().numpy())
+            try:
+                return jax.dlpack.from_dlpack(t)
+            except TypeError:
+                try:
+                    return jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(t))
+                except RuntimeError as exc:
+                    if t.is_cuda and 'Unknown backend cuda' in str(exc):
+                        return jnp.asarray(t.cpu().numpy())
+                    raise
+            except RuntimeError as exc:
+                if t.is_cuda and 'Unknown backend cuda' in str(exc):
+                    return jnp.asarray(t.cpu().numpy())
+                raise
 
         try:
             U_sol, converged = self._jax_solve_mpc(
                 to_jax(z_t),
                 to_jax(A_diag_seq_t),
                 to_jax(B_t),
-                to_jax(Q_diag_seq_t),
+                to_jax(Q_seq_t),
                 to_jax(q_seq_t),
-                to_jax(R_diag_seq_t),
+                to_jax(R_seq_t),
                 to_jax(r_seq_t),
                 self._a_low_jax,
                 self._a_high_jax,
             )
             if not bool(converged):
-                return self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy()
+                self._record_qpax_failure('nonconverged')
+                return self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy()
             u = np.asarray(U_sol[0], dtype=np.float32)   # first control step
-        except Exception:
-            return self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy()
+            if not np.isfinite(u).all():
+                self._record_qpax_failure('solution_nonfinite')
+                return self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy()
+        except Exception as exc:
+            self._record_qpax_failure('exception', exc)
+            return self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy()
 
-        if not eval_mode:
-            std = self.model.get_pi_std(z)[0]
-            epsilon = (std * torch.randn(self.act_dim, device=std.device)
-                       ).detach().cpu().numpy()
-            u = u + epsilon
+        # if not eval_mode:
+        #     std = self.model.get_pi_std(obs_t)[0]
+        #     epsilon = (std * torch.randn(self.act_dim, device=std.device)
+        #                ).detach().cpu().numpy()
+        #     u = u + epsilon
 
         return np.clip(u, -1.0, 1.0).astype(np.float32)
 
@@ -317,8 +357,8 @@ class SSMAgent:
             min   ½ U^T Q_qp U + c_qp^T U
             s.t.  G U ≤ h   (box constraints on each u_t)
 
-        Stage reward:  r(z_t, u_t) = -(z_t^T diag(Q_r) z_t + q_r^T z_t
-                                        + u_t^T diag(R_r) u_t + r_r^T u_t + b)
+        Stage reward:  r(z_t, u_t) = -(z_t^T Q_r z_t + q_r^T z_t
+                                        + u_t^T R_r u_t + r_r^T u_t + b)
         Terminal cost (Q-value): Q(z_H, u_H) UCB over ensemble.
         """
         D   = self.latent_dim
@@ -332,8 +372,8 @@ class SSMAgent:
         self._control_horizon = CH
         n = CH * nU   # total QP decision-variable size
 
-        def _build_and_solve(z0, A_diag_seq, B, Q_diag_seq, q_seq,
-                             R_diag_seq, r_seq,
+        def _build_and_solve(z0, A_diag_seq, B, Q_seq, q_seq,
+                             R_seq, r_seq,
                              a_low, a_high):
             """
             Args
@@ -341,9 +381,9 @@ class SSMAgent:
             z0          : (D,)       initial latent state
             A_diag_seq  : (H, D)     per-step diagonal of dynamics matrix A
             B           : (D, nU)    input matrix
-            Q_diag_seq  : (H, D)     per-step diagonal of stage state-cost matrix
+            Q_seq       : (H, D, D)  per-step PSD stage state-cost matrix
             q_seq       : (H, D)     per-step linear state-cost coefficient
-            R_diag_seq  : (H, nU)    per-step diagonal of stage action-cost matrix
+            R_seq       : (H, nU, nU) per-step PSD stage action-cost matrix
             r_seq       : (H, nU)    per-step linear action-cost coefficient
             a_low       : (nU,)      per-dim action lower bound
             a_high      : (nU,)      per-dim action upper bound
@@ -405,16 +445,16 @@ class SSMAgent:
                 Tu  = T_u_list[t]   # (D, n)
                 f   = f_list[t]     # (D,)
 
-                # Stage state cost: z^T diag(Q[t]) z + q[t]^T z  (per-step Q and q)
-                Q_t = Q_diag_seq[t]              # (D,)
+                # Stage state cost: z^T Q[t] z + q[t]^T z  (per-step Q and q)
+                Q_t = Q_seq[t]                   # (D, D)
                 q_t = q_seq[t]                   # (D,)
-                QTu  = Q_t[:, None] * Tu          # (D, n)
+                QTu = Q_t @ Tu                   # (D, n)
                 Q_qp = Q_qp + (discount ** t) * 2.0 * (Tu.T @ QTu)
                 c_qp = c_qp + (discount ** t) * (2.0 * (QTu.T @ f) + Tu.T @ q_t)
 
-                # Stage action cost: u_t^T diag(R[t]) u_t + r[t]^T u_t  (per-step, block k_u)
+                # Stage action cost: u_t^T R[t] u_t + r[t]^T u_t  (per-step, block k_u)
                 Q_qp = Q_qp.at[s_u:e_u, s_u:e_u].add(
-                    (discount ** t) * 2.0 * jnp.diag(R_diag_seq[t]))
+                    (discount ** t) * 2.0 * R_seq[t])
                 c_qp = c_qp.at[s_u:e_u].add(
                     (discount ** t) * r_seq[t])
 
@@ -460,49 +500,140 @@ class SSMAgent:
     # ------------------------------------------------------------------
     # Episode reset
     # ------------------------------------------------------------------
+    def _reset_qpax_diagnostics(self):
+        self.qpax_solver_attempts = 0
+        self.qpax_solver_failures = 0
+        self.qpax_solver_nonconverged = 0
+        self.qpax_solver_exceptions = 0
+        self.qpax_solver_input_nonfinite = 0
+        self.qpax_solver_solution_nonfinite = 0
+        self.qpax_nonfinite_inputs = {name: 0 for name in ('z', 'A', 'B', 'Q', 'q', 'R', 'r')}
+        self.qpax_last_failure_reason = 'none'
+        self.qpax_last_exception_type = 'none'
+        self.qpax_last_exception_message = ''
+        self.qpax_exception_samples = []
+
+    def _add_qpax_exception_sample(self, sample):
+        sample = str(sample)[:512]
+        if sample and sample not in self.qpax_exception_samples:
+            self.qpax_exception_samples.append(sample)
+            self.qpax_exception_samples = self.qpax_exception_samples[-5:]
+
+    def _record_qpax_failure(self, reason, detail=None):
+        self.qpax_solver_failures += 1
+        self.qpax_last_failure_reason = reason
+        if reason == 'nonconverged':
+            self.qpax_solver_nonconverged += 1
+        elif reason == 'exception':
+            self.qpax_solver_exceptions += 1
+            self.qpax_last_exception_type = type(detail).__name__
+            self.qpax_last_exception_message = str(detail)[:512]
+            self._add_qpax_exception_sample(
+                f'{self.qpax_last_exception_type}: {self.qpax_last_exception_message}')
+        elif reason == 'input_nonfinite':
+            self.qpax_solver_input_nonfinite += 1
+            self.qpax_last_exception_type = 'input_nonfinite'
+            self.qpax_last_exception_message = str(detail)
+            self._add_qpax_exception_sample(f'input_nonfinite: {detail}')
+        elif reason == 'solution_nonfinite':
+            self.qpax_solver_solution_nonfinite += 1
+            self.qpax_last_exception_type = 'solution_nonfinite'
+            self.qpax_last_exception_message = ''
+            self._add_qpax_exception_sample('solution_nonfinite')
+
     def reset_for_control(self):
         self.state_history = []
         self.action_history = []
+        self._reset_qpax_diagnostics()
+
+    def get_control_metrics(self):
+        successes = self.qpax_solver_attempts - self.qpax_solver_failures
+        failure_rate = (self.qpax_solver_failures / self.qpax_solver_attempts
+                        if self.qpax_solver_attempts else 0.0)
+        metrics = {
+            'qpax_solver_attempts': int(self.qpax_solver_attempts),
+            'qpax_solver_successes': int(successes),
+            'qpax_solver_failures': int(self.qpax_solver_failures),
+            'qpax_solver_failure_rate': float(failure_rate),
+            'qpax_solver_nonconverged': int(self.qpax_solver_nonconverged),
+            'qpax_solver_exceptions': int(self.qpax_solver_exceptions),
+            'qpax_solver_input_nonfinite': int(self.qpax_solver_input_nonfinite),
+            'qpax_solver_solution_nonfinite': int(self.qpax_solver_solution_nonfinite),
+        }
+        metrics.update({
+            f'qpax_nonfinite_{name}': int(count)
+            for name, count in self.qpax_nonfinite_inputs.items()
+        })
+        metrics.update({
+            'qpax_last_failure_reason': self.qpax_last_failure_reason,
+            'qpax_last_exception_type': self.qpax_last_exception_type,
+            'qpax_last_exception_message': self.qpax_last_exception_message,
+            'qpax_exception_samples': ' | '.join(self.qpax_exception_samples),
+        })
+        return metrics
+
+    def get_control_diagnostics(self):
+        return self.get_control_metrics()
 
     def store_cached_control_info(self):
         self._cached = copy.deepcopy({
             'state_history': self.state_history,
             'action_history': self.action_history,
+            'qpax_diagnostics': self.get_control_diagnostics(),
         })
 
     def restore_control_info(self):
         if hasattr(self, '_cached'):
             self.state_history = self._cached['state_history']
             self.action_history = self._cached['action_history']
+            self._reset_qpax_diagnostics()
+            diagnostics = self._cached.get('qpax_diagnostics')
+            if diagnostics is None:
+                self.qpax_solver_failures = self._cached.get('qpax_solver_failures', 0)
+                self.qpax_solver_attempts = self.qpax_solver_failures
+            else:
+                self.qpax_solver_attempts = diagnostics.get('qpax_solver_attempts', 0)
+                self.qpax_solver_failures = diagnostics.get('qpax_solver_failures', 0)
+                self.qpax_solver_nonconverged = diagnostics.get('qpax_solver_nonconverged', 0)
+                self.qpax_solver_exceptions = diagnostics.get('qpax_solver_exceptions', 0)
+                self.qpax_solver_input_nonfinite = diagnostics.get('qpax_solver_input_nonfinite', 0)
+                self.qpax_solver_solution_nonfinite = diagnostics.get('qpax_solver_solution_nonfinite', 0)
+                for name in self.qpax_nonfinite_inputs:
+                    self.qpax_nonfinite_inputs[name] = diagnostics.get(f'qpax_nonfinite_{name}', 0)
+                self.qpax_last_failure_reason = diagnostics.get('qpax_last_failure_reason', 'none')
+                self.qpax_last_exception_type = diagnostics.get('qpax_last_exception_type', 'none')
+                self.qpax_last_exception_message = diagnostics.get('qpax_last_exception_message', '')
+                samples = diagnostics.get('qpax_exception_samples', '')
+                self.qpax_exception_samples = [s for s in samples.split(' | ') if s]
         else:
             print('No cached control info found.')
 
     # ------------------------------------------------------------------
     # Policy update (mirror SSMRL.update_pi)
     # ------------------------------------------------------------------
-    def update_pi(self, z0, A_diag, B_mat, encoder_in):
+    def update_pi(self, obs0, z0, encoder_in):
         """
-        Update policy using Q(z0, action) directly (SAC-style).
+        Update policy using raw observations for the actor and latent state for the critic.
 
         The gradient path is:
-            z0 (detached) → pi(z0) → action → Q_value(z0, action, encoder_in)
-        so that the policy parameters receive gradients through the action.
+            obs0 -> pi(obs0) -> action -> Q_value(z0, action, encoder_in)
+        so policy parameters receive gradients through the action without using
+        the world-model encoder as the actor input.
 
         Args:
-            z0:         [batch, latent_dim]          (detached, first latent state)
-            A_diag:     [batch, latent_dim]          (detached, unused but kept for API compat)
-            B_mat:      [batch, latent_dim, act_dim] (detached, unused but kept for API compat)
-            encoder_in: [batch, ctx_dim]             (detached)
+            obs0:       [batch, state_dim]           raw observation for policy input
+            z0:         [batch, latent_dim]          detached latent state for Q input
+            encoder_in: [batch, ctx_dim]             detached context for Q input
         Returns:
             pi_loss (float)
         """
         self.pi_optim.zero_grad(set_to_none=True)
         self.model.track_critic_grad(False)
 
-        # Sample action from policy at z0
-        action, log_prob = self.model.pi(z0, return_log_prob=True)  # [B, act_dim], [B, 1]
+        # Sample action from policy at raw observation obs0
+        action, log_prob = self.model.pi(obs0, return_log_prob=True)  # [B, act_dim], [B, 1]
 
-        # Q value at (z0, action) — critic grad frozen
+        # Q value at (z0, action) - critic grad frozen, actor grad flows via action
         val = self.model.Q_value(z0, action, encoder_in, target=False, return_type='min')  # [B, 1]
 
         self.scale.update(val)
@@ -513,8 +644,7 @@ class SSMAgent:
 
         pi_loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            list(self.model._pi_encoder.parameters())
-            + list(self.model._pi_trunk.parameters())
+            list(self.model._pi_trunk.parameters())
             + list(self.model._pi_mean_head.parameters())
             + list(self.model._pi_log_std_head.parameters()),
             self.grad_clip_norm
@@ -528,12 +658,13 @@ class SSMAgent:
     # TD target (mirror SSMRL._td_target)
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def _td_target(self, next_z, reward, encoder_in):
+    def _td_target(self, next_z, next_obs, reward, encoder_in):
         """
         Compute TD target: r + gamma * V_target(next_z).
 
         Args:
             next_z:     [T, batch, latent_dim]
+            next_obs:   [T, batch, state_dim]
             reward:     [T, batch, 1]
             encoder_in: [batch, ctx_dim]
         Returns:
@@ -541,9 +672,10 @@ class SSMAgent:
         """
         T, B, _ = next_z.shape
         z_flat = next_z.reshape(T * B, -1)
+        obs_flat = next_obs.reshape(T * B, -1)
         enc_in_flat = encoder_in.unsqueeze(0).expand(T, -1, -1).reshape(T * B, -1)
         # Sample next action from target policy for Q(z, a)
-        a_next = self.model.pi(z_flat, target=True, deterministic=True)
+        a_next = self.model.pi(obs_flat, target=True, deterministic=True)
         next_val = self.model.Q_value(z_flat, a_next, enc_in_flat, target=True, return_type='min')
         next_val = next_val.view(T, B, 1)
         return reward + self.discount * next_val
@@ -600,7 +732,7 @@ class SSMAgent:
         ## rearrange the dimension from  [history_horizon, batch, state_dim] to  [batch, history_horizon, state_dim]
         ctx_state = ctx_state.permute(1, 0, 2)
         ctx_action = ctx_action.permute(1, 0, 2)
-        A_diag_seq, B_mat, Q_diag_seq, q_seq, R_diag_seq, r_seq, encoder_in = self.model.encode_context(
+        A_diag_seq, B_mat, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
             ctx_state, ctx_action, obs[self.history_horizon]
         )
 
@@ -622,15 +754,15 @@ class SSMAgent:
         for t in range(H):
             r_pred = self.model.reward(
                 z_randoms[t+1], action[t+self.history_horizon],
-                Q_diag_seq[:, t, :], q_seq[:, t, :], R_diag_seq[:, t, :], r_seq[:, t, :]
+                Q_seq[:, t], q_seq[:, t, :], R_seq[:, t], r_seq[:, t, :]
             )
             reward_loss += F.mse_loss(r_pred, reward[t+self.history_horizon]) * (self.rho ** t)
 
         # ---- Value loss (Q-function) ----
         z_for_q = self.model.encode(obs[self.history_horizon + H-1])
-        # Sample action from target policy at z_target for Q(z_target, a_target)
+        # Sample target action from raw obs; evaluate it with latent z_target
         with torch.no_grad():
-            a_target = self.model.pi(z_target, target=True, deterministic=True)
+            a_target = self.model.pi(obs[self.history_horizon + H], target=True, deterministic=True)
 
         q_target_val = reward[self.history_horizon] + self.discount * self.model.Q_value(
             z_target, a_target, encoder_in, target=True
@@ -657,9 +789,11 @@ class SSMAgent:
         )
         self.model_optim.step()
 
-        # ---- Update policy (re-encode to get a fresh graph through the encoder) ----
-        z0_pi = self.model.encode(obs[self.history_horizon])   # fresh graph, no detach
-        pi_loss = self.update_pi(z0_pi, A_diag_seq.detach(), B_mat.detach(), encoder_in.detach())
+        # ---- Update policy from raw observations; critic still uses latent z0 ----
+        with torch.no_grad():
+            z0_pi = self.model.encode(obs[self.history_horizon])
+        pi_loss = self.update_pi(
+            obs[self.history_horizon], z0_pi.detach(), encoder_in.detach())
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()
@@ -711,7 +845,7 @@ class SSMAgent:
             # Build context
             ctx_state = obs[:self.history_horizon].permute(1, 0, 2)
             ctx_action = action[:self.history_horizon].permute(1, 0, 2)
-            A_diag_seq, B_mat, Q_diag_seq, q_seq, R_diag_seq, r_seq, encoder_in = self.model.encode_context(
+            A_diag_seq, B_mat, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
                 ctx_state, ctx_action, obs[self.history_horizon]
             )
 
@@ -724,7 +858,7 @@ class SSMAgent:
                 z = self.model.next(z, action[t+self.history_horizon], A_diag_seq[:, t, :], B_mat)
                 r_pred = self.model.reward(
                     z, action[t+self.history_horizon],
-                    Q_diag_seq[:, t, :], q_seq[:, t, :], R_diag_seq[:, t, :], r_seq[:, t, :]
+                    Q_seq[:, t], q_seq[:, t, :], R_seq[:, t], r_seq[:, t, :]
                 )
                 predicted_rewards.append(r_pred.detach().cpu().numpy())
 
