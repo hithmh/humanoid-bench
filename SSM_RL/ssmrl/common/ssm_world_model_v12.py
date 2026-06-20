@@ -3,7 +3,7 @@ SSM World Model for SSM-RL.
 Implements a state-space model with:
   - Variational encoder (mean + log_sigma)
   - Transformer-based temporal context encoder
-  - Dense full-rank per-step linear dynamics: z' = A*z + B*u
+  - Diagonal A / dense B linear dynamics: z' = diag(A)*z + B*u
   - Quadratic reward: z^T Q z + q^T z + u^T R u + r^T u + b
     with full PSD Q and R matrices
   - Scalar Q-function conditioned on latent state, action, and context
@@ -95,8 +95,8 @@ class SSMWorldModel(nn.Module):
     ``WorldModel`` in ``ssmrl.common.world_model`` (TD-MPC2 style).
 
     Key differences from the vanilla TD-MPC2 WorldModel:
-    * Dynamics are linear: z' = A*z + B*u  (dense full-rank A and dense B
-      predicted per-step by MLP heads conditioned on a transformer context).
+    * Dynamics are linear: z' = diag(A)*z + B*u  (A, B predicted per-step by
+      MLP heads conditioned on a transformer context).
     * Reward is a learned quadratic form over latent state and action.
     * Critic is a scalar MLP over (latent state, action, context).
     * The policy consumes raw observations directly.
@@ -148,11 +148,8 @@ class SSMWorldModel(nn.Module):
 
         # ---- A, B dynamics heads (conditioned on transformer_output || current_obs) ----
         ctx_dim = transformer_d_model + state_dim
-        self._A_diag_scale = float(getattr(cfg, 'dynamics_a_diag_scale', 0.05))
-        self._A_offdiag_scale = float(getattr(cfg, 'dynamics_a_offdiag_scale', 0.05))
-        self._B_scale = float(getattr(cfg, 'dynamics_b_scale', 0.1))
-        self._A_net = _mlp(ctx_dim, encoder_hidden, 2 * latent_dim * latent_dim * prediction_horizon)
-        self._B_net = _mlp(ctx_dim, encoder_hidden, latent_dim * act_dim * prediction_horizon)
+        self._A_net = _mlp(ctx_dim, encoder_hidden, latent_dim * prediction_horizon)
+        self._B_net = _mlp(ctx_dim, encoder_hidden, latent_dim * act_dim)
 
         # ---- Quadratic reward heads (state part) ----
         # Each outputs lower-triangular factors for a sequence of full PSD matrices.
@@ -238,8 +235,8 @@ class SSMWorldModel(nn.Module):
             action_history: [batch, history_horizon, act_dim]
             current_obs:    [batch, state_dim]
         Returns:
-            A_seq:      [batch, prediction_horizon, latent_dim, latent_dim]
-            B_seq:      [batch, prediction_horizon, latent_dim, act_dim]
+            A_diag_seq: [batch, prediction_horizon, latent_dim]
+            B:          [batch, latent_dim, act_dim]
             Q_seq:      [batch, prediction_horizon, latent_dim, latent_dim] per-step state PSD matrix
             q_seq:      [batch, prediction_horizon, latent_dim]   per-step state linear coefficient
             R_seq:      [batch, prediction_horizon, act_dim, act_dim] per-step action PSD matrix
@@ -251,13 +248,11 @@ class SSMWorldModel(nn.Module):
         encoder_in = torch.cat([transformer_out, current_obs], dim=-1)
 
         H = self.prediction_horizon
-        A_flat = self._A_net(encoder_in)  # [batch, 2 * latent_dim * latent_dim * H]
-        A_raw_seq = A_flat.view(-1, H, 2, self.latent_dim, self.latent_dim)
-        A_seq = self._full_rank_from_raw_factors(
-            A_raw_seq, self._A_diag_scale, self._A_offdiag_scale)
+        A_flat = self._A_net(encoder_in)  # [batch, latent_dim * H]
+        A_diag_seq = A_flat.view(-1, H, self.latent_dim)  # [batch, H, latent_dim]
 
-        B_flat = self._B_net(encoder_in)  # [batch, latent_dim * act_dim * H]
-        B_seq = self._B_scale * torch.tanh(B_flat.view(-1, H, self.latent_dim, self.act_dim))
+        B_flat = self._B_net(encoder_in)  # [batch, latent_dim * act_dim]
+        B = B_flat.view(-1, self.latent_dim, self.act_dim)
 
         H = self.prediction_horizon
         # Q_net and q_net output sequences of length H
@@ -275,34 +270,7 @@ class SSMWorldModel(nn.Module):
         r_flat = self._r_net(encoder_in)  # [batch, act_dim * H]
         r_seq = r_flat.view(-1, H, self.act_dim)       # [batch, H, act_dim]
 
-        return A_seq, B_seq, Q_seq, q_seq, R_seq, r_seq, encoder_in
-
-    @staticmethod
-    def _full_rank_from_raw_factors(raw, diag_scale=0.05, offdiag_scale=0.05):
-        """
-        Convert unconstrained LU-style factors to dense, full-rank, near-identity matrices.
-
-        Args:
-            raw: [..., 2, dim, dim] unconstrained lower/upper factor parameters
-            diag_scale: keeps triangular diagonals in [1 - scale, 1 + scale]
-            offdiag_scale: bounds strict triangular entries
-        Returns:
-            [..., dim, dim] matrix L @ U with non-zero triangular diagonals
-        """
-        dim = raw.shape[-1]
-        eye = torch.eye(dim, device=raw.device, dtype=raw.dtype)
-        eye = eye.expand(*raw.shape[:-3], dim, dim)
-
-        L_raw = raw[..., 0, :, :]
-        U_raw = raw[..., 1, :, :]
-        L_strict = offdiag_scale * torch.tanh(torch.tril(L_raw, diagonal=-1))
-        U_strict = offdiag_scale * torch.tanh(torch.triu(U_raw, diagonal=1))
-        U_diag_raw = torch.diagonal(U_raw, dim1=-2, dim2=-1)
-        U_diag = 1.0 + diag_scale * torch.tanh(U_diag_raw)
-
-        L = eye + L_strict
-        U = torch.diag_embed(U_diag) + U_strict
-        return L @ U
+        return A_diag_seq, B, Q_seq, q_seq, R_seq, r_seq, encoder_in
 
     @staticmethod
     def _psd_from_raw_factor(raw):
@@ -323,19 +291,21 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     # Dynamics
     # ------------------------------------------------------------------
-    def next(self, z, a, A, B):
+    def next(self, z, a, A_diag, B):
         """
-        Predict next latent: z' = A*z + B*u
+        Predict next latent: z' = diag(A)*z + B*u
 
         Args:
-            z: [batch, latent_dim]
-            a: [batch, act_dim]
-            A: [batch, latent_dim, latent_dim]
-            B: [batch, latent_dim, act_dim]
+            z:      [batch, latent_dim]
+            a:      [batch, act_dim]
+            A_diag: [batch, latent_dim]
+            B:      [batch, latent_dim, act_dim]
         Returns:
             z': [batch, latent_dim]
         """
-        Az = torch.bmm(A, z.unsqueeze(-1)).squeeze(-1)
+        # diag(A) * z
+        Az = A_diag * z
+        # B @ u  → [batch, latent_dim, 1] → squeeze
         Bu = torch.bmm(B, a.unsqueeze(-1)).squeeze(-1)
         return Az + Bu
 

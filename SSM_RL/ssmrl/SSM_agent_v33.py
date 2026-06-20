@@ -10,9 +10,9 @@ available, or if the QP solver fails, actions come from the learned policy.
 MPC controller:
   * The finite-horizon control problem is assembled in JAX and JIT-compiled.
   * ``qpax`` solves the dense QP over the stacked action sequence only.
-  * Dense latent dynamics are analytically unrolled, eliminating equality
+  * Diagonal latent dynamics are analytically unrolled, eliminating equality
     dynamics constraints:
-      z_{t+1} = A_t ... A_0 z_0 + T_u[t] @ U_flat
+      z_{t+1} = A^{t+1} * z_0 + T_u[t] @ U_flat
   * Per-step action bounds are encoded as box inequalities ``G U <= h``.
   * The terminal Q cost uses the critic ensemble mean plus
     ``cfg.ucb_beta`` times the ensemble standard deviation for state and action
@@ -43,7 +43,7 @@ import jax.numpy as jnp
 import qpax  # pip install qpax
 
 
-from ssmrl.common.ssm_world_model_v11 import SSMWorldModel
+from ssmrl.common.ssm_world_model_v10 import SSMWorldModel
 from ssmrl.common.scale import RunningScale
 
 
@@ -197,7 +197,6 @@ class SSMAgent:
             # Attempt JAX/qpax planning
             u_norm = self._plan_jax(z, x0, eval_mode)
             # u_norm = self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy()
-        u_norm = self._sanitize_action(u_norm)
         # Update history
         self.action_history.append(u_norm.copy())
         self.state_history.append(x0.copy())
@@ -206,19 +205,8 @@ class SSMAgent:
         u = np.asarray(u_norm, dtype=np.float32)
         return u
 
-    def _sanitize_action(self, action):
-        """Return a finite clipped action so MuJoCo never receives NaN controls."""
-        action = np.asarray(action, dtype=np.float32).reshape(-1)
-        if action.shape[0] != self.act_dim:
-            safe = np.zeros(self.act_dim, dtype=np.float32)
-            safe[:min(action.shape[0], self.act_dim)] = action[:min(action.shape[0], self.act_dim)]
-            action = safe
-        if not np.isfinite(action).all():
-            action = np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
-        return np.clip(action, -1.0, 1.0).astype(np.float32)
-
     @torch.no_grad()
-    def _perturb_encoded_params(self, A, B, Q, q, R, r_vec):
+    def _perturb_encoded_params(self, A_diag, B, Q, q, R, r_vec):
         """
         Add relative Gaussian noise to encoded SSM parameters for exploration.
         Full quadratic matrices are perturbed by congruence transforms,
@@ -236,7 +224,7 @@ class SSMAgent:
             S = eye.expand(*M.shape[:-2], dim, dim) + std * torch.randn_like(M)
             return S @ M @ S.transpose(-1, -2)
 
-        return _noisy(A), _noisy(B), _noisy_psd(Q), _noisy(q), _noisy_psd(R), _noisy(r_vec)
+        return _noisy(A_diag), _noisy(B), _noisy_psd(Q), _noisy(q), _noisy_psd(R), _noisy(r_vec)
 
     def _plan_jax(self, z: torch.Tensor, x0: np.ndarray, eval_mode: bool):
         """
@@ -254,7 +242,7 @@ class SSMAgent:
         action_t = torch.tensor(action_seq, device=self.device).unsqueeze(0)
         obs_t    = torch.tensor(x0, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-        A_seq, B_seq, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
+        A_diag_seq, B, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
             state_t, action_t, obs_t)
 
         # # ---- Parameter noise for exploration ----
@@ -268,16 +256,16 @@ class SSMAgent:
                 eye = torch.eye(dim, device=M.device, dtype=M.dtype)
                 S = eye.expand(*M.shape[:-2], dim, dim) + std * torch.randn_like(M)
                 return S @ M @ S.transpose(-1, -2)
-            A_seq = _noisy(A_seq)
-            B_seq = _noisy(B_seq)
+            A_diag_seq = _noisy(A_diag_seq)
+            B = _noisy(B)
             Q_seq = _noisy_psd(Q_seq)
             q_seq = _noisy(q_seq)
             R_seq = _noisy_psd(R_seq)
             r_seq = _noisy(r_seq)
 
         # Extract single-sample tensors
-        A_seq_t      = A_seq[0]          # (H, D, D)
-        B_seq_t      = B_seq[0]          # (H, D, nU)
+        A_diag_seq_t = A_diag_seq[0]    # (H, D)
+        B_t          = B[0]              # (D, nU)
         Q_seq_t      = Q_seq[0]          # (H, D, D)
         q_seq_t      = q_seq[0]          # (H, D)
         R_seq_t      = R_seq[0]          # (H, nU, nU)
@@ -288,8 +276,8 @@ class SSMAgent:
         self.qpax_solver_attempts += 1
         input_tensors = {
             'z': z_t,
-            'A': A_seq_t,
-            'B': B_seq_t,
+            'A': A_diag_seq_t,
+            'B': B_t,
             'Q': Q_seq_t,
             'q': q_seq_t,
             'R': R_seq_t,
@@ -301,7 +289,7 @@ class SSMAgent:
             self._record_qpax_failure('input_nonfinite', ','.join(bad_inputs))
             for name in bad_inputs:
                 self.qpax_nonfinite_inputs[name] += 1
-            return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
+            return self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy()
 
         # ---- PyTorch -> JAX. Use DLPack when both libraries share a backend;
         # otherwise copy through CPU so CUDA Torch + CPU-only JAX still works.
@@ -326,8 +314,8 @@ class SSMAgent:
         try:
             U_sol, converged = self._jax_solve_mpc(
                 to_jax(z_t),
-                to_jax(A_seq_t),
-                to_jax(B_seq_t),
+                to_jax(A_diag_seq_t),
+                to_jax(B_t),
                 to_jax(Q_seq_t),
                 to_jax(q_seq_t),
                 to_jax(R_seq_t),
@@ -337,14 +325,14 @@ class SSMAgent:
             )
             if not bool(converged):
                 self._record_qpax_failure('nonconverged')
-                return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
+                return self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy()
             u = np.asarray(U_sol[0], dtype=np.float32)   # first control step
             if not np.isfinite(u).all():
                 self._record_qpax_failure('solution_nonfinite')
-                return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
+                return self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy()
         except Exception as exc:
             self._record_qpax_failure('exception', exc)
-            return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
+            return self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy()
 
         # if not eval_mode:
         #     std = self.model.get_pi_std(obs_t)[0]
@@ -352,7 +340,7 @@ class SSMAgent:
         #                ).detach().cpu().numpy()
         #     u = u + epsilon
 
-        return self._sanitize_action(u)
+        return np.clip(u, -1.0, 1.0).astype(np.float32)
 
     # ------------------------------------------------------------------
     # JAX + qpax MPC controller builder
@@ -364,7 +352,7 @@ class SSMAgent:
         Dynamics constraints are analytically eliminated by expressing the full
         state trajectory as a linear map of the stacked control vector U_flat:
 
-            z_{t+1} = A_t ... A_0 z_0   +   T_u[t] @ U_flat
+            z_{t+1} = A_diag^{t+1} ⊙ z_0   +   T_u[t] @ U_flat
 
         Substituting into the MPC cost yields a strict convex QP in U_flat:
             min   ½ U^T Q_qp U + c_qp^T U
@@ -385,15 +373,15 @@ class SSMAgent:
         self._control_horizon = CH
         n = CH * nU   # total QP decision-variable size
 
-        def _build_and_solve(z0, A_seq, B_seq, Q_seq, q_seq,
+        def _build_and_solve(z0, A_diag_seq, B, Q_seq, q_seq,
                              R_seq, r_seq,
                              a_low, a_high):
             """
             Args
             ----
             z0          : (D,)       initial latent state
-            A_seq       : (H, D, D)  per-step dynamics matrix
-            B_seq       : (H, D, nU) per-step input matrix
+            A_diag_seq  : (H, D)     per-step diagonal of dynamics matrix A
+            B           : (D, nU)    input matrix
             Q_seq       : (H, D, D)  per-step PSD stage state-cost matrix
             q_seq       : (H, D)     per-step linear state-cost coefficient
             R_seq       : (H, nU, nU) per-step PSD stage action-cost matrix
@@ -407,17 +395,17 @@ class SSMAgent:
             converged : bool
             """
             # ----------------------------------------------------------
-            # 1. State trajectory matrices (per-step A and B)
+            # 1. State trajectory matrices (per-step A_diag)
             # ----------------------------------------------------------
             f_list   = []
             T_u_list = []
 
             for t in range(H):
-                # f_t = A_t @ ... @ A_0 @ z0
-                A_cum = jnp.eye(D)
+                # f_t = A_0 * A_1 * ... * A_t * z0  (element-wise cumulative product)
+                A_cum = jnp.ones(D)
                 for s in range(t + 1):
-                    A_cum = A_seq[s] @ A_cum
-                f_list.append(A_cum @ z0)
+                    A_cum = A_cum * A_diag_seq[s]
+                f_list.append(A_cum * z0)
 
                 T_u_t = jnp.zeros((D, n))
                 for k in range(CH):
@@ -425,20 +413,20 @@ class SSMAgent:
                     e_k = (k + 1) * nU
                     if k < CH - 1:
                         if k <= t:
-                            # coeff = A_t @ ... @ A_{k+1} @ B_k
-                            A_prod = jnp.eye(D)
+                            # coeff = A_{k+1} * ... * A_t * B  (element-wise)
+                            A_prod = jnp.ones(D)
                             for s in range(k + 1, t + 1):
-                                A_prod = A_seq[s] @ A_prod
-                            coeff = A_prod @ B_seq[k]   # (D, nU)
+                                A_prod = A_prod * A_diag_seq[s]
+                            coeff = A_prod[:, None] * B   # (D, nU)
                             T_u_t = T_u_t.at[:, s_k:e_k].set(coeff)
                     else:
                         # Last ZOH block
                         accum = jnp.zeros((D, nU))
                         for j in range(CH - 1, t + 1):
-                            A_prod = jnp.eye(D)
+                            A_prod = jnp.ones(D)
                             for s in range(j + 1, t + 1):
-                                A_prod = A_seq[s] @ A_prod
-                            accum = accum + A_prod @ B_seq[j]
+                                A_prod = A_prod * A_diag_seq[s]
+                            accum = accum + A_prod[:, None] * B
                         T_u_t = T_u_t.at[:, s_k:e_k].set(accum)
 
                 T_u_list.append(T_u_t)
@@ -654,10 +642,6 @@ class SSMAgent:
 
         # SAC loss: maximise (Q - alpha * log_pi)
         pi_loss = -(val - self.entropy_coef * log_prob).mean()
-        if not torch.isfinite(pi_loss):
-            self.pi_optim.zero_grad(set_to_none=True)
-            self.model.track_critic_grad(True)
-            return 0.0
 
         pi_loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -700,22 +684,6 @@ class SSMAgent:
     # ------------------------------------------------------------------
     # Main update (mirror SSMRL.update)
     # ------------------------------------------------------------------
-    def _skipped_update_stats(self, nonfinite_batch=False, nonfinite_loss=False):
-        self.model.eval()
-        return {
-            'consistency_loss': 0.0,
-            'reward_loss': 0.0,
-            'value_loss': 0.0,
-            'q_loss': 0.0,
-            'pi_loss': 0.0,
-            'total_loss': 0.0,
-            'grad_norm': 0.0,
-            'pi_scale': float(self.scale.value),
-            'skipped_update': 1.0,
-            'nonfinite_batch': float(nonfinite_batch),
-            'nonfinite_loss': float(nonfinite_loss),
-        }
-
     def update(self, buffer):
         """
         Main update function.  Corresponds to one iteration of model learning.
@@ -733,9 +701,6 @@ class SSMAgent:
         obs = obs.to(self.device)
         action = action.to(self.device)
         reward = reward.to(self.device)
-        if not (torch.isfinite(obs).all() and torch.isfinite(action).all()
-                and torch.isfinite(reward).all()):
-            return self._skipped_update_stats(nonfinite_batch=True)
 
         H = self.horizon  # horizon
 
@@ -768,7 +733,7 @@ class SSMAgent:
         ## rearrange the dimension from  [history_horizon, batch, state_dim] to  [batch, history_horizon, state_dim]
         ctx_state = ctx_state.permute(1, 0, 2)
         ctx_action = ctx_action.permute(1, 0, 2)
-        A_seq, B_seq, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
+        A_diag_seq, B_mat, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
             ctx_state, ctx_action, obs[self.history_horizon]
         )
 
@@ -779,9 +744,8 @@ class SSMAgent:
         z_randoms[0] = z_random
         consistency_loss = torch.tensor(0.0, device=self.device)
         for t in range(H):
-            z = self.model.next(z, action[t+self.history_horizon], A_seq[:, t], B_seq[:, t])
-            z_random = self.model.next(
-                z_random, action[t+self.history_horizon], A_seq[:, t], B_seq[:, t])
+            z = self.model.next(z, action[t+self.history_horizon], A_diag_seq[:, t, :], B_mat)
+            z_random = self.model.next(z_random, action[t+self.history_horizon], A_diag_seq[:, t, :], B_mat)
             consistency_loss += F.mse_loss(z, next_mean[t+self.history_horizon]) * (self.rho ** t)
             zs[t + 1] = z
             z_randoms[t + 1] = z_random
@@ -818,9 +782,6 @@ class SSMAgent:
             + self.reward_coef * reward_loss
             + self.value_coef * value_loss
         )
-        if not torch.isfinite(total_loss):
-            self.model_optim.zero_grad(set_to_none=True)
-            return self._skipped_update_stats(nonfinite_loss=True)
 
         # ---- Backward & step (world model) ----
         total_loss.backward()
@@ -849,9 +810,6 @@ class SSMAgent:
             'total_loss': float(total_loss.item()),
             'grad_norm': float(grad_norm),
             'pi_scale': float(self.scale.value),
-            'skipped_update': 0.0,
-            'nonfinite_batch': 0.0,
-            'nonfinite_loss': 0.0,
         }
 
     # ------------------------------------------------------------------
@@ -888,7 +846,7 @@ class SSMAgent:
             # Build context
             ctx_state = obs[:self.history_horizon].permute(1, 0, 2)
             ctx_action = action[:self.history_horizon].permute(1, 0, 2)
-            A_seq, B_seq, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
+            A_diag_seq, B_mat, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
                 ctx_state, ctx_action, obs[self.history_horizon]
             )
 
@@ -898,7 +856,7 @@ class SSMAgent:
             # Rollout and predict rewards
             predicted_rewards = []
             for t in range(H):
-                z = self.model.next(z, action[t+self.history_horizon], A_seq[:, t], B_seq[:, t])
+                z = self.model.next(z, action[t+self.history_horizon], A_diag_seq[:, t, :], B_mat)
                 r_pred = self.model.reward(
                     z, action[t+self.history_horizon],
                     Q_seq[:, t], q_seq[:, t, :], R_seq[:, t], r_seq[:, t, :]
