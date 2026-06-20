@@ -43,7 +43,7 @@ import jax.numpy as jnp
 import qpax  # pip install qpax
 
 
-from ssmrl.common.ssm_world_model_v10 import SSMWorldModel
+from ssmrl.common.ssm_world_model_v11 import SSMWorldModel
 from ssmrl.common.scale import RunningScale
 
 

@@ -25,6 +25,23 @@ from ssmrl.common.logger import Logger
 torch.backends.cudnn.benchmark = True
 
 
+def _configure_jax_mpc_runtime(cfg):
+    """Set XLA options before importing an SSM agent that imports JAX."""
+    platform = str(getattr(cfg, "jax_mpc_platform", "cpu")).lower()
+    preallocate = bool(getattr(cfg, "jax_mpc_preallocate", False))
+    mem_fraction = float(getattr(cfg, "jax_mpc_mem_fraction", 0.20))
+
+    os.environ.setdefault(
+        "XLA_PYTHON_CLIENT_PREALLOCATE", "true" if preallocate else "false"
+    )
+    os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", str(mem_fraction))
+
+    if platform not in {"auto", "default", "none", ""}:
+        os.environ.setdefault(
+            "JAX_PLATFORMS", "cuda" if platform == "gpu" else platform
+        )
+
+
 @hydra.main(config_name="config", config_path=".")
 def train(cfg: dict):
     """
@@ -51,6 +68,8 @@ def train(cfg: dict):
     set_seed(cfg.seed)
     print(colored("Work dir:", "yellow", attrs=["bold"]), cfg.work_dir)
     agent_name = cfg.agent_name
+    if agent_name.startswith("SSM_agent"):
+        _configure_jax_mpc_runtime(cfg)
     ## import SSM_agent from the python file specified by agent_name
     agent_module = __import__(f"ssmrl.{agent_name}", fromlist=["SSMAgent"])
     SSMAgent = getattr(agent_module, "SSMAgent")

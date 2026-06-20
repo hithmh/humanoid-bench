@@ -6,7 +6,7 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: H=16-latent=32-norm_clip=200-lr=3e-5
+exp_name: H=16-latent=32-with_param_noise
 #agent_name: SSM_agent_v15_const
 agent_name: SSM_agent_v31
 
@@ -22,9 +22,9 @@ reward_coef: 1.0
 value_coef: 1e0
 consistency_coef: 1e-2
 rho: 1.0
-lr: 3e-5
+lr: 3e-4
 enc_lr_scale: 0.3
-grad_clip_norm: 200
+grad_clip_norm: 20
 tau: 0.01
 discount_denom: 5
 discount_min: 0.95
@@ -48,6 +48,9 @@ history_horizon: 6
 
 # ssm controller
 apply_action_constraints: true
+jax_mpc_platform: cpu
+jax_mpc_preallocate: false
+jax_mpc_mem_fraction: 0.20
 
 # planning
 solver: SCS
