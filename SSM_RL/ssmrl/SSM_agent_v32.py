@@ -10,9 +10,9 @@ available, or if the QP solver fails, actions come from the learned policy.
 MPC controller:
   * The finite-horizon control problem is assembled in JAX and JIT-compiled.
   * ``qpax`` solves the dense QP over the stacked action sequence only.
-  * Diagonal latent dynamics are analytically unrolled, eliminating equality
+  * Dense latent dynamics are analytically unrolled, eliminating equality
     dynamics constraints:
-      z_{t+1} = A^{t+1} * z_0 + T_u[t] @ U_flat
+      z_{t+1} = A_t ... A_0 z_0 + T_u[t] @ U_flat
   * Per-step action bounds are encoded as box inequalities ``G U <= h``.
   * The terminal Q cost uses the critic ensemble mean plus
     ``cfg.ucb_beta`` times the ensemble standard deviation for state and action
@@ -206,7 +206,7 @@ class SSMAgent:
         return u
 
     @torch.no_grad()
-    def _perturb_encoded_params(self, A_diag, B, Q, q, R, r_vec):
+    def _perturb_encoded_params(self, A, B, Q, q, R, r_vec):
         """
         Add relative Gaussian noise to encoded SSM parameters for exploration.
         Full quadratic matrices are perturbed by congruence transforms,
@@ -224,7 +224,7 @@ class SSMAgent:
             S = eye.expand(*M.shape[:-2], dim, dim) + std * torch.randn_like(M)
             return S @ M @ S.transpose(-1, -2)
 
-        return _noisy(A_diag), _noisy(B), _noisy_psd(Q), _noisy(q), _noisy_psd(R), _noisy(r_vec)
+        return _noisy(A), _noisy(B), _noisy_psd(Q), _noisy(q), _noisy_psd(R), _noisy(r_vec)
 
     def _plan_jax(self, z: torch.Tensor, x0: np.ndarray, eval_mode: bool):
         """
@@ -242,7 +242,7 @@ class SSMAgent:
         action_t = torch.tensor(action_seq, device=self.device).unsqueeze(0)
         obs_t    = torch.tensor(x0, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-        A_diag_seq, B, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
+        A_seq, B_seq, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
             state_t, action_t, obs_t)
 
         # # ---- Parameter noise for exploration ----
@@ -256,16 +256,16 @@ class SSMAgent:
                 eye = torch.eye(dim, device=M.device, dtype=M.dtype)
                 S = eye.expand(*M.shape[:-2], dim, dim) + std * torch.randn_like(M)
                 return S @ M @ S.transpose(-1, -2)
-            A_diag_seq = _noisy(A_diag_seq)
-            B = _noisy(B)
+            A_seq = _noisy(A_seq)
+            B_seq = _noisy(B_seq)
             Q_seq = _noisy_psd(Q_seq)
             q_seq = _noisy(q_seq)
             R_seq = _noisy_psd(R_seq)
             r_seq = _noisy(r_seq)
 
         # Extract single-sample tensors
-        A_diag_seq_t = A_diag_seq[0]    # (H, D)
-        B_t          = B[0]              # (D, nU)
+        A_seq_t      = A_seq[0]          # (H, D, D)
+        B_seq_t      = B_seq[0]          # (H, D, nU)
         Q_seq_t      = Q_seq[0]          # (H, D, D)
         q_seq_t      = q_seq[0]          # (H, D)
         R_seq_t      = R_seq[0]          # (H, nU, nU)
@@ -276,8 +276,8 @@ class SSMAgent:
         self.qpax_solver_attempts += 1
         input_tensors = {
             'z': z_t,
-            'A': A_diag_seq_t,
-            'B': B_t,
+            'A': A_seq_t,
+            'B': B_seq_t,
             'Q': Q_seq_t,
             'q': q_seq_t,
             'R': R_seq_t,
@@ -314,8 +314,8 @@ class SSMAgent:
         try:
             U_sol, converged = self._jax_solve_mpc(
                 to_jax(z_t),
-                to_jax(A_diag_seq_t),
-                to_jax(B_t),
+                to_jax(A_seq_t),
+                to_jax(B_seq_t),
                 to_jax(Q_seq_t),
                 to_jax(q_seq_t),
                 to_jax(R_seq_t),
@@ -352,7 +352,7 @@ class SSMAgent:
         Dynamics constraints are analytically eliminated by expressing the full
         state trajectory as a linear map of the stacked control vector U_flat:
 
-            z_{t+1} = A_diag^{t+1} ⊙ z_0   +   T_u[t] @ U_flat
+            z_{t+1} = A_t ... A_0 z_0   +   T_u[t] @ U_flat
 
         Substituting into the MPC cost yields a strict convex QP in U_flat:
             min   ½ U^T Q_qp U + c_qp^T U
@@ -373,15 +373,15 @@ class SSMAgent:
         self._control_horizon = CH
         n = CH * nU   # total QP decision-variable size
 
-        def _build_and_solve(z0, A_diag_seq, B, Q_seq, q_seq,
+        def _build_and_solve(z0, A_seq, B_seq, Q_seq, q_seq,
                              R_seq, r_seq,
                              a_low, a_high):
             """
             Args
             ----
             z0          : (D,)       initial latent state
-            A_diag_seq  : (H, D)     per-step diagonal of dynamics matrix A
-            B           : (D, nU)    input matrix
+            A_seq       : (H, D, D)  per-step dynamics matrix
+            B_seq       : (H, D, nU) per-step input matrix
             Q_seq       : (H, D, D)  per-step PSD stage state-cost matrix
             q_seq       : (H, D)     per-step linear state-cost coefficient
             R_seq       : (H, nU, nU) per-step PSD stage action-cost matrix
@@ -395,17 +395,17 @@ class SSMAgent:
             converged : bool
             """
             # ----------------------------------------------------------
-            # 1. State trajectory matrices (per-step A_diag)
+            # 1. State trajectory matrices (per-step A and B)
             # ----------------------------------------------------------
             f_list   = []
             T_u_list = []
 
             for t in range(H):
-                # f_t = A_0 * A_1 * ... * A_t * z0  (element-wise cumulative product)
-                A_cum = jnp.ones(D)
+                # f_t = A_t @ ... @ A_0 @ z0
+                A_cum = jnp.eye(D)
                 for s in range(t + 1):
-                    A_cum = A_cum * A_diag_seq[s]
-                f_list.append(A_cum * z0)
+                    A_cum = A_seq[s] @ A_cum
+                f_list.append(A_cum @ z0)
 
                 T_u_t = jnp.zeros((D, n))
                 for k in range(CH):
@@ -413,20 +413,20 @@ class SSMAgent:
                     e_k = (k + 1) * nU
                     if k < CH - 1:
                         if k <= t:
-                            # coeff = A_{k+1} * ... * A_t * B  (element-wise)
-                            A_prod = jnp.ones(D)
+                            # coeff = A_t @ ... @ A_{k+1} @ B_k
+                            A_prod = jnp.eye(D)
                             for s in range(k + 1, t + 1):
-                                A_prod = A_prod * A_diag_seq[s]
-                            coeff = A_prod[:, None] * B   # (D, nU)
+                                A_prod = A_seq[s] @ A_prod
+                            coeff = A_prod @ B_seq[k]   # (D, nU)
                             T_u_t = T_u_t.at[:, s_k:e_k].set(coeff)
                     else:
                         # Last ZOH block
                         accum = jnp.zeros((D, nU))
                         for j in range(CH - 1, t + 1):
-                            A_prod = jnp.ones(D)
+                            A_prod = jnp.eye(D)
                             for s in range(j + 1, t + 1):
-                                A_prod = A_prod * A_diag_seq[s]
-                            accum = accum + A_prod[:, None] * B
+                                A_prod = A_seq[s] @ A_prod
+                            accum = accum + A_prod @ B_seq[j]
                         T_u_t = T_u_t.at[:, s_k:e_k].set(accum)
 
                 T_u_list.append(T_u_t)
@@ -733,7 +733,7 @@ class SSMAgent:
         ## rearrange the dimension from  [history_horizon, batch, state_dim] to  [batch, history_horizon, state_dim]
         ctx_state = ctx_state.permute(1, 0, 2)
         ctx_action = ctx_action.permute(1, 0, 2)
-        A_diag_seq, B_mat, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
+        A_seq, B_seq, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
             ctx_state, ctx_action, obs[self.history_horizon]
         )
 
@@ -744,8 +744,9 @@ class SSMAgent:
         z_randoms[0] = z_random
         consistency_loss = torch.tensor(0.0, device=self.device)
         for t in range(H):
-            z = self.model.next(z, action[t+self.history_horizon], A_diag_seq[:, t, :], B_mat)
-            z_random = self.model.next(z_random, action[t+self.history_horizon], A_diag_seq[:, t, :], B_mat)
+            z = self.model.next(z, action[t+self.history_horizon], A_seq[:, t], B_seq[:, t])
+            z_random = self.model.next(
+                z_random, action[t+self.history_horizon], A_seq[:, t], B_seq[:, t])
             consistency_loss += F.mse_loss(z, next_mean[t+self.history_horizon]) * (self.rho ** t)
             zs[t + 1] = z
             z_randoms[t + 1] = z_random
@@ -846,7 +847,7 @@ class SSMAgent:
             # Build context
             ctx_state = obs[:self.history_horizon].permute(1, 0, 2)
             ctx_action = action[:self.history_horizon].permute(1, 0, 2)
-            A_diag_seq, B_mat, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
+            A_seq, B_seq, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
                 ctx_state, ctx_action, obs[self.history_horizon]
             )
 
@@ -856,7 +857,7 @@ class SSMAgent:
             # Rollout and predict rewards
             predicted_rewards = []
             for t in range(H):
-                z = self.model.next(z, action[t+self.history_horizon], A_diag_seq[:, t, :], B_mat)
+                z = self.model.next(z, action[t+self.history_horizon], A_seq[:, t], B_seq[:, t])
                 r_pred = self.model.reward(
                     z, action[t+self.history_horizon],
                     Q_seq[:, t], q_seq[:, t, :], R_seq[:, t], r_seq[:, t, :]

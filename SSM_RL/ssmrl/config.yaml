@@ -8,7 +8,7 @@ obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
 exp_name: H=16-latent=32-with_param_noise
 #agent_name: SSM_agent_v15_const
-agent_name: SSM_agent_v31
+agent_name: SSM_agent_v32
 
 # evaluation
 checkpoint: ???
