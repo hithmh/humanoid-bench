@@ -3,7 +3,7 @@ SSM World Model for SSM-RL.
 Implements a state-space model with:
   - Variational encoder (mean + log_sigma)
   - Transformer-based temporal context encoder
-  - Dense full-rank per-step linear dynamics: z' = A*z + B*u
+  - Dense per-step linear dynamics: z' = A*z + B*u
   - Quadratic reward: z^T Q z + q^T z + u^T R u + r^T u + b
     with full PSD Q and R matrices
   - Scalar Q-function conditioned on latent state, action, and context
@@ -95,8 +95,8 @@ class SSMWorldModel(nn.Module):
     ``WorldModel`` in ``ssmrl.common.world_model`` (TD-MPC2 style).
 
     Key differences from the vanilla TD-MPC2 WorldModel:
-    * Dynamics are linear: z' = A*z + B*u  (dense full-rank A and dense B
-      predicted per-step by MLP heads conditioned on a transformer context).
+    * Dynamics are linear: z' = A*z + B*u  (dense A is mixed from learned
+      basis matrices; dense B is predicted per-step by a context MLP).
     * Reward is a learned quadratic form over latent state and action.
     * Critic is a scalar MLP over (latent state, action, context).
     * The policy consumes raw observations directly.
@@ -148,10 +148,13 @@ class SSMWorldModel(nn.Module):
 
         # ---- A, B dynamics heads (conditioned on transformer_output || current_obs) ----
         ctx_dim = transformer_d_model + state_dim
-        self._A_diag_scale = float(getattr(cfg, 'dynamics_a_diag_scale', 0.05))
-        self._A_offdiag_scale = float(getattr(cfg, 'dynamics_a_offdiag_scale', 0.05))
+        self._A_num_bases = int(getattr(cfg, 'dynamics_a_num_bases', 16))
+        self._A_identity_scale = float(getattr(cfg, 'dynamics_a_identity_scale', 1.0))
+        self._A_scale = float(getattr(cfg, 'dynamics_a_scale', 0.05))
+        a_basis_init = float(getattr(cfg, 'dynamics_a_basis_init', 0.01))
         self._B_scale = float(getattr(cfg, 'dynamics_b_scale', 0.1))
-        self._A_net = _mlp(ctx_dim, encoder_hidden, 2 * latent_dim * latent_dim * prediction_horizon)
+        self._A_net = _mlp(ctx_dim, encoder_hidden, self._A_num_bases * prediction_horizon)
+        self._A_basis = nn.Parameter(torch.randn(self._A_num_bases, latent_dim, latent_dim) * a_basis_init)
         self._B_net = _mlp(ctx_dim, encoder_hidden, latent_dim * act_dim * prediction_horizon)
 
         # ---- Quadratic reward heads (state part) ----
@@ -251,10 +254,10 @@ class SSMWorldModel(nn.Module):
         encoder_in = torch.cat([transformer_out, current_obs], dim=-1)
 
         H = self.prediction_horizon
-        A_flat = self._A_net(encoder_in)  # [batch, 2 * latent_dim * latent_dim * H]
-        A_raw_seq = A_flat.view(-1, H, 2, self.latent_dim, self.latent_dim)
-        A_seq = self._full_rank_from_raw_factors(
-            A_raw_seq, self._A_diag_scale, self._A_offdiag_scale)
+        A_weight_flat = self._A_net(encoder_in)  # [batch, H * num_bases]
+        A_weights = A_weight_flat.view(-1, H, self._A_num_bases)
+        A_seq = self._basis_dynamics_matrix(
+            A_weights, self._A_basis, self._A_identity_scale, self._A_scale)
 
         B_flat = self._B_net(encoder_in)  # [batch, latent_dim * act_dim * H]
         B_seq = self._B_scale * torch.tanh(B_flat.view(-1, H, self.latent_dim, self.act_dim))
@@ -278,31 +281,26 @@ class SSMWorldModel(nn.Module):
         return A_seq, B_seq, Q_seq, q_seq, R_seq, r_seq, encoder_in
 
     @staticmethod
-    def _full_rank_from_raw_factors(raw, diag_scale=0.05, offdiag_scale=0.05):
+    def _basis_dynamics_matrix(weights, basis, identity_scale=1.0, dynamics_scale=0.05):
         """
-        Convert unconstrained LU-style factors to dense, full-rank, near-identity matrices.
+        Mix learned dense basis matrices into bounded near-identity dynamics.
 
         Args:
-            raw: [..., 2, dim, dim] unconstrained lower/upper factor parameters
-            diag_scale: keeps triangular diagonals in [1 - scale, 1 + scale]
-            offdiag_scale: bounds strict triangular entries
+            weights: [batch, horizon, num_bases] context-dependent coefficients
+            basis: [num_bases, dim, dim] learned dense basis matrices
+            identity_scale: coefficient on identity matrix for stable initialization
+            dynamics_scale: bound for learned dense residual entries
         Returns:
-            [..., dim, dim] matrix L @ U with non-zero triangular diagonals
+            [batch, horizon, dim, dim] dense dynamics matrices
         """
-        dim = raw.shape[-1]
-        eye = torch.eye(dim, device=raw.device, dtype=raw.dtype)
-        eye = eye.expand(*raw.shape[:-3], dim, dim)
-
-        L_raw = raw[..., 0, :, :]
-        U_raw = raw[..., 1, :, :]
-        L_strict = offdiag_scale * torch.tanh(torch.tril(L_raw, diagonal=-1))
-        U_strict = offdiag_scale * torch.tanh(torch.triu(U_raw, diagonal=1))
-        U_diag_raw = torch.diagonal(U_raw, dim1=-2, dim2=-1)
-        U_diag = 1.0 + diag_scale * torch.tanh(U_diag_raw)
-
-        L = eye + L_strict
-        U = torch.diag_embed(U_diag) + U_strict
-        return L @ U
+        dim = basis.shape[-1]
+        num_bases = basis.shape[0]
+        eye = torch.eye(dim, device=weights.device, dtype=weights.dtype)
+        eye = eye.expand(weights.shape[0], weights.shape[1], dim, dim)
+        coeffs = torch.tanh(weights)
+        bounded_basis = torch.tanh(basis)
+        residual = torch.einsum('bhk,kij->bhij', coeffs, bounded_basis) / (num_bases ** 0.5)
+        return identity_scale * eye + dynamics_scale * residual
 
     @staticmethod
     def _psd_from_raw_factor(raw):

@@ -73,6 +73,7 @@ class SSMAgent:
 
         # ---- Optimizers (following ssmrl.py pattern: model optim + pi optim) ----
         enc_lr_scale = getattr(cfg, 'enc_lr_scale', 0.3)
+        critic_lr_scale = getattr(cfg, 'critic_lr_scale', 0.1)
         lr = cfg.lr
 
         # Group 1 – world-model parameters (encoder_mean at scaled lr)
@@ -81,13 +82,15 @@ class SSMAgent:
              'lr': lr * enc_lr_scale},
             {'params': self.model._transformer.parameters()},
             {'params': self.model._A_net.parameters()},
+            {'params': [self.model._A_basis]},
             {'params': self.model._B_net.parameters()},
             {'params': self.model._Q_net.parameters()},
             {'params': self.model._q_net.parameters()},
             {'params': self.model._R_net.parameters()},
             {'params': self.model._r_net.parameters()},
             {'params': [self.model._b]},
-            {'params': self.model._q_func.parameters()},
+            {'params': self.model._q_func.parameters(),
+             'lr': lr * critic_lr_scale},
         ], lr=lr)
 
 
@@ -478,8 +481,8 @@ class SSMAgent:
             # Note: Terminal cost Q(z_H, u_H) is now handled by a separate MLP
             # and not included in the QP. The MPC only optimizes the stage costs.
 
-            # Ridge for numerical stability
-            Q_qp = Q_qp + 1e-6 * jnp.eye(n)
+            # # Ridge for numerical stability
+            # Q_qp = Q_qp + 1e-6 * jnp.eye(n)
 
             # ----------------------------------------------------------
             # 3. Inequality constraints: a_low ≤ u_t ≤ a_high  ∀t
@@ -807,7 +810,7 @@ class SSMAgent:
         # Sample action from current policy at z_for_q for Q(z_for_q, a)
         a_for_q = action[self.history_horizon + H-1]
         q_pred = self.model.Q_value(z_for_q, a_for_q, encoder_in, target=False)
-        q_loss = F.mse_loss(q_pred, q_target_val.detach())
+        q_loss = F.smooth_l1_loss(q_pred, q_target_val.detach())
         # Normalise
         consistency_loss = consistency_loss / H
         reward_loss = reward_loss / H

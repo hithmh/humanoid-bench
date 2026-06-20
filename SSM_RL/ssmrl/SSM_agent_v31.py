@@ -466,8 +466,8 @@ class SSMAgent:
             # Note: Terminal cost Q(z_H, u_H) is now handled by a separate MLP
             # and not included in the QP. The MPC only optimizes the stage costs.
 
-            # Ridge for numerical stability
-            Q_qp = Q_qp + 1e-6 * jnp.eye(n)
+            # # Ridge for numerical stability
+            # Q_qp = Q_qp + 1e-6 * jnp.eye(n)
 
             # ----------------------------------------------------------
             # 3. Inequality constraints: a_low ≤ u_t ≤ a_high  ∀t
