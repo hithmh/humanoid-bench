@@ -9,3 +9,4 @@ pyquaternion==0.9.9
 tensordict==0.4.0
 pandas==2.2.2
 termcolor==2.4.0
+matplotlib==3.9.0

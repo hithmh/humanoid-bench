@@ -102,7 +102,7 @@ class SSMWorldModel(nn.Module):
     * Dynamics are linear: z' = A*z + B*u  (dense A and B are mixed from
       learned basis matrices).
     * Reward is a learned quadratic form over latent state and action.
-    * Critic is a TD-MPC2-style ensemble over (latent state, action).
+    * Critic is a TD-MPC2-style ensemble over (raw observation, action).
     * Arrival-cost critic is an ensemble of context-conditioned quadratic
       forms in latent state and action.
     * The policy consumes raw observations directly.
@@ -210,8 +210,8 @@ class SSMWorldModel(nn.Module):
         ])
 
         # ---- TD-MPC2-style Q-function ensemble ----
-        # Each head takes (z, a) and outputs distributional value logits.
-        q_func_input_dim = latent_dim + act_dim
+        # Each head takes (raw obs, a) and outputs distributional value logits.
+        q_func_input_dim = state_dim + act_dim
         q_func_output_dim = max(int(getattr(cfg, 'num_bins', 0)), 1)
         critic_hidden = getattr(cfg, 'critic_struct', encoder_hidden)
 
@@ -379,7 +379,7 @@ class SSMWorldModel(nn.Module):
         """
         L_raw = torch.tril(raw)
         diag_raw = torch.diagonal(L_raw, dim1=-2, dim2=-1)
-        diag_pos = F.elu(diag_raw) + 1.0
+        diag_pos = F.relu(diag_raw)
         L = L_raw - torch.diag_embed(diag_raw) + torch.diag_embed(diag_pos)
         return L @ L.transpose(-1, -2)
 
@@ -500,12 +500,12 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     # Q-Function ensemble
     # ------------------------------------------------------------------
-    def Q_value(self, z, a, encoder_in=None, target=False, return_type='min'):
+    def Q_value(self, obs, a, encoder_in=None, target=False, return_type='min'):
         """
         Predict state-action value with a TD-MPC2-style Q ensemble.
 
         Args:
-            z:          [batch, latent_dim]
+            obs:        [batch, state_dim]
             a:          [batch, act_dim]
             encoder_in: ignored; kept for compatibility with older call sites
             target:     whether to use target network
@@ -519,7 +519,7 @@ class SSMWorldModel(nn.Module):
         assert return_type in {'min', 'avg', 'all'}
 
         q_func = self._q_func_target if target else self._q_func
-        x = torch.cat([z, a], dim=-1)  # [batch, latent_dim + act_dim]
+        x = torch.cat([obs, a], dim=-1)  # [batch, state_dim + act_dim]
         out = q_func(x)  # [num_q, batch, num_bins]
 
         if return_type == 'all':

@@ -550,9 +550,6 @@ class SSMAgent:
             c_qp = c_qp.at[s_u_H:e_u_H].add(
                 (discount ** H) * rc_ucb)
 
-            # Ridge for numerical stability
-            Q_qp = Q_qp + 1e-6 * jnp.eye(n)
-
             # ----------------------------------------------------------
             # 3. Inequality constraints: a_low ≤ u_t ≤ a_high  ∀t
             # ----------------------------------------------------------
@@ -701,18 +698,17 @@ class SSMAgent:
     # ------------------------------------------------------------------
     # Policy update (mirror SSMRL.update_pi)
     # ------------------------------------------------------------------
-    def update_pi(self, obs0, z0):
+    def update_pi(self, obs0):
         """
-        Update policy using raw observations for the actor and latent state for the critic.
+        Update policy using raw observations for both actor and critic.
 
         The gradient path is:
-            obs0 -> pi(obs0) -> action -> Q_value(z0, action)
+            obs0 -> pi(obs0) -> action -> Q_value(obs0, action)
         so policy parameters receive gradients through the action without using
         the world-model encoder as the actor input.
 
         Args:
             obs0:       [batch, state_dim]           raw observation for policy input
-            z0:         [batch, latent_dim]          detached latent state for Q input
         Returns:
             pi_loss (float)
         """
@@ -722,8 +718,8 @@ class SSMAgent:
         # Sample action from policy at raw observation obs0
         action, log_prob = self.model.pi(obs0, return_log_prob=True)  # [B, act_dim], [B, 1]
 
-        # Q value at (z0, action) - critic grad frozen, actor grad flows via action
-        val = self.model.Q_value(z0, action, target=False, return_type='min')  # [B, 1]
+        # Q value at (obs0, action) - critic grad frozen, actor grad flows via action
+        val = self.model.Q_value(obs0, action, target=False, return_type='min')  # [B, 1]
 
         self.scale.update(val)
         val = self.scale(val)
@@ -753,21 +749,20 @@ class SSMAgent:
     @torch.no_grad()
     def _td_target(self, next_z, next_obs, reward):
         """
-        Compute TD target: r + gamma * V_target(next_z).
+        Compute TD target: r + gamma * V_target(next_obs).
 
         Args:
-            next_z:     [T, batch, latent_dim]
+            next_z:     ignored; kept for compatibility with older call sites
             next_obs:   [T, batch, state_dim]
             reward:     [T, batch, 1]
         Returns:
             td_target: [T, batch, 1]
         """
-        T, B, _ = next_z.shape
-        z_flat = next_z.reshape(T * B, -1)
+        T, B, _ = next_obs.shape
         obs_flat = next_obs.reshape(T * B, -1)
-        # Sample next action from target policy for Q(z, a)
+        # Sample next action from target policy for Q(obs, a)
         a_next = self.model.pi(obs_flat, target=True, deterministic=True)
-        next_val = self.model.Q_value(z_flat, a_next, target=True, return_type='min')
+        next_val = self.model.Q_value(obs_flat, a_next, target=True, return_type='min')
         next_val = next_val.view(T, B, 1)
         return reward + self.discount * next_val
 
@@ -872,38 +867,33 @@ class SSMAgent:
             reward_loss += F.mse_loss(r_pred, reward[t+self.history_horizon]) * (self.rho ** t)
 
         # ---- Value loss (distributional Q ensemble + quadratic arrival Q-function) ----
-        z_for_q = self.model.encode(obs[self.history_horizon])
-        z_target = self.model.encode(obs[self.history_horizon + 1], target=True)
-        # Sample target action from raw obs; evaluate it with latent z_target
+        obs_for_q = obs[0]
+        obs_target = obs[1]
+        # Sample target action from raw obs; evaluate it with raw target obs
         with torch.no_grad():
-            a_target = self.model.pi(obs[self.history_horizon +1], target=True, deterministic=True)
+            a_target = self.model.pi(obs_target, target=True, deterministic=True)
 
-        q_target_val = reward[self.history_horizon] + self.discount * self.model.Q_value(
-            z_target, a_target, target=True
+        q_target_val = reward[0] + self.discount * self.model.Q_value(
+            obs_target, a_target, target=True
         )
-        # Sample action from current policy at z_for_q for Q(z_for_q, a)
-        a_for_q = action[self.history_horizon]
-        q_pred_all = self.model.Q_value(z_for_q, a_for_q, target=False, return_type='all')
+        # Replay action for Q(obs, a)
+        a_for_q = action[0]
+        q_pred_all = self.model.Q_value(obs_for_q, a_for_q, target=False, return_type='all')
         q_loss = torch.tensor(0.0, device=self.device)
         for q_idx in range(self.model.num_q):
             q_loss += math.soft_ce(q_pred_all[q_idx], q_target_val.detach(), self.cfg).mean()
         q_loss = q_loss / self.model.num_q
 
-
-
         z_for_q = self.model.encode(obs[self.history_horizon + H-1])
+        obs_target = obs[self.history_horizon + H]
         a_for_q = action[self.history_horizon+ H-1]
-        z_target = self.model.encode(obs[self.history_horizon + H], target=True)
-        # Sample target action from raw obs; evaluate it with latent z_target
+        # Sample target action from raw obs; evaluate it with raw target obs
         with torch.no_grad():
-            a_target = self.model.pi(obs[self.history_horizon + H], target=True, deterministic=True)
+            a_target = self.model.pi(obs_target, target=True, deterministic=True)
 
         q_target_val = reward[self.history_horizon + H-1] + self.discount * self.model.Q_value(
-            z_target, a_target, target=True
+            obs_target, a_target, target=True
         )
-        # q_target_val = reward[self.history_horizon + H-1] + self.discount * self.model.arrival_Q_value(
-        #     z_target, a_target, encoder_in, target=True, return_type='max'
-        # )
         arrival_q_pred = self.model.arrival_Q_value(
             z_for_q, a_for_q, encoder_in, target=False, return_type='all')
         arrival_q_target = q_target_val.detach().expand_as(arrival_q_pred)
@@ -929,11 +919,8 @@ class SSMAgent:
         )
         self.model_optim.step()
 
-        # ---- Update policy from raw observations; critic still uses latent z0 ----
-        with torch.no_grad():
-            z0_pi = self.model.encode(obs[self.history_horizon])
-        pi_loss = self.update_pi(
-            obs[self.history_horizon], z0_pi.detach())
+        # ---- Update policy from raw observations; critic also uses raw observations ----
+        pi_loss = self.update_pi(obs[self.history_horizon])
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()

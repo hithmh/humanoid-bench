@@ -368,3 +368,44 @@ class TDMPC2:
             "grad_norm": float(grad_norm),
             "pi_scale": float(self.scale.value),
         }
+
+    @torch.no_grad()
+    def compute_reward_predictions(self, buffer, num_samples=1):
+        """
+        Compute predicted vs actual rewards for visualization.
+
+        Args:
+                buffer (common.buffer.Buffer): Replay buffer.
+                num_samples (int): Number of sampled batches to visualize.
+
+        Returns:
+                dict: Actual and predicted scalar reward arrays.
+        """
+        self.model.eval()
+        actual_rewards_list = []
+        predicted_rewards_list = []
+
+        for _ in range(num_samples):
+            obs, action, reward, task = buffer.sample()
+
+            z = self.model.encode(obs[0], task)
+            predicted_rewards = []
+            for t in range(self.cfg.horizon):
+                r_pred = math.two_hot_inv(
+                    self.model.reward(z, action[t], task), self.cfg
+                )
+                predicted_rewards.append(r_pred.detach().cpu().numpy())
+                z = self.model.next(z, action[t], task)
+
+            predicted_rewards = np.concatenate(predicted_rewards, axis=0)
+            actual_rewards = reward.detach().cpu().numpy().reshape(-1, 1)
+
+            actual_rewards_list.append(actual_rewards)
+            predicted_rewards_list.append(predicted_rewards)
+
+        return {
+            "actual_rewards": np.concatenate(actual_rewards_list, axis=0).flatten(),
+            "predicted_rewards": np.concatenate(
+                predicted_rewards_list, axis=0
+            ).flatten(),
+        }

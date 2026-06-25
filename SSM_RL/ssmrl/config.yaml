@@ -6,7 +6,7 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: -param_noise=2e-4-lr3e-4-latent=32-l2r1e-4-tdmpc2_Q-H4-rho0.5
+exp_name: -l2r1e-4-H4-rho0.5-Q_on_0-entro_weight1e0-Q_obs
 #agent_name: SSM_agent_v15_const
 agent_name: SSM_agent_v34
 
@@ -71,7 +71,7 @@ u_penalty: 1e-2
 # actor
 log_std_min: -10
 log_std_max: 2
-entropy_coef: 1e-4
+entropy_coef: 1e0
 
 # critic
 num_bins: 101
