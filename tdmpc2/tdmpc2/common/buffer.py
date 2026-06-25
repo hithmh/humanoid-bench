@@ -14,10 +14,8 @@ class Buffer:
 
     def __init__(self, cfg):
         self.cfg = cfg
-        if sys.platform == "darwin":
-            self._device = torch.device("cpu")
-        else:
-            self._device = torch.device("cuda")
+        self._device = self._resolve_device(getattr(cfg, "device", "auto"))
+        self._replay_device = str(getattr(cfg, "replay_device", "auto")).lower()
         self._capacity = min(cfg.buffer_size, cfg.steps)
         self._sampler = SliceSampler(
             num_slices=self.cfg.batch_size,
@@ -27,6 +25,18 @@ class Buffer:
         )
         self._batch_size = cfg.batch_size * (cfg.horizon + 1)
         self._num_eps = 0
+
+    def _resolve_device(self, requested):
+        requested = str(requested).lower()
+        if requested in {"auto", "none", "???", ""}:
+            requested = (
+                "cuda"
+                if sys.platform != "darwin" and torch.cuda.is_available()
+                else "cpu"
+            )
+        if requested.startswith("cuda") and not torch.cuda.is_available():
+            requested = "cpu"
+        return torch.device(requested)
 
     @property
     def capacity(self):
@@ -53,7 +63,11 @@ class Buffer:
     def _init(self, tds):
         """Initialize the replay buffer. Use the first episode to estimate storage requirements."""
         print(f"Buffer capacity: {self._capacity:,}")
-        if sys.platform == "darwin":
+        if (
+            sys.platform == "darwin"
+            or not torch.cuda.is_available()
+            or self._device.type == "cpu"
+        ):
             mem_free = 0
         else:
             mem_free, _ = torch.cuda.mem_get_info()
@@ -69,8 +83,11 @@ class Buffer:
         ) / len(tds)
         total_bytes = bytes_per_step * self._capacity
         print(f"Storage required: {total_bytes/1e9:.2f} GB")
-        # Heuristic: decide whether to use CUDA or CPU memory
-        storage_device = "cuda" if 2.5 * total_bytes < mem_free else "cpu"
+        # Heuristic: decide whether to use CUDA or CPU memory unless overridden.
+        if self._replay_device in {"auto", "none", "???", ""}:
+            storage_device = "cuda" if 2.5 * total_bytes < mem_free else "cpu"
+        else:
+            storage_device = str(self._resolve_device(self._replay_device))
         print(f"Using {storage_device.upper()} memory for storage.")
         return self._reserve_buffer(
             LazyTensorStorage(self._capacity, device=torch.device(storage_device))

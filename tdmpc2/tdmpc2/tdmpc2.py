@@ -16,10 +16,7 @@ class TDMPC2:
 
     def __init__(self, cfg):
         self.cfg = cfg
-        if torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
+        self.device = self._resolve_device(getattr(cfg, "device", "auto"))
         self.model = WorldModel(cfg).to(self.device)
         self.optim = torch.optim.Adam(
             [
@@ -49,11 +46,19 @@ class TDMPC2:
         self.discount = (
             torch.tensor(
                 [self._get_discount(ep_len) for ep_len in cfg.episode_lengths],
-                device="cuda",
+                device=self.device,
             )
             if self.cfg.multitask
             else self._get_discount(cfg.episode_length)
         )
+
+    def _resolve_device(self, requested):
+        requested = str(requested).lower()
+        if requested in {"auto", "none", "???", ""}:
+            requested = "cuda" if torch.cuda.is_available() else "cpu"
+        if requested.startswith("cuda") and not torch.cuda.is_available():
+            requested = "cpu"
+        return torch.device(requested)
 
     def _get_discount(self, episode_length):
         """

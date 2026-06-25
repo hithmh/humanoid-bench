@@ -43,7 +43,7 @@ import jax.numpy as jnp
 import qpax  # pip install qpax
 
 
-from ssmrl.common.ssm_world_model_v11 import SSMWorldModel
+from ssmrl.common.ssm_world_model_v13 import SSMWorldModel
 from ssmrl.common.scale import RunningScale
 
 
@@ -58,7 +58,7 @@ class SSMAgent:
     # ------------------------------------------------------------------
     def __init__(self, cfg):
         self.cfg = cfg
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = self._resolve_device(getattr(cfg, "device", "auto"))
         self._jax_has_cuda = any(d.platform in ('cuda', 'gpu') for d in jax.devices())
 
         # World model
@@ -75,6 +75,7 @@ class SSMAgent:
         enc_lr_scale = getattr(cfg, 'enc_lr_scale', 0.3)
         critic_lr_scale = getattr(cfg, 'critic_lr_scale', 0.1)
         lr = cfg.lr
+        self.l2_regularizer = float(getattr(cfg, 'l2_regularizer', 0.0))
 
         # Group 1 – world-model parameters (encoder_mean at scaled lr)
         self.model_optim = torch.optim.Adam([
@@ -84,14 +85,19 @@ class SSMAgent:
             {'params': self.model._A_net.parameters()},
             {'params': [self.model._A_basis]},
             {'params': self.model._B_net.parameters()},
+            {'params': [self.model._B_basis]},
             {'params': self.model._Q_net.parameters()},
+            {'params': [self.model._Q_basis]},
             {'params': self.model._q_net.parameters()},
             {'params': self.model._R_net.parameters()},
+            {'params': [self.model._R_basis]},
             {'params': self.model._r_net.parameters()},
             {'params': [self.model._b]},
             {'params': self.model._q_func.parameters(),
              'lr': lr * critic_lr_scale},
-        ], lr=lr)
+            {'params': self.model._arrival_q_ensemble.parameters(),
+             'lr': lr * critic_lr_scale},
+        ], lr=lr, weight_decay=self.l2_regularizer)
 
 
         # Group 2 - raw-observation policy trunk and action heads
@@ -99,7 +105,7 @@ class SSMAgent:
             list(self.model._pi_trunk.parameters())
             + list(self.model._pi_mean_head.parameters())
             + list(self.model._pi_log_std_head.parameters()),
-            lr=lr, eps=1e-5
+            lr=lr, eps=1e-5, weight_decay=self.l2_regularizer
         )
 
         self.model.eval()
@@ -134,6 +140,14 @@ class SSMAgent:
 
         # Build JAX + qpax MPC controller
         self._build_jax_controller()
+
+    def _resolve_device(self, requested):
+        requested = str(requested).lower()
+        if requested in {"auto", "none", "???", ""}:
+            requested = "cuda" if torch.cuda.is_available() else "cpu"
+        if requested.startswith("cuda") and not torch.cuda.is_available():
+            requested = "cpu"
+        return torch.device(requested)
 
     # ------------------------------------------------------------------
     # Discount helper (same as SSMRL)
@@ -287,6 +301,13 @@ class SSMAgent:
         r_seq_t      = r_seq[0]          # (H, nU)
         z_t          = z[0]              # (D,)
 
+        P_diag, p_vec, pb_vec, Rc_diag, rc_vec = self.model.arrival_Q_params(
+            encoder_in, target=False)
+        P_diag_t  = P_diag[0]            # (E, D)
+        p_vec_t   = p_vec[0]             # (E, D)
+        pb_vec_t  = pb_vec[0]            # (E,)
+        Rc_diag_t = Rc_diag[0]           # (E, nU)
+        rc_vec_t  = rc_vec[0]            # (E, nU)
 
         self.qpax_solver_attempts += 1
         input_tensors = {
@@ -297,6 +318,11 @@ class SSMAgent:
             'q': q_seq_t,
             'R': R_seq_t,
             'r': r_seq_t,
+            'P_arrival': P_diag_t,
+            'p_arrival': p_vec_t,
+            'pb_arrival': pb_vec_t,
+            'Rc_arrival': Rc_diag_t,
+            'rc_arrival': rc_vec_t,
         }
         bad_inputs = [name for name, tensor in input_tensors.items()
                       if not torch.isfinite(tensor).all().item()]
@@ -335,6 +361,11 @@ class SSMAgent:
                 to_jax(q_seq_t),
                 to_jax(R_seq_t),
                 to_jax(r_seq_t),
+                to_jax(P_diag_t),
+                to_jax(p_vec_t),
+                to_jax(pb_vec_t),
+                to_jax(Rc_diag_t),
+                to_jax(rc_vec_t),
                 self._a_low_jax,
                 self._a_high_jax,
             )
@@ -349,11 +380,11 @@ class SSMAgent:
             self._record_qpax_failure('exception', exc)
             return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
 
-        # if not eval_mode:
-        #     std = self.model.get_pi_std(obs_t)[0]
-        #     epsilon = (std * torch.randn(self.act_dim, device=std.device)
-        #                ).detach().cpu().numpy()
-        #     u = u + epsilon
+        if not eval_mode:
+            std = self.model.get_pi_std(obs_t)[0]
+            epsilon = (std * torch.randn(self.act_dim, device=std.device)
+                       ).detach().cpu().numpy()
+            u = u + epsilon
 
         return self._sanitize_action(u)
 
@@ -384,12 +415,15 @@ class SSMAgent:
         discount = self.discount
         discount = 1.0
         u_penalty = float(getattr(self.cfg, 'u_penalty', 0.0))
+        ucb_beta = float(getattr(self.cfg, 'ucb_beta', 1.0))
 
         self._control_horizon = CH
         n = CH * nU   # total QP decision-variable size
 
         def _build_and_solve(z0, A_seq, B_seq, Q_seq, q_seq,
                              R_seq, r_seq,
+                             P_diags, p_mat, pb_vec,
+                             Rc_diags, rc_mat,
                              a_low, a_high):
             """
             Args
@@ -401,6 +435,11 @@ class SSMAgent:
             q_seq       : (H, D)     per-step linear state-cost coefficient
             R_seq       : (H, nU, nU) per-step PSD stage action-cost matrix
             r_seq       : (H, nU)    per-step linear action-cost coefficient
+            P_diags     : (E, D)     diagonal terminal state-cost coefficients
+            p_mat       : (E, D)     linear terminal state-cost coefficients
+            pb_vec      : (E,)       terminal critic bias (constant for QP)
+            Rc_diags    : (E, nU)    diagonal terminal action-cost coefficients
+            rc_mat      : (E, nU)    linear terminal action-cost coefficients
             a_low       : (nU,)      per-dim action lower bound
             a_high      : (nU,)      per-dim action upper bound
 
@@ -478,11 +517,40 @@ class SSMAgent:
                 # Q_qp = Q_qp.at[s_u:e_u, s_u:e_u].add(
                 #     (discount ** t) * 2.0 * u_penalty * jnp.eye(nU))
 
-            # Note: Terminal cost Q(z_H, u_H) is now handled by a separate MLP
-            # and not included in the QP. The MPC only optimizes the stage costs.
+            # Terminal arrival cost from the quadratic Q ensemble.
+            Tu_H = T_u_list[H - 1]   # (D, n)
+            f_H = f_list[H - 1]      # (D,)
 
-            # # Ridge for numerical stability
-            # Q_qp = Q_qp + 1e-6 * jnp.eye(n)
+            P_mean = jnp.mean(P_diags, axis=0)
+            P_std = jnp.std(P_diags, axis=0)
+            P_ucb = P_mean + ucb_beta * P_std
+
+            p_mean = jnp.mean(p_mat, axis=0)
+            p_std = jnp.std(p_mat, axis=0)
+            p_ucb = p_mean + ucb_beta * p_std
+
+            PTu = P_ucb[:, None] * Tu_H
+            Q_qp = Q_qp + (discount ** H) * 2.0 * (Tu_H.T @ PTu)
+            c_qp = c_qp + (discount ** H) * (2.0 * (PTu.T @ f_H) + Tu_H.T @ p_ucb)
+
+            s_u_H = (CH - 1) * nU
+            e_u_H = CH * nU
+
+            Rc_mean = jnp.mean(Rc_diags, axis=0)
+            Rc_std = jnp.std(Rc_diags, axis=0)
+            Rc_ucb = Rc_mean + ucb_beta * Rc_std
+
+            rc_mean = jnp.mean(rc_mat, axis=0)
+            rc_std = jnp.std(rc_mat, axis=0)
+            rc_ucb = rc_mean + ucb_beta * rc_std
+
+            Q_qp = Q_qp.at[s_u_H:e_u_H, s_u_H:e_u_H].add(
+                (discount ** H) * 2.0 * jnp.diag(Rc_ucb))
+            c_qp = c_qp.at[s_u_H:e_u_H].add(
+                (discount ** H) * rc_ucb)
+
+            # Ridge for numerical stability
+            Q_qp = Q_qp + 1e-6 * jnp.eye(n)
 
             # ----------------------------------------------------------
             # 3. Inequality constraints: a_low ≤ u_t ≤ a_high  ∀t
@@ -523,7 +591,12 @@ class SSMAgent:
         self.qpax_solver_exceptions = 0
         self.qpax_solver_input_nonfinite = 0
         self.qpax_solver_solution_nonfinite = 0
-        self.qpax_nonfinite_inputs = {name: 0 for name in ('z', 'A', 'B', 'Q', 'q', 'R', 'r')}
+        self.qpax_nonfinite_inputs = {
+            name: 0 for name in (
+                'z', 'A', 'B', 'Q', 'q', 'R', 'r',
+                'P_arrival', 'p_arrival', 'pb_arrival', 'Rc_arrival', 'rc_arrival',
+            )
+        }
         self.qpax_last_failure_reason = 'none'
         self.qpax_last_exception_type = 'none'
         self.qpax_last_exception_message = ''
@@ -627,19 +700,18 @@ class SSMAgent:
     # ------------------------------------------------------------------
     # Policy update (mirror SSMRL.update_pi)
     # ------------------------------------------------------------------
-    def update_pi(self, obs0, z0, encoder_in):
+    def update_pi(self, obs0, z0):
         """
         Update policy using raw observations for the actor and latent state for the critic.
 
         The gradient path is:
-            obs0 -> pi(obs0) -> action -> Q_value(z0, action, encoder_in)
+            obs0 -> pi(obs0) -> action -> Q_value(z0, action)
         so policy parameters receive gradients through the action without using
         the world-model encoder as the actor input.
 
         Args:
             obs0:       [batch, state_dim]           raw observation for policy input
             z0:         [batch, latent_dim]          detached latent state for Q input
-            encoder_in: [batch, ctx_dim]             detached context for Q input
         Returns:
             pi_loss (float)
         """
@@ -650,13 +722,13 @@ class SSMAgent:
         action, log_prob = self.model.pi(obs0, return_log_prob=True)  # [B, act_dim], [B, 1]
 
         # Q value at (z0, action) - critic grad frozen, actor grad flows via action
-        val = self.model.Q_value(z0, action, encoder_in, target=False, return_type='min')  # [B, 1]
+        val = self.model.Q_value(z0, action, target=False, return_type='min')  # [B, 1]
 
         self.scale.update(val)
         val = self.scale(val)
 
         # SAC loss: maximise (Q - alpha * log_pi)
-        pi_loss = -(val - self.entropy_coef * log_prob).mean()
+        pi_loss = (self.entropy_coef * log_prob- val).mean()
         if not torch.isfinite(pi_loss):
             self.pi_optim.zero_grad(set_to_none=True)
             self.model.track_critic_grad(True)
@@ -678,7 +750,7 @@ class SSMAgent:
     # TD target (mirror SSMRL._td_target)
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def _td_target(self, next_z, next_obs, reward, encoder_in):
+    def _td_target(self, next_z, next_obs, reward):
         """
         Compute TD target: r + gamma * V_target(next_z).
 
@@ -686,17 +758,15 @@ class SSMAgent:
             next_z:     [T, batch, latent_dim]
             next_obs:   [T, batch, state_dim]
             reward:     [T, batch, 1]
-            encoder_in: [batch, ctx_dim]
         Returns:
             td_target: [T, batch, 1]
         """
         T, B, _ = next_z.shape
         z_flat = next_z.reshape(T * B, -1)
         obs_flat = next_obs.reshape(T * B, -1)
-        enc_in_flat = encoder_in.unsqueeze(0).expand(T, -1, -1).reshape(T * B, -1)
         # Sample next action from target policy for Q(z, a)
         a_next = self.model.pi(obs_flat, target=True, deterministic=True)
-        next_val = self.model.Q_value(z_flat, a_next, enc_in_flat, target=True, return_type='min')
+        next_val = self.model.Q_value(z_flat, a_next, target=True, return_type='min')
         next_val = next_val.view(T, B, 1)
         return reward + self.discount * next_val
 
@@ -710,6 +780,7 @@ class SSMAgent:
             'reward_loss': 0.0,
             'value_loss': 0.0,
             'q_loss': 0.0,
+            'arrival_q_loss': 0.0,
             'pi_loss': 0.0,
             'total_loss': 0.0,
             'grad_norm': 0.0,
@@ -742,8 +813,9 @@ class SSMAgent:
 
         H = self.horizon  # horizon
 
-        # # ---- Compute targets (no grad) ----
-        # with torch.no_grad():
+        # ---- Compute consistency targets without letting the encoder move both
+        # sides of the prediction target.
+
         next_mean = self.model.encode(obs[1:])  # [H, B, D]
         #     # Build encoder_in for target computation using history
         #     ctx_state_tgt = obs[:self.history_horizon].permute(1, 0, 2)
@@ -762,7 +834,7 @@ class SSMAgent:
 
         # ---- Encode first obs ----
         z = self.model.encode(obs[self.history_horizon])  # [B, D]
-        z_target = self.model.encode(obs[self.history_horizon+ H], target=True)
+
         z_random = z
 
         # ---- Build context for transformer ----
@@ -798,23 +870,44 @@ class SSMAgent:
             )
             reward_loss += F.mse_loss(r_pred, reward[t+self.history_horizon]) * (self.rho ** t)
 
-        # ---- Value loss (Q-function) ----
+        # ---- Value loss (scalar Q-function + quadratic arrival Q-function) ----
+        z_for_q = self.model.encode(obs[self.history_horizon])
+        z_target = self.model.encode(obs[self.history_horizon + 1], target=True)
+        # Sample target action from raw obs; evaluate it with latent z_target
+        with torch.no_grad():
+            a_target = self.model.pi(obs[self.history_horizon +1], target=True, deterministic=True)
+
+        q_target_val = reward[self.history_horizon] + self.discount * self.model.Q_value(
+            z_target, a_target, target=True
+        )
+        # Sample action from current policy at z_for_q for Q(z_for_q, a)
+        a_for_q = action[self.history_horizon]
+        q_pred = self.model.Q_value(z_for_q, a_for_q, target=False)
+        q_loss = F.smooth_l1_loss(q_pred, q_target_val.detach())
+
+
+
         z_for_q = self.model.encode(obs[self.history_horizon + H-1])
+        a_for_q = action[self.history_horizon+ H-1]
+        z_target = self.model.encode(obs[self.history_horizon + H], target=True)
         # Sample target action from raw obs; evaluate it with latent z_target
         with torch.no_grad():
             a_target = self.model.pi(obs[self.history_horizon + H], target=True, deterministic=True)
 
-        q_target_val = reward[self.history_horizon] + self.discount * self.model.Q_value(
-            z_target, a_target, encoder_in, target=True
+        q_target_val = reward[self.history_horizon + H-1] + self.discount * self.model.Q_value(
+            z_target, a_target, target=True
         )
-        # Sample action from current policy at z_for_q for Q(z_for_q, a)
-        a_for_q = action[self.history_horizon + H-1]
-        q_pred = self.model.Q_value(z_for_q, a_for_q, encoder_in, target=False)
-        q_loss = F.smooth_l1_loss(q_pred, q_target_val.detach())
+        # q_target_val = reward[self.history_horizon + H-1] + self.discount * self.model.arrival_Q_value(
+        #     z_target, a_target, encoder_in, target=True, return_type='max'
+        # )
+        arrival_q_pred = self.model.arrival_Q_value(
+            z_for_q, a_for_q, encoder_in, target=False, return_type='all')
+        arrival_q_target = q_target_val.detach().expand_as(arrival_q_pred)
+        arrival_q_loss = F.smooth_l1_loss(arrival_q_pred, arrival_q_target)
         # Normalise
         consistency_loss = consistency_loss / H
         reward_loss = reward_loss / H
-        value_loss = q_loss
+        value_loss = q_loss + arrival_q_loss
 
         total_loss = (
             self.consistency_coef * consistency_loss
@@ -836,7 +929,7 @@ class SSMAgent:
         with torch.no_grad():
             z0_pi = self.model.encode(obs[self.history_horizon])
         pi_loss = self.update_pi(
-            obs[self.history_horizon], z0_pi.detach(), encoder_in.detach())
+            obs[self.history_horizon], z0_pi.detach())
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()
@@ -848,6 +941,7 @@ class SSMAgent:
             'reward_loss': float(reward_loss.item()),
             'value_loss': float(value_loss.item()),
             'q_loss': float(q_loss.item()),
+            'arrival_q_loss': float(arrival_q_loss.item()),
             'pi_loss': pi_loss,
             'total_loss': float(total_loss.item()),
             'grad_norm': float(grad_norm),

@@ -11,12 +11,12 @@ class HumanoidWrapper(gym.Wrapper):
     def __init__(self, env, cfg):
         if sys.platform != "darwin" and "MUJOCO_GL" not in os.environ:
             os.environ["MUJOCO_GL"] = "egl"
-        if "SLURM_STEP_GPUS" in os.environ:
-            os.environ["EGL_DEVICE_ID"] = os.environ["SLURM_STEP_GPUS"]
-            print(f"EGL_DEVICE_ID set to {os.environ['SLURM_STEP_GPUS']}")
-        if "SLURM_JOB_GPUS" in os.environ:
-            os.environ["EGL_DEVICE_ID"] = os.environ["SLURM_JOB_GPUS"]
-            print(f"EGL_DEVICE_ID set to {os.environ['SLURM_JOB_GPUS']}")
+        if "EGL_DEVICE_ID" not in os.environ:
+            for key in ("SLURM_STEP_GPUS", "SLURM_JOB_GPUS", "CUDA_VISIBLE_DEVICES"):
+                if key in os.environ and os.environ[key]:
+                    os.environ["EGL_DEVICE_ID"] = os.environ[key].split(",")[0]
+                    print(f"EGL_DEVICE_ID set to {os.environ['EGL_DEVICE_ID']}")
+                    break
 
         super().__init__(env)
         self.env = env

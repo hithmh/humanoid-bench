@@ -6,7 +6,8 @@ Implements a state-space model with:
   - Dense per-step linear dynamics: z' = A*z + B*u
   - Quadratic reward: z^T Q z + q^T z + u^T R u + r^T u + b
     with full PSD Q and R matrices
-  - Scalar Q-function conditioned on latent state, action, and context
+  - Scalar Q-function conditioned on latent state and action
+  - Ensemble quadratic Q-function for MPC arrival cost
   - Raw-observation policy network (tanh-squashed)
 
 Follows the architecture of WorldModel in ssmrl/common/world_model.py.
@@ -95,10 +96,12 @@ class SSMWorldModel(nn.Module):
     ``WorldModel`` in ``ssmrl.common.world_model`` (TD-MPC2 style).
 
     Key differences from the vanilla TD-MPC2 WorldModel:
-    * Dynamics are linear: z' = A*z + B*u  (dense A is mixed from learned
-      basis matrices; dense B is predicted per-step by a context MLP).
+    * Dynamics are linear: z' = A*z + B*u  (dense A and B are mixed from
+      learned basis matrices).
     * Reward is a learned quadratic form over latent state and action.
-    * Critic is a scalar MLP over (latent state, action, context).
+    * Critic is a scalar MLP over (latent state, action).
+    * Arrival-cost critic is an ensemble of context-conditioned quadratic
+      forms in latent state and action.
     * The policy consumes raw observations directly.
     """
 
@@ -152,19 +155,31 @@ class SSMWorldModel(nn.Module):
         self._A_identity_scale = float(getattr(cfg, 'dynamics_a_identity_scale', 1.0))
         self._A_scale = float(getattr(cfg, 'dynamics_a_scale', 0.05))
         a_basis_init = float(getattr(cfg, 'dynamics_a_basis_init', 0.01))
+        self._B_num_bases = int(getattr(cfg, 'dynamics_b_num_bases', self._A_num_bases))
         self._B_scale = float(getattr(cfg, 'dynamics_b_scale', 0.1))
+        b_basis_init = float(getattr(cfg, 'dynamics_b_basis_init', a_basis_init))
         self._A_net = _mlp(ctx_dim, encoder_hidden, self._A_num_bases * prediction_horizon)
         self._A_basis = nn.Parameter(torch.randn(self._A_num_bases, latent_dim, latent_dim) * a_basis_init)
-        self._B_net = _mlp(ctx_dim, encoder_hidden, latent_dim * act_dim * prediction_horizon)
+        self._B_net = _mlp(ctx_dim, encoder_hidden, self._B_num_bases * prediction_horizon)
+        self._B_basis = nn.Parameter(torch.randn(self._B_num_bases, latent_dim, act_dim) * b_basis_init)
 
         # ---- Quadratic reward heads (state part) ----
-        # Each outputs lower-triangular factors for a sequence of full PSD matrices.
-        self._Q_net = _mlp(ctx_dim, encoder_hidden, latent_dim * latent_dim * prediction_horizon)
+        # Each predicts basis weights for lower-triangular factors. PSD is
+        # enforced after basis mixing via L @ L.T.
+        self._Q_num_bases = int(getattr(cfg, 'reward_q_num_bases', self._A_num_bases))
+        self._Q_scale = max(0.0, float(getattr(cfg, 'reward_q_scale', 1.0)))
+        q_basis_init = float(getattr(cfg, 'reward_q_basis_init', a_basis_init))
+        self._Q_net = _mlp(ctx_dim, encoder_hidden, self._Q_num_bases * prediction_horizon)
+        self._Q_basis = nn.Parameter(torch.randn(self._Q_num_bases, latent_dim, latent_dim) * q_basis_init)
         self._q_net = _mlp(ctx_dim, encoder_hidden, latent_dim * prediction_horizon)
         self._b = nn.Parameter(torch.zeros(1))
 
         # ---- Quadratic reward heads (action part) ----
-        self._R_net = _mlp(ctx_dim, encoder_hidden, act_dim * act_dim * prediction_horizon)
+        self._R_num_bases = int(getattr(cfg, 'reward_r_num_bases', self._A_num_bases))
+        self._R_scale = max(0.0, float(getattr(cfg, 'reward_r_scale', 1.0)))
+        r_basis_init = float(getattr(cfg, 'reward_r_basis_init', a_basis_init))
+        self._R_net = _mlp(ctx_dim, encoder_hidden, self._R_num_bases * prediction_horizon)
+        self._R_basis = nn.Parameter(torch.randn(self._R_num_bases, act_dim, act_dim) * r_basis_init)
         self._r_net = _mlp(ctx_dim, encoder_hidden, act_dim * prediction_horizon)
 
         # ---- Policy (SAC-style stochastic: outputs mean + log_std) ----
@@ -190,15 +205,30 @@ class SSMWorldModel(nn.Module):
         ])
 
         # ---- Single Q-function MLP ----
-        # Takes (z, a, encoder_in) and outputs a single Q-value scalar
-        # Input: [z, a, encoder_in] concatenated
-        q_func_input_dim = latent_dim + act_dim + ctx_dim
+        # Takes (z, a) and outputs a single Q-value scalar.
+        q_func_input_dim = latent_dim + act_dim
         critic_hidden = getattr(cfg, 'critic_struct', encoder_hidden)
 
         self._q_func = _mlp(q_func_input_dim, critic_hidden, 1)
         self._q_func_target = deepcopy(self._q_func)
         for p in self._q_func_target.parameters():
             p.requires_grad_(False)
+
+        # ---- Quadratic Q-function ensemble for MPC arrival cost ----
+        # Each MLP maps encoder_in -> [P_diag, p, pb, Rc_diag, rc].
+        # The scalar _q_func above remains the actor/training critic; this
+        # module provides convex quadratic coefficients for the QP terminal term.
+        arrival_q_out_dim = 2 * latent_dim + 1 + 2 * act_dim
+        self._arrival_q_ensemble = nn.ModuleList([
+            _mlp(ctx_dim, critic_hidden, arrival_q_out_dim)
+            for _ in range(num_ensembles)
+        ])
+        self._arrival_q_ensemble_target = nn.ModuleList([
+            deepcopy(net) for net in self._arrival_q_ensemble
+        ])
+        for net in self._arrival_q_ensemble_target:
+            for p in net.parameters():
+                p.requires_grad_(False)
 
     # ------------------------------------------------------------------
     # Properties
@@ -259,26 +289,47 @@ class SSMWorldModel(nn.Module):
         A_seq = self._basis_dynamics_matrix(
             A_weights, self._A_basis, self._A_identity_scale, self._A_scale)
 
-        B_flat = self._B_net(encoder_in)  # [batch, latent_dim * act_dim * H]
-        B_seq = self._B_scale * torch.tanh(B_flat.view(-1, H, self.latent_dim, self.act_dim))
+        B_weight_flat = self._B_net(encoder_in)  # [batch, H * B_num_bases]
+        B_weights = B_weight_flat.view(-1, H, self._B_num_bases)
+        B_seq = self._basis_matrix(B_weights, self._B_basis, self._B_scale)
 
         H = self.prediction_horizon
         # Q_net and q_net output sequences of length H
-        Q_flat = self._Q_net(encoder_in)  # [batch, latent_dim * latent_dim * H]
-        Q_raw_seq = Q_flat.view(-1, H, self.latent_dim, self.latent_dim)
-        Q_seq = self._psd_from_raw_factor(Q_raw_seq)
+        Q_weight_flat = self._Q_net(encoder_in)  # [batch, H * Q_num_bases]
+        Q_weights = Q_weight_flat.view(-1, H, self._Q_num_bases)
+        Q_raw_seq = self._basis_matrix(Q_weights, self._Q_basis)
+        Q_seq = self._Q_scale * self._psd_from_raw_factor(Q_raw_seq)
 
         q_flat = self._q_net(encoder_in)  # [batch, latent_dim * H]
         q_seq = q_flat.view(-1, H, self.latent_dim)       # [batch, H, latent_dim]
 
-        R_flat = self._R_net(encoder_in)  # [batch, act_dim * act_dim * H]
-        R_raw_seq = R_flat.view(-1, H, self.act_dim, self.act_dim)
-        R_seq = self._psd_from_raw_factor(R_raw_seq)
+        R_weight_flat = self._R_net(encoder_in)  # [batch, H * R_num_bases]
+        R_weights = R_weight_flat.view(-1, H, self._R_num_bases)
+        R_raw_seq = self._basis_matrix(R_weights, self._R_basis)
+        R_seq = self._R_scale * self._psd_from_raw_factor(R_raw_seq)
 
         r_flat = self._r_net(encoder_in)  # [batch, act_dim * H]
         r_seq = r_flat.view(-1, H, self.act_dim)       # [batch, H, act_dim]
 
         return A_seq, B_seq, Q_seq, q_seq, R_seq, r_seq, encoder_in
+
+    @staticmethod
+    def _basis_matrix(weights, basis, matrix_scale=1.0):
+        """
+        Mix learned dense basis matrices using bounded context coefficients.
+
+        Args:
+            weights: [batch, horizon, num_bases] context-dependent coefficients
+            basis: [num_bases, rows, cols] learned dense basis matrices
+            matrix_scale: non-negative scale applied to the mixed matrix
+        Returns:
+            [batch, horizon, rows, cols] dense matrix sequence
+        """
+        num_bases = basis.shape[0]
+        coeffs = torch.tanh(weights)
+        bounded_basis = torch.tanh(basis)
+        mixed = torch.einsum('bhk,kij->bhij', coeffs, bounded_basis) / (num_bases ** 0.5)
+        return matrix_scale * mixed
 
     @staticmethod
     def _basis_dynamics_matrix(weights, basis, identity_scale=1.0, dynamics_scale=0.05):
@@ -294,12 +345,9 @@ class SSMWorldModel(nn.Module):
             [batch, horizon, dim, dim] dense dynamics matrices
         """
         dim = basis.shape[-1]
-        num_bases = basis.shape[0]
         eye = torch.eye(dim, device=weights.device, dtype=weights.dtype)
         eye = eye.expand(weights.shape[0], weights.shape[1], dim, dim)
-        coeffs = torch.tanh(weights)
-        bounded_basis = torch.tanh(basis)
-        residual = torch.einsum('bhk,kij->bhij', coeffs, bounded_basis) / (num_bases ** 0.5)
+        residual = SSMWorldModel._basis_matrix(weights, basis)
         return identity_scale * eye + dynamics_scale * residual
 
     @staticmethod
@@ -435,38 +483,117 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     # Q-Function MLP (single scalar Q-value approximator)
     # ------------------------------------------------------------------
-    def Q_value(self, z, a, encoder_in, target=False, return_type=None):
+    def Q_value(self, z, a, encoder_in=None, target=False, return_type=None):
         """
-        Compute Q-value using a single MLP: Q(z, a, encoder_in).
+        Compute Q-value using a single MLP: Q(z, a).
 
         Args:
             z:          [batch, latent_dim]
             a:          [batch, act_dim]
-            encoder_in: [batch, ctx_dim]
+            encoder_in: ignored; kept for compatibility with older call sites
             target:     whether to use target network
             return_type: unused (kept for API compatibility)
         Returns:
             q_val: [batch, 1]
         """
         q_func = self._q_func_target if target else self._q_func
-        # Concatenate inputs
-        x = torch.cat([z, a, encoder_in], dim=-1)  # [batch, latent_dim + act_dim + ctx_dim]
+        x = torch.cat([z, a], dim=-1)  # [batch, latent_dim + act_dim]
         q_val = q_func(x)  # [batch, 1]
         return q_val
+
+    # ------------------------------------------------------------------
+    # Quadratic Q-Function ensemble for MPC arrival cost
+    # ------------------------------------------------------------------
+    def arrival_Q_params(self, encoder_in, target=False):
+        """
+        Return context-conditioned quadratic Q coefficients.
+
+        Each ensemble member represents:
+            Q_i(z, a) = -(z^T diag(P_i) z + p_i^T z + pb_i
+                         + a^T diag(Rc_i) a + rc_i^T a)
+
+        Args:
+            encoder_in: [batch, ctx_dim]
+            target:     whether to use target networks
+        Returns:
+            P_diag:  [batch, E, latent_dim]
+            p_vec:   [batch, E, latent_dim]
+            pb:      [batch, E]
+            Rc_diag: [batch, E, act_dim]
+            rc_vec:  [batch, E, act_dim]
+        """
+        ensemble = self._arrival_q_ensemble_target if target else self._arrival_q_ensemble
+        D = self.latent_dim
+        nU = self.act_dim
+
+        P_list, p_list, pb_list, Rc_list, rc_list = [], [], [], [], []
+        for net in ensemble:
+            out = net(encoder_in)
+            P_list.append(F.relu(out[:, :D]))
+            p_list.append(out[:, D:2 * D])
+            pb_list.append(out[:, 2 * D:2 * D + 1].squeeze(-1))
+            Rc_list.append(F.relu(out[:, 2 * D + 1:2 * D + 1 + nU]))
+            rc_list.append(out[:, 2 * D + 1 + nU:])
+
+        return (
+            torch.stack(P_list, dim=1),
+            torch.stack(p_list, dim=1),
+            torch.stack(pb_list, dim=1),
+            torch.stack(Rc_list, dim=1),
+            torch.stack(rc_list, dim=1),
+        )
+
+    def arrival_Q_value(self, z, a, encoder_in, target=False, return_type='min'):
+        """
+        Evaluate the quadratic arrival Q ensemble.
+
+        Args:
+            z:          [batch, latent_dim]
+            a:          [batch, act_dim]
+            encoder_in: [batch, ctx_dim]
+            target:     whether to use target networks
+            return_type: 'max', 'min', 'avg', or 'all'
+        Returns:
+            If 'max'/'min'/'avg': [batch, 1]
+            If 'all':             [batch, num_ensembles]
+        """
+        P_diag, p_vec, pb, Rc_diag, rc_vec = self.arrival_Q_params(encoder_in, target=target)
+        z_e = z.unsqueeze(1)
+        a_e = a.unsqueeze(1)
+
+        quad_z = (P_diag * z_e * z_e).sum(dim=-1)
+        lin_z = (p_vec * z_e).sum(dim=-1)
+        quad_a = (Rc_diag * a_e * a_e).sum(dim=-1)
+        lin_a = (rc_vec * a_e).sum(dim=-1)
+        all_vals = -(quad_z + lin_z + pb + quad_a + lin_a)
+
+        if return_type == 'all':
+            return all_vals
+        elif return_type == 'max':
+            return all_vals.max(dim=1, keepdim=True).values
+        elif return_type == 'min':
+            return all_vals.min(dim=1, keepdim=True).values
+        elif return_type == 'avg':
+            return all_vals.mean(dim=1, keepdim=True)
+        else:
+            raise ValueError(f"Unknown return_type: {return_type}")
 
     # ------------------------------------------------------------------
     # Gradient control helpers
     # ------------------------------------------------------------------
     def track_critic_grad(self, mode=True):
-        """Enable / disable gradients for Q-function MLP parameters."""
+        """Enable / disable gradients for Q-function parameters."""
         for p in self._q_func.parameters():
             p.requires_grad_(mode)
+        for net in self._arrival_q_ensemble:
+            for p in net.parameters():
+                p.requires_grad_(mode)
 
     # ------------------------------------------------------------------
     # Soft target updates
     # ------------------------------------------------------------------
     def soft_update_targets(self, tau=None):
-        """Polyak-average update of target encoder, Q-function and target policy."""
+        """Polyak-average update of target encoder, Q-functions and target policy."""
         if tau is None:
             tau = self.cfg.tau
         with torch.no_grad():
@@ -477,6 +604,10 @@ class SSMWorldModel(nn.Module):
             # Q-function target
             for p_tgt, p in zip(self._q_func_target.parameters(), self._q_func.parameters()):
                 p_tgt.data.lerp_(p.data, tau)
+            # Arrival Q-function targets
+            for tgt_net, src_net in zip(self._arrival_q_ensemble_target, self._arrival_q_ensemble):
+                for p_tgt, p in zip(tgt_net.parameters(), src_net.parameters()):
+                    p_tgt.data.lerp_(p.data, tau)
             # Update all three policy heads
             pi_pairs = [
                 (self._pi_target_trunk,        self._pi_trunk),

@@ -2,7 +2,7 @@ defaults:
     - override hydra/launcher: submitit_local
 
 # environment
-task: dog-run
+task: humanoid_h1-walk-v0
 obs: state
 
 # evaluation
@@ -12,6 +12,8 @@ eval_freq: 50000
 
 # training
 steps: 10_000_000
+device: auto
+replay_device: auto
 batch_size: 256
 reward_coef: 0.1
 value_coef: 0.1
@@ -63,9 +65,9 @@ simnorm_dim: 8
 
 # logging
 wandb_project: humanoid-bench
-wandb_entity: robot-learning
+wandb_entity: minghao-han
 wandb_silent: false
-disable_wandb: true
+disable_wandb: false
 save_csv: true
 
 # misc

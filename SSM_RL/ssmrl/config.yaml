@@ -6,9 +6,9 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: H=16-latent=32-dense_new-value_techs
+exp_name: -param_noise=2e-4-lr3e-4-latent=64-l2r1e-4-a_for_q_fixed
 #agent_name: SSM_agent_v15_const
-agent_name: SSM_agent_v32
+agent_name: SSM_agent_v34
 
 # evaluation
 checkpoint: ???
@@ -17,16 +17,20 @@ eval_freq: 10000
 
 # training
 steps: 10_000_000
+device: auto
+replay_device: auto
 batch_size: 256
-reward_coef: 1.0
+reward_coef: 1e0
 value_coef: 1e0
 consistency_coef: 1e-2
 rho: 1.0
 lr: 3e-4
+l2_regularizer: 1e-4
 enc_lr_scale: 0.3
 grad_clip_norm: 20
 tau: 0.01
 discount_denom: 5
+param_noise_std: 2e-4
 discount_min: 0.95
 discount_max: 0.995
 buffer_size: 3_000_000
@@ -81,7 +85,7 @@ num_enc_layers: 2
 enc_dim: 256
 num_channels: 32
 mlp_dim: 512
-latent_dim: 32
+latent_dim: 64
 task_dim: 96
 num_q: 5
 dropout: 0.01

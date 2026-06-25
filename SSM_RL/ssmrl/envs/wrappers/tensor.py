@@ -34,8 +34,13 @@ class TensorWrapper(gym.Wrapper):
         obs, info = self.env.reset()
         return self._obs_to_tensor(obs), info
 
+    def _action_to_numpy(self, action):
+        if isinstance(action, torch.Tensor):
+            action = action.detach().cpu().numpy()
+        return np.asarray(action, dtype=np.float32).copy()
+
     def step(self, action):
-        obs, reward, done, truncated, info = self.env.step(action)
+        obs, reward, done, truncated, info = self.env.step(self._action_to_numpy(action))
         info = defaultdict(float, info)
         info["success"] = float(info["success"])
         return (
