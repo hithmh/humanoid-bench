@@ -6,7 +6,7 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: -param_noise=2e-4-lr3e-4-latent=64-l2r1e-4-a_for_q_fixed
+exp_name: -param_noise=2e-4-lr3e-4-latent=32-l2r1e-4-tdmpc2_Q-H4-rho0.5
 #agent_name: SSM_agent_v15_const
 agent_name: SSM_agent_v34
 
@@ -23,7 +23,7 @@ batch_size: 256
 reward_coef: 1e0
 value_coef: 1e0
 consistency_coef: 1e-2
-rho: 1.0
+rho: 0.5
 lr: 3e-4
 l2_regularizer: 1e-4
 enc_lr_scale: 0.3
@@ -61,7 +61,7 @@ solver: SCS
 mpc: true
 iterations: 6
 num_samples: 512
-horizon: 16
+horizon: 4
 control_horizon: 8
 min_std: 0.05
 max_std: 2
@@ -85,7 +85,7 @@ num_enc_layers: 2
 enc_dim: 256
 num_channels: 32
 mlp_dim: 512
-latent_dim: 64
+latent_dim: 32
 task_dim: 96
 num_q: 5
 dropout: 0.01
