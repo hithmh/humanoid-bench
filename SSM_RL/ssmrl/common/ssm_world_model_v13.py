@@ -15,12 +15,11 @@ Follows the architecture of WorldModel in ssmrl/common/world_model.py.
 
 from copy import deepcopy
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ssmrl.common import layers, math
+from ssmrl.common import layers
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +32,7 @@ class _ShiftedELU(nn.Module):
         return F.elu(x) + 1.0
 
 
-def _mlp(in_dim, hidden_dims, out_dim, act=nn.ReLU, output_act=None, dropout=0.0):
+def _mlp(in_dim, hidden_dims, out_dim, act=nn.Mish, output_act=None, dropout=0.0):
     """Build a simple MLP with optional output activation."""
     dims = [in_dim] + list(hidden_dims) + [out_dim]
     mods = []
@@ -103,8 +102,8 @@ class SSMWorldModel(nn.Module):
       learned basis matrices).
     * Reward is a learned quadratic form over latent state and action.
     * Critic is a TD-MPC2-style ensemble over (raw observation, action).
-    * Arrival-cost critic is an ensemble of context-conditioned quadratic
-      forms in latent state and action.
+    * Arrival-cost critic is a context-conditioned quadratic form in latent
+      state and action.
     * The policy consumes raw observations directly.
     """
 
@@ -138,7 +137,8 @@ class SSMWorldModel(nn.Module):
         self.prediction_horizon = prediction_horizon
 
         # ---- Deterministic encoder: obs → latent (for world model) ----
-        self._encoder_mean = _mlp(state_dim, encoder_hidden, latent_dim)
+        # self._encoder_mean = _mlp(state_dim, encoder_hidden, latent_dim)
+        self._encoder_mean = layers.enc(cfg)
         self._encoder_mean_target = deepcopy(self._encoder_mean)
         for p in self._encoder_mean_target.parameters():
             p.requires_grad_(False)
@@ -163,9 +163,19 @@ class SSMWorldModel(nn.Module):
         self._B_num_bases = int(getattr(cfg, 'dynamics_b_num_bases', self._A_num_bases))
         self._B_scale = float(getattr(cfg, 'dynamics_b_scale', 0.1))
         b_basis_init = float(getattr(cfg, 'dynamics_b_basis_init', a_basis_init))
-        self._A_net = _mlp(ctx_dim, encoder_hidden, self._A_num_bases * prediction_horizon)
+        # self._A_net = _mlp(ctx_dim, encoder_hidden, self._A_num_bases * prediction_horizon)
+        self._A_net = layers.mlp(
+            ctx_dim,
+            2 * [cfg.mlp_dim],
+            self._A_num_bases * prediction_horizon,
+        )
         self._A_basis = nn.Parameter(torch.randn(self._A_num_bases, latent_dim, latent_dim) * a_basis_init)
-        self._B_net = _mlp(ctx_dim, encoder_hidden, self._B_num_bases * prediction_horizon)
+        # self._B_net = _mlp(ctx_dim, encoder_hidden, self._B_num_bases * prediction_horizon)
+        self._B_net = layers.mlp(
+            ctx_dim,
+            2 * [cfg.mlp_dim],
+            self._B_num_bases * prediction_horizon,
+        )
         self._B_basis = nn.Parameter(torch.randn(self._B_num_bases, latent_dim, act_dim) * b_basis_init)
 
         # ---- Quadratic reward heads (state part) ----
@@ -174,19 +184,38 @@ class SSMWorldModel(nn.Module):
         self._Q_num_bases = int(getattr(cfg, 'reward_q_num_bases', self._A_num_bases))
         self._Q_scale = max(0.0, float(getattr(cfg, 'reward_q_scale', 1.0)))
         q_basis_init = float(getattr(cfg, 'reward_q_basis_init', a_basis_init))
-        self._Q_net = _mlp(ctx_dim, encoder_hidden, self._Q_num_bases * prediction_horizon)
+        # self._Q_net = _mlp(ctx_dim, encoder_hidden, self._Q_num_bases * prediction_horizon)
+        self._Q_net = layers.mlp(
+            ctx_dim,
+            2 * [cfg.mlp_dim],
+            self._Q_num_bases * prediction_horizon,
+        )
         self._Q_basis = nn.Parameter(torch.randn(self._Q_num_bases, latent_dim, latent_dim) * q_basis_init)
-        self._q_net = _mlp(ctx_dim, encoder_hidden, latent_dim * prediction_horizon)
+        # self._q_net = _mlp(ctx_dim, encoder_hidden, latent_dim * prediction_horizon)
+        self._q_net = layers.mlp(
+            ctx_dim,
+            2 * [cfg.mlp_dim],
+            latent_dim * prediction_horizon,
+        )
         self._b = nn.Parameter(torch.zeros(1))
 
         # ---- Quadratic reward heads (action part) ----
         self._R_num_bases = int(getattr(cfg, 'reward_r_num_bases', self._A_num_bases))
         self._R_scale = max(0.0, float(getattr(cfg, 'reward_r_scale', 1.0)))
         r_basis_init = float(getattr(cfg, 'reward_r_basis_init', a_basis_init))
-        self._R_net = _mlp(ctx_dim, encoder_hidden, self._R_num_bases * prediction_horizon)
+        # self._R_net = _mlp(ctx_dim, encoder_hidden, self._R_num_bases * prediction_horizon)
+        self._R_net = layers.mlp(
+            ctx_dim,
+            2 * [cfg.mlp_dim],
+            self._R_num_bases * prediction_horizon,
+        )
         self._R_basis = nn.Parameter(torch.randn(self._R_num_bases, act_dim, act_dim) * r_basis_init)
-        self._r_net = _mlp(ctx_dim, encoder_hidden, act_dim * prediction_horizon)
-
+        # self._r_net = _mlp(ctx_dim, encoder_hidden, act_dim * prediction_horizon)
+        self._r_net = layers.mlp(
+            ctx_dim,
+            2 * [cfg.mlp_dim],
+            act_dim * prediction_horizon,
+        )
         # ---- Policy (SAC-style stochastic: outputs mean + log_std) ----
         log_std_min = getattr(cfg, 'log_std_min', -5)
         log_std_max = getattr(cfg, 'log_std_max', 2)
@@ -194,7 +223,12 @@ class SSMWorldModel(nn.Module):
         self._log_std_max = log_std_max
 
         # Raw-observation policy trunk -> mean head and log_std head
-        self._pi_trunk = _mlp(state_dim, policy_hidden, policy_hidden[-1])
+        # self._pi_trunk = _mlp(state_dim, policy_hidden, policy_hidden[-1])
+        self._pi_trunk = layers.mlp(
+            state_dim,
+            2 * [cfg.mlp_dim],
+            policy_hidden[-1],
+        )
         self._pi_mean_head = nn.Linear(policy_hidden[-1], act_dim)
         self._pi_log_std_head = nn.Linear(policy_hidden[-1], act_dim)
 
@@ -209,40 +243,49 @@ class SSMWorldModel(nn.Module):
             self._pi_target_trunk, self._pi_target_mean_head, self._pi_target_log_std_head
         ])
 
-        # ---- TD-MPC2-style Q-function ensemble ----
-        # Each head takes (raw obs, a) and outputs distributional value logits.
+        # ---- Scalar Q-function ensemble ----
+        # Each head takes (raw obs, a) and outputs a scalar Q-value.
         q_func_input_dim = state_dim + act_dim
-        q_func_output_dim = max(int(getattr(cfg, 'num_bins', 0)), 1)
+        q_func_output_dim = 1
         critic_hidden = getattr(cfg, 'critic_struct', encoder_hidden)
 
-        self._q_func = layers.Ensemble([
-            _mlp(
-                q_func_input_dim,
-                critic_hidden,
-                q_func_output_dim,
-                dropout=float(getattr(cfg, 'dropout', 0.0)),
-            )
-            for _ in range(num_q)
-        ])
+        # self._q_func = layers.Ensemble([
+        #     _mlp(
+        #         q_func_input_dim,
+        #         critic_hidden,
+        #         q_func_output_dim,
+        #     )
+        #     for _ in range(num_q)
+        # ])
+        self._q_func = layers.Ensemble(
+            [
+                layers.mlp(
+                    q_func_input_dim,
+                    2 * [cfg.mlp_dim],
+                    q_func_output_dim,
+                    dropout=cfg.dropout,
+                )
+                for _ in range(cfg.num_q)
+            ]
+        )
         self._q_func_target = deepcopy(self._q_func)
         for p in self._q_func_target.parameters():
             p.requires_grad_(False)
 
-        # ---- Quadratic Q-function ensemble for MPC arrival cost ----
+        # ---- Quadratic Q-function for MPC arrival cost ----
         # Each MLP maps encoder_in -> [P_diag, p, pb, Rc_diag, rc].
-        # The distributional _q_func above remains the actor/training critic; this
+        # The scalar _q_func above remains the actor/training critic; this
         # module provides convex quadratic coefficients for the QP terminal term.
         arrival_q_out_dim = 2 * latent_dim + 1 + 2 * act_dim
-        self._arrival_q_ensemble = nn.ModuleList([
-            _mlp(ctx_dim, critic_hidden, arrival_q_out_dim)
-            for _ in range(num_ensembles)
-        ])
-        self._arrival_q_ensemble_target = nn.ModuleList([
-            deepcopy(net) for net in self._arrival_q_ensemble
-        ])
-        for net in self._arrival_q_ensemble_target:
-            for p in net.parameters():
-                p.requires_grad_(False)
+        # self._arrival_q = _mlp(ctx_dim, critic_hidden, arrival_q_out_dim)
+        self._arrival_q = layers.mlp(
+            ctx_dim,
+            2 * [cfg.mlp_dim],
+            arrival_q_out_dim,
+        )
+        self._arrival_q_target = deepcopy(self._arrival_q)
+        for p in self._arrival_q_target.parameters():
+            p.requires_grad_(False)
 
     # ------------------------------------------------------------------
     # Properties
@@ -259,8 +302,7 @@ class SSMWorldModel(nn.Module):
         for m in self._pi_target:
             m.train(False)
         self._q_func_target.train(False)
-        for net in self._arrival_q_ensemble_target:
-            net.train(False)
+        self._arrival_q_target.train(False)
         return self
 
     # ------------------------------------------------------------------
@@ -277,7 +319,7 @@ class SSMWorldModel(nn.Module):
             z   (same leading shape as obs, last dim = latent_dim)
         """
         encoder = self._encoder_mean_target if target else self._encoder_mean
-        return encoder(obs)
+        return encoder[self.cfg.obs](obs)
 
     def encode_context(self, state_history, action_history, current_obs):
         """
@@ -502,7 +544,7 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     def Q_value(self, obs, a, encoder_in=None, target=False, return_type='min'):
         """
-        Predict state-action value with a TD-MPC2-style Q ensemble.
+        Predict state-action value with a scalar Q ensemble.
 
         Args:
             obs:        [batch, state_dim]
@@ -512,7 +554,7 @@ class SSMWorldModel(nn.Module):
             return_type: 'min', 'avg', or 'all'
         Returns:
             If 'min'/'avg': scalar Q value [batch, 1]
-            If 'all':       Q logits [num_q, batch, num_bins]
+            If 'all':       scalar Q values [num_q, batch, 1]
         """
         if return_type is None:
             return_type = 'min'
@@ -520,93 +562,72 @@ class SSMWorldModel(nn.Module):
 
         q_func = self._q_func_target if target else self._q_func
         x = torch.cat([obs, a], dim=-1)  # [batch, state_dim + act_dim]
-        out = q_func(x)  # [num_q, batch, num_bins]
+        out = q_func(x)  # [num_q, batch, 1]
 
         if return_type == 'all':
             return out
 
-        if self.num_q >= 2:
-            idx = np.random.choice(self.num_q, 2, replace=False)
-            q1, q2 = out[idx[0]], out[idx[1]]
-        else:
-            q1 = q2 = out[0]
-        q1, q2 = math.two_hot_inv(q1, self.cfg), math.two_hot_inv(q2, self.cfg)
-        return torch.min(q1, q2) if return_type == 'min' else (q1 + q2) / 2
+        if return_type == 'min':
+            return out.min(dim=0).values
+        return out.mean(dim=0)
 
     # ------------------------------------------------------------------
-    # Quadratic Q-Function ensemble for MPC arrival cost
+    # Quadratic Q-Function for MPC arrival cost
     # ------------------------------------------------------------------
     def arrival_Q_params(self, encoder_in, target=False):
         """
         Return context-conditioned quadratic Q coefficients.
 
-        Each ensemble member represents:
-            Q_i(z, a) = -(z^T diag(P_i) z + p_i^T z + pb_i
-                         + a^T diag(Rc_i) a + rc_i^T a)
+        The arrival Q-function represents:
+            Q(z, a) = -(z^T diag(P) z + p^T z + pb
+                       + a^T diag(Rc) a + rc^T a)
 
         Args:
             encoder_in: [batch, ctx_dim]
-            target:     whether to use target networks
+            target:     whether to use the target network
         Returns:
-            P_diag:  [batch, E, latent_dim]
-            p_vec:   [batch, E, latent_dim]
-            pb:      [batch, E]
-            Rc_diag: [batch, E, act_dim]
-            rc_vec:  [batch, E, act_dim]
+            P_diag:  [batch, latent_dim]
+            p_vec:   [batch, latent_dim]
+            pb:      [batch]
+            Rc_diag: [batch, act_dim]
+            rc_vec:  [batch, act_dim]
         """
-        ensemble = self._arrival_q_ensemble_target if target else self._arrival_q_ensemble
+        net = self._arrival_q_target if target else self._arrival_q
         D = self.latent_dim
         nU = self.act_dim
 
-        P_list, p_list, pb_list, Rc_list, rc_list = [], [], [], [], []
-        for net in ensemble:
-            out = net(encoder_in)
-            P_list.append(F.relu(out[:, :D]))
-            p_list.append(out[:, D:2 * D])
-            pb_list.append(out[:, 2 * D:2 * D + 1].squeeze(-1))
-            Rc_list.append(F.relu(out[:, 2 * D + 1:2 * D + 1 + nU]))
-            rc_list.append(out[:, 2 * D + 1 + nU:])
+        out = net(encoder_in)
+        P_diag = F.relu(out[:, :D])
+        p_vec = out[:, D:2 * D]
+        pb = out[:, 2 * D:2 * D + 1].squeeze(-1)
+        Rc_diag = F.relu(out[:, 2 * D + 1:2 * D + 1 + nU])
+        rc_vec = out[:, 2 * D + 1 + nU:]
 
-        return (
-            torch.stack(P_list, dim=1),
-            torch.stack(p_list, dim=1),
-            torch.stack(pb_list, dim=1),
-            torch.stack(Rc_list, dim=1),
-            torch.stack(rc_list, dim=1),
-        )
+        return P_diag, p_vec, pb, Rc_diag, rc_vec
 
     def arrival_Q_value(self, z, a, encoder_in, target=False, return_type='min'):
         """
-        Evaluate the quadratic arrival Q ensemble.
+        Evaluate the quadratic arrival Q-function.
 
         Args:
             z:          [batch, latent_dim]
             a:          [batch, act_dim]
             encoder_in: [batch, ctx_dim]
-            target:     whether to use target networks
-            return_type: 'max', 'min', 'avg', or 'all'
+            target:     whether to use the target network
+            return_type: kept for compatibility; all modes return the single Q
         Returns:
-            If 'max'/'min'/'avg': [batch, 1]
-            If 'all':             [batch, num_ensembles]
+            Arrival Q value [batch, 1]
         """
         P_diag, p_vec, pb, Rc_diag, rc_vec = self.arrival_Q_params(encoder_in, target=target)
-        z_e = z.unsqueeze(1)
-        a_e = a.unsqueeze(1)
 
-        quad_z = (P_diag * z_e * z_e).sum(dim=-1)
-        lin_z = (p_vec * z_e).sum(dim=-1)
-        quad_a = (Rc_diag * a_e * a_e).sum(dim=-1)
-        lin_a = (rc_vec * a_e).sum(dim=-1)
-        all_vals = -(quad_z + lin_z + pb + quad_a + lin_a)
+        quad_z = (P_diag * z * z).sum(dim=-1, keepdim=True)
+        lin_z = (p_vec * z).sum(dim=-1, keepdim=True)
+        quad_a = (Rc_diag * a * a).sum(dim=-1, keepdim=True)
+        lin_a = (rc_vec * a).sum(dim=-1, keepdim=True)
+        value = -(quad_z + lin_z + pb.unsqueeze(-1) + quad_a + lin_a)
 
-        if return_type == 'all':
-            return all_vals
-        elif return_type == 'max':
-            return all_vals.max(dim=1, keepdim=True).values
-        elif return_type == 'min':
-            return all_vals.min(dim=1, keepdim=True).values
-        elif return_type == 'avg':
-            return all_vals.mean(dim=1, keepdim=True)
+        if return_type in {'all', 'max', 'min', 'avg', None}:
+            return value
         else:
             raise ValueError(f"Unknown return_type: {return_type}")
 
@@ -617,9 +638,8 @@ class SSMWorldModel(nn.Module):
         """Enable / disable gradients for Q-function parameters."""
         for p in self._q_func.parameters():
             p.requires_grad_(mode)
-        for net in self._arrival_q_ensemble:
-            for p in net.parameters():
-                p.requires_grad_(mode)
+        for p in self._arrival_q.parameters():
+            p.requires_grad_(mode)
 
     # ------------------------------------------------------------------
     # Soft target updates
@@ -636,10 +656,9 @@ class SSMWorldModel(nn.Module):
             # Q-function target
             for p_tgt, p in zip(self._q_func_target.parameters(), self._q_func.parameters()):
                 p_tgt.data.lerp_(p.data, tau)
-            # Arrival Q-function targets
-            for tgt_net, src_net in zip(self._arrival_q_ensemble_target, self._arrival_q_ensemble):
-                for p_tgt, p in zip(tgt_net.parameters(), src_net.parameters()):
-                    p_tgt.data.lerp_(p.data, tau)
+            # Arrival Q-function target
+            for p_tgt, p in zip(self._arrival_q_target.parameters(), self._arrival_q.parameters()):
+                p_tgt.data.lerp_(p.data, tau)
             # Update all three policy heads
             pi_pairs = [
                 (self._pi_target_trunk,        self._pi_trunk),

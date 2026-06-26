@@ -6,7 +6,7 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: -l2r1e-4-H4-rho0.5-Q_on_0-entro_weight1e0-Q_obs
+exp_name: -H16-rho1-param_nois_2e-1-q_arival_Q_fun-new_arch-pi_avgQ
 #agent_name: SSM_agent_v15_const
 agent_name: SSM_agent_v34
 
@@ -20,17 +20,17 @@ steps: 10_000_000
 device: auto
 replay_device: auto
 batch_size: 256
-reward_coef: 1e0
+reward_coef: 1e3
 value_coef: 1e0
 consistency_coef: 1e-2
-rho: 0.5
+rho: 1.0
 lr: 3e-4
 l2_regularizer: 1e-4
 enc_lr_scale: 0.3
 grad_clip_norm: 20
 tau: 0.01
 discount_denom: 5
-param_noise_std: 2e-4
+param_noise_std: 2e-1
 discount_min: 0.95
 discount_max: 0.995
 buffer_size: 3_000_000
@@ -61,7 +61,7 @@ solver: SCS
 mpc: true
 iterations: 6
 num_samples: 512
-horizon: 4
+horizon: 16
 control_horizon: 8
 min_std: 0.05
 max_std: 2
@@ -71,7 +71,7 @@ u_penalty: 1e-2
 # actor
 log_std_min: -10
 log_std_max: 2
-entropy_coef: 1e0
+entropy_coef: 1e-4
 
 # critic
 num_bins: 101

@@ -14,9 +14,8 @@ MPC controller:
     dynamics constraints:
       z_{t+1} = A_t ... A_0 z_0 + T_u[t] @ U_flat
   * Per-step action bounds are encoded as box inequalities ``G U <= h``.
-  * The terminal Q cost uses the critic ensemble mean plus
-    ``cfg.ucb_beta`` times the ensemble standard deviation for state and action
-    quadratic terms.
+  * The terminal Q cost uses a single quadratic arrival Q-function over state
+    and action terms.
   * Training-time exploration perturbs encoded SSM/reward parameters by
     relative Gaussian noise (``cfg.param_noise_std``) and adds policy-standard-
     deviation action noise after planning.
@@ -96,7 +95,7 @@ class SSMAgent:
             {'params': [self.model._b]},
             {'params': self.model._q_func.parameters(),
              'lr': lr * critic_lr_scale},
-            {'params': self.model._arrival_q_ensemble.parameters(),
+            {'params': self.model._arrival_q.parameters(),
              'lr': lr * critic_lr_scale},
         ], lr=lr, weight_decay=self.l2_regularizer)
 
@@ -304,11 +303,11 @@ class SSMAgent:
 
         P_diag, p_vec, pb_vec, Rc_diag, rc_vec = self.model.arrival_Q_params(
             encoder_in, target=False)
-        P_diag_t  = P_diag[0]            # (E, D)
-        p_vec_t   = p_vec[0]             # (E, D)
-        pb_vec_t  = pb_vec[0]            # (E,)
-        Rc_diag_t = Rc_diag[0]           # (E, nU)
-        rc_vec_t  = rc_vec[0]            # (E, nU)
+        P_diag_t  = P_diag[0]            # (D,)
+        p_vec_t   = p_vec[0]             # (D,)
+        pb_vec_t  = pb_vec[0]            # ()
+        Rc_diag_t = Rc_diag[0]           # (nU,)
+        rc_vec_t  = rc_vec[0]            # (nU,)
 
         self.qpax_solver_attempts += 1
         input_tensors = {
@@ -407,7 +406,7 @@ class SSMAgent:
 
         Stage reward:  r(z_t, u_t) = -(z_t^T Q_r z_t + q_r^T z_t
                                         + u_t^T R_r u_t + r_r^T u_t + b)
-        Terminal cost (Q-value): Q(z_H, u_H) UCB over ensemble.
+        Terminal cost (Q-value): Q(z_H, u_H) from the quadratic arrival Q-function.
         """
         D   = self.latent_dim
         nU  = self.act_dim
@@ -416,15 +415,14 @@ class SSMAgent:
         discount = self.discount
         discount = 1.0
         u_penalty = float(getattr(self.cfg, 'u_penalty', 0.0))
-        ucb_beta = float(getattr(self.cfg, 'ucb_beta', 1.0))
 
         self._control_horizon = CH
         n = CH * nU   # total QP decision-variable size
 
         def _build_and_solve(z0, A_seq, B_seq, Q_seq, q_seq,
                              R_seq, r_seq,
-                             P_diags, p_mat, pb_vec,
-                             Rc_diags, rc_mat,
+                             P_diag, p_vec, pb,
+                             Rc_diag, rc_vec,
                              a_low, a_high):
             """
             Args
@@ -436,11 +434,11 @@ class SSMAgent:
             q_seq       : (H, D)     per-step linear state-cost coefficient
             R_seq       : (H, nU, nU) per-step PSD stage action-cost matrix
             r_seq       : (H, nU)    per-step linear action-cost coefficient
-            P_diags     : (E, D)     diagonal terminal state-cost coefficients
-            p_mat       : (E, D)     linear terminal state-cost coefficients
-            pb_vec      : (E,)       terminal critic bias (constant for QP)
-            Rc_diags    : (E, nU)    diagonal terminal action-cost coefficients
-            rc_mat      : (E, nU)    linear terminal action-cost coefficients
+            P_diag      : (D,)       diagonal terminal state-cost coefficients
+            p_vec       : (D,)       linear terminal state-cost coefficients
+            pb          : ()         terminal critic bias (constant for QP)
+            Rc_diag     : (nU,)      diagonal terminal action-cost coefficients
+            rc_vec      : (nU,)      linear terminal action-cost coefficients
             a_low       : (nU,)      per-dim action lower bound
             a_high      : (nU,)      per-dim action upper bound
 
@@ -518,37 +516,21 @@ class SSMAgent:
                 # Q_qp = Q_qp.at[s_u:e_u, s_u:e_u].add(
                 #     (discount ** t) * 2.0 * u_penalty * jnp.eye(nU))
 
-            # Terminal arrival cost from the quadratic Q ensemble.
+            # Terminal arrival cost from the quadratic Q-function.
             Tu_H = T_u_list[H - 1]   # (D, n)
             f_H = f_list[H - 1]      # (D,)
 
-            P_mean = jnp.mean(P_diags, axis=0)
-            P_std = jnp.std(P_diags, axis=0)
-            P_ucb = P_mean + ucb_beta * P_std
-
-            p_mean = jnp.mean(p_mat, axis=0)
-            p_std = jnp.std(p_mat, axis=0)
-            p_ucb = p_mean + ucb_beta * p_std
-
-            PTu = P_ucb[:, None] * Tu_H
+            PTu = P_diag[:, None] * Tu_H
             Q_qp = Q_qp + (discount ** H) * 2.0 * (Tu_H.T @ PTu)
-            c_qp = c_qp + (discount ** H) * (2.0 * (PTu.T @ f_H) + Tu_H.T @ p_ucb)
+            c_qp = c_qp + (discount ** H) * (2.0 * (PTu.T @ f_H) + Tu_H.T @ p_vec)
 
             s_u_H = (CH - 1) * nU
             e_u_H = CH * nU
 
-            Rc_mean = jnp.mean(Rc_diags, axis=0)
-            Rc_std = jnp.std(Rc_diags, axis=0)
-            Rc_ucb = Rc_mean + ucb_beta * Rc_std
-
-            rc_mean = jnp.mean(rc_mat, axis=0)
-            rc_std = jnp.std(rc_mat, axis=0)
-            rc_ucb = rc_mean + ucb_beta * rc_std
-
             Q_qp = Q_qp.at[s_u_H:e_u_H, s_u_H:e_u_H].add(
-                (discount ** H) * 2.0 * jnp.diag(Rc_ucb))
+                (discount ** H) * 2.0 * jnp.diag(Rc_diag))
             c_qp = c_qp.at[s_u_H:e_u_H].add(
-                (discount ** H) * rc_ucb)
+                (discount ** H) * rc_vec)
 
             # Ridge for numerical stability
             Q_qp = Q_qp + 1e-6 * jnp.eye(n)
