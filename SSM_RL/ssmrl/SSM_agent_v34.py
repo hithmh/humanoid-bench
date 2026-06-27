@@ -1,5 +1,5 @@
 """
-SSM Agent v19 - transformer-conditioned SSM-RL with JAX/qpax MPC.
+SSM Agent v34- transformer-conditioned SSM-RL with JAX/qpax MPC.
 
 This agent wraps ``SSMWorldModel`` and provides both model learning and
 inference-time control. During inference, recent state/action history is used

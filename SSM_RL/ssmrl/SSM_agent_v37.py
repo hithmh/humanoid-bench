@@ -1,5 +1,5 @@
 """
-SSM Agent v36 - transformer-conditioned SSM-RL with JAX/qpax MPC.
+SSM Agent v37- transformer-conditioned SSM-RL with JAX/qpax MPC.
 
 This agent wraps ``SSMWorldModel`` and provides both model learning and
 inference-time control. During inference, recent state/action history is used
@@ -42,7 +42,7 @@ import jax.numpy as jnp
 import qpax  # pip install qpax
 
 
-from ssmrl.common.ssm_world_model_v15 import SSMWorldModel
+from ssmrl.common.ssm_world_model_v37 import SSMWorldModel
 from ssmrl.common.scale import RunningScale
 
 
@@ -86,8 +86,10 @@ class SSMAgent:
             {'params': self.model._B_net.parameters()},
             {'params': [self.model._B_basis]},
             {'params': self.model._Q_net.parameters()},
+            {'params': [self.model._Q_basis]},
             {'params': self.model._q_net.parameters()},
             {'params': self.model._R_net.parameters()},
+            {'params': [self.model._R_basis]},
             {'params': self.model._r_net.parameters()},
             {'params': [self.model._b]},
             {'params': self.model._q_func.parameters(),
