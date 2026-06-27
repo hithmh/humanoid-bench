@@ -5,9 +5,9 @@ Implements a state-space model with:
   - Transformer-based temporal context encoder
   - Dense per-step linear dynamics: z' = A*z + B*u
   - Quadratic reward: z^T Q z + q^T z + u^T R u + r^T u + b
-    with networks directly outputting full PSD Q and R matrices
+    with full PSD Q and R matrices
   - Ensemble Q-function conditioned on latent state and action
-  - Ensemble quadratic Q-function for MPC arrival cost
+  - Single quadratic Q-function for MPC arrival cost
   - Raw-observation policy network (tanh-squashed)
 
 Follows the architecture of WorldModel in ssmrl/common/world_model.py.
@@ -99,7 +99,7 @@ class SSMWorldModel(nn.Module):
 
     Key differences from the vanilla TD-MPC2 WorldModel:
     * Dynamics are linear: z' = A*z + B*u  (dense A and B are mixed from
-      learned basis matrices using ensemble-predicted basis weights).
+      learned basis matrices).
     * Reward is a learned quadratic form over latent state and action.
     * Critic is a TD-MPC2-style ensemble over (raw observation, action).
     * Arrival-cost critic is a context-conditioned quadratic form in latent
@@ -167,27 +167,30 @@ class SSMWorldModel(nn.Module):
         self._A_net = layers.mlp(
             ctx_dim,
             2 * [cfg.mlp_dim],
-            num_ensembles * self._A_num_bases * prediction_horizon,
+            self._A_num_bases * prediction_horizon,
         )
         self._A_basis = nn.Parameter(torch.randn(self._A_num_bases, latent_dim, latent_dim) * a_basis_init)
         # self._B_net = _mlp(ctx_dim, encoder_hidden, self._B_num_bases * prediction_horizon)
         self._B_net = layers.mlp(
             ctx_dim,
             2 * [cfg.mlp_dim],
-            num_ensembles * self._B_num_bases * prediction_horizon,
+            self._B_num_bases * prediction_horizon,
         )
         self._B_basis = nn.Parameter(torch.randn(self._B_num_bases, latent_dim, act_dim) * b_basis_init)
 
         # ---- Quadratic reward heads (state part) ----
-        # The network directly predicts per-step lower-triangular factors.
-        # PSD is enforced by L @ L.T.
+        # Each predicts basis weights for lower-triangular factors. PSD is
+        # enforced after basis mixing via L @ L.T.
+        self._Q_num_bases = int(getattr(cfg, 'reward_q_num_bases', self._A_num_bases))
         self._Q_scale = max(0.0, float(getattr(cfg, 'reward_q_scale', 1.0)))
-        # self._Q_net = _mlp(ctx_dim, encoder_hidden, latent_dim * latent_dim * prediction_horizon)
+        q_basis_init = float(getattr(cfg, 'reward_q_basis_init', a_basis_init))
+        # self._Q_net = _mlp(ctx_dim, encoder_hidden, self._Q_num_bases * prediction_horizon)
         self._Q_net = layers.mlp(
             ctx_dim,
             2 * [cfg.mlp_dim],
-            latent_dim * latent_dim * prediction_horizon,
+            self._Q_num_bases * prediction_horizon,
         )
+        self._Q_basis = nn.Parameter(torch.randn(self._Q_num_bases, latent_dim, latent_dim) * q_basis_init)
         # self._q_net = _mlp(ctx_dim, encoder_hidden, latent_dim * prediction_horizon)
         self._q_net = layers.mlp(
             ctx_dim,
@@ -197,14 +200,16 @@ class SSMWorldModel(nn.Module):
         self._b = nn.Parameter(torch.zeros(1))
 
         # ---- Quadratic reward heads (action part) ----
-        # The network directly predicts per-step lower-triangular factors.
+        self._R_num_bases = int(getattr(cfg, 'reward_r_num_bases', self._A_num_bases))
         self._R_scale = max(0.0, float(getattr(cfg, 'reward_r_scale', 1.0)))
-        # self._R_net = _mlp(ctx_dim, encoder_hidden, act_dim * act_dim * prediction_horizon)
+        r_basis_init = float(getattr(cfg, 'reward_r_basis_init', a_basis_init))
+        # self._R_net = _mlp(ctx_dim, encoder_hidden, self._R_num_bases * prediction_horizon)
         self._R_net = layers.mlp(
             ctx_dim,
             2 * [cfg.mlp_dim],
-            act_dim * act_dim * prediction_horizon,
+            self._R_num_bases * prediction_horizon,
         )
+        self._R_basis = nn.Parameter(torch.randn(self._R_num_bases, act_dim, act_dim) * r_basis_init)
         # self._r_net = _mlp(ctx_dim, encoder_hidden, act_dim * prediction_horizon)
         self._r_net = layers.mlp(
             ctx_dim,
@@ -278,9 +283,9 @@ class SSMWorldModel(nn.Module):
             2 * [cfg.mlp_dim],
             arrival_q_out_dim,
         )
-        # self._arrival_q_target = deepcopy(self._arrival_q)
-        # for p in self._arrival_q_target.parameters():
-        #     p.requires_grad_(False)
+        self._arrival_q_target = deepcopy(self._arrival_q)
+        for p in self._arrival_q_target.parameters():
+            p.requires_grad_(False)
 
     # ------------------------------------------------------------------
     # Properties
@@ -297,6 +302,7 @@ class SSMWorldModel(nn.Module):
         for m in self._pi_target:
             m.train(False)
         self._q_func_target.train(False)
+        self._arrival_q_target.train(False)
         return self
 
     # ------------------------------------------------------------------
@@ -315,8 +321,7 @@ class SSMWorldModel(nn.Module):
         encoder = self._encoder_mean_target if target else self._encoder_mean
         return encoder[self.cfg.obs](obs)
 
-    def encode_context(self, state_history, action_history, current_obs,
-                       sample_dynamics=False, dynamics_noise_scale=1.0):
+    def encode_context(self, state_history, action_history, current_obs):
         """
         Run transformer on history and produce (A, B, Q_seq, q_seq, R_seq, r_seq, encoder_in) for the current step.
 
@@ -326,11 +331,7 @@ class SSMWorldModel(nn.Module):
             current_obs:    [batch, state_dim]
         Returns:
             A_seq:      [batch, prediction_horizon, latent_dim, latent_dim]
-                        from mean ensemble weights, or sampled weights when
-                        sample_dynamics=True
             B_seq:      [batch, prediction_horizon, latent_dim, act_dim]
-                        from mean ensemble weights, or sampled weights when
-                        sample_dynamics=True
             Q_seq:      [batch, prediction_horizon, latent_dim, latent_dim] per-step state PSD matrix
             q_seq:      [batch, prediction_horizon, latent_dim]   per-step state linear coefficient
             R_seq:      [batch, prediction_horizon, act_dim, act_dim] per-step action PSD matrix
@@ -342,41 +343,28 @@ class SSMWorldModel(nn.Module):
         encoder_in = torch.cat([transformer_out, current_obs], dim=-1)
 
         H = self.prediction_horizon
-        E = self.num_ensembles
-        A_weight_flat = self._A_net(encoder_in)  # [batch, E * H * num_bases]
-        A_weights = A_weight_flat.view(-1, E, H, self._A_num_bases)
-        A_weight_mean = A_weights.mean(dim=1)
-        if sample_dynamics:
-            A_weight_std = A_weights.std(dim=1, unbiased=False)
-            A_weight_mean = (
-                A_weight_mean
-                + dynamics_noise_scale * torch.randn_like(A_weight_mean) * A_weight_std
-            )
+        A_weight_flat = self._A_net(encoder_in)  # [batch, H * num_bases]
+        A_weights = A_weight_flat.view(-1, H, self._A_num_bases)
         A_seq = self._basis_dynamics_matrix(
-            A_weight_mean, self._A_basis, self._A_identity_scale, self._A_scale)
+            A_weights, self._A_basis, self._A_identity_scale, self._A_scale)
 
-        B_weight_flat = self._B_net(encoder_in)  # [batch, E * H * B_num_bases]
-        B_weights = B_weight_flat.view(-1, E, H, self._B_num_bases)
-        B_weight_mean = B_weights.mean(dim=1)
-        if sample_dynamics:
-            B_weight_std = B_weights.std(dim=1, unbiased=False)
-            B_weight_mean = (
-                B_weight_mean
-                + dynamics_noise_scale * torch.randn_like(B_weight_mean) * B_weight_std
-            )
-        B_seq = self._basis_matrix(B_weight_mean, self._B_basis, self._B_scale)
+        B_weight_flat = self._B_net(encoder_in)  # [batch, H * B_num_bases]
+        B_weights = B_weight_flat.view(-1, H, self._B_num_bases)
+        B_seq = self._basis_matrix(B_weights, self._B_basis, self._B_scale)
 
         H = self.prediction_horizon
         # Q_net and q_net output sequences of length H
-        Q_raw_flat = self._Q_net(encoder_in)  # [batch, H * latent_dim * latent_dim]
-        Q_raw_seq = Q_raw_flat.view(-1, H, self.latent_dim, self.latent_dim)
+        Q_weight_flat = self._Q_net(encoder_in)  # [batch, H * Q_num_bases]
+        Q_weights = Q_weight_flat.view(-1, H, self._Q_num_bases)
+        Q_raw_seq = self._basis_matrix(Q_weights, self._Q_basis)
         Q_seq = self._Q_scale * self._psd_from_raw_factor(Q_raw_seq)
 
         q_flat = self._q_net(encoder_in)  # [batch, latent_dim * H]
         q_seq = q_flat.view(-1, H, self.latent_dim)       # [batch, H, latent_dim]
 
-        R_raw_flat = self._R_net(encoder_in)  # [batch, H * act_dim * act_dim]
-        R_raw_seq = R_raw_flat.view(-1, H, self.act_dim, self.act_dim)
+        R_weight_flat = self._R_net(encoder_in)  # [batch, H * R_num_bases]
+        R_weights = R_weight_flat.view(-1, H, self._R_num_bases)
+        R_raw_seq = self._basis_matrix(R_weights, self._R_basis)
         R_seq = self._R_scale * self._psd_from_raw_factor(R_raw_seq)
 
         r_flat = self._r_net(encoder_in)  # [batch, act_dim * H]
@@ -396,10 +384,10 @@ class SSMWorldModel(nn.Module):
         Returns:
             [batch, horizon, rows, cols] dense matrix sequence
         """
+        num_bases = basis.shape[0]
         coeffs = torch.tanh(weights)
         bounded_basis = torch.tanh(basis)
-        num_bases = basis.shape[0]
-        mixed = torch.einsum('...k,kij->...ij', coeffs, bounded_basis) / (num_bases ** 0.5)
+        mixed = torch.einsum('bhk,kij->bhij', coeffs, bounded_basis) / (num_bases ** 0.5)
         return matrix_scale * mixed
 
     @staticmethod
@@ -417,7 +405,7 @@ class SSMWorldModel(nn.Module):
         """
         dim = basis.shape[-1]
         eye = torch.eye(dim, device=weights.device, dtype=weights.dtype)
-        eye = eye.expand(*weights.shape[:-1], dim, dim)
+        eye = eye.expand(weights.shape[0], weights.shape[1], dim, dim)
         residual = SSMWorldModel._basis_matrix(weights, basis)
         return identity_scale * eye + dynamics_scale * residual
 
@@ -604,7 +592,7 @@ class SSMWorldModel(nn.Module):
             Rc_diag: [batch, act_dim]
             rc_vec:  [batch, act_dim]
         """
-        net = self._arrival_q
+        net = self._arrival_q_target if target else self._arrival_q
         D = self.latent_dim
         nU = self.act_dim
 
@@ -668,7 +656,9 @@ class SSMWorldModel(nn.Module):
             # Q-function target
             for p_tgt, p in zip(self._q_func_target.parameters(), self._q_func.parameters()):
                 p_tgt.data.lerp_(p.data, tau)
-
+            # Arrival Q-function target
+            for p_tgt, p in zip(self._arrival_q_target.parameters(), self._arrival_q.parameters()):
+                p_tgt.data.lerp_(p.data, tau)
             # Update all three policy heads
             pi_pairs = [
                 (self._pi_target_trunk,        self._pi_trunk),

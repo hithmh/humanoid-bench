@@ -16,9 +16,9 @@ MPC controller:
   * Per-step action bounds are encoded as box inequalities ``G U <= h``.
   * The terminal Q cost uses a single quadratic arrival Q-function over state
     and action terms.
-  * Training-time exploration perturbs encoded SSM/reward parameters by
-    relative Gaussian noise (``cfg.param_noise_std``) and adds policy-standard-
-    deviation action noise after planning.
+  * Training-time exploration samples dynamics parameters from the A/B
+    ensemble mean plus Gaussian noise times ensemble standard deviation, then
+    adds policy-standard-deviation action noise after planning.
   * PyTorch tensors are passed to JAX through DLPack before the JIT solve.
 
 QP form passed to ``qpax``:
@@ -42,7 +42,7 @@ import jax.numpy as jnp
 import qpax  # pip install qpax
 
 
-from ssmrl.common.ssm_world_model_v37 import SSMWorldModel
+from ssmrl.common.ssm_world_model_v372 import SSMWorldModel
 from ssmrl.common.scale import RunningScale
 
 
@@ -233,27 +233,6 @@ class SSMAgent:
             action = np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
         return np.clip(action, -1.0, 1.0).astype(np.float32)
 
-    @torch.no_grad()
-    def _perturb_encoded_params(self, A, B, Q, q, R, r_vec):
-        """
-        Add relative Gaussian noise to encoded SSM parameters for exploration.
-        Full quadratic matrices are perturbed by congruence transforms,
-        preserving PSD structure.
-        """
-        std = float(getattr(self.cfg, 'param_noise_std', 0.02))
-
-        def _noisy(t: torch.Tensor) -> torch.Tensor:
-            scale = t.abs().mean() + 1e-6
-            return t + std * scale * torch.randn_like(t)
-
-        def _noisy_psd(M: torch.Tensor) -> torch.Tensor:
-            dim = M.shape[-1]
-            eye = torch.eye(dim, device=M.device, dtype=M.dtype)
-            S = eye.expand(*M.shape[:-2], dim, dim) + std * torch.randn_like(M)
-            return S @ M @ S.transpose(-1, -2)
-
-        return _noisy(A), _noisy(B), _noisy_psd(Q), _noisy(q), _noisy_psd(R), _noisy(r_vec)
-
     def _plan_jax(self, z: torch.Tensor, x0: np.ndarray, eval_mode: bool):
         """
         Solve the JAX/qpax MPC problem.  Falls back to the policy net on
@@ -271,25 +250,12 @@ class SSMAgent:
         obs_t    = torch.tensor(x0, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         A_seq, B_seq, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
-            state_t, action_t, obs_t)
-
-        # # ---- Parameter noise for exploration ----
-        if not eval_mode:
-            std = float(getattr(self.cfg, 'param_noise_std', 0.02))
-            def _noisy(t):
-                scale = t.abs().mean() + 1e-6
-                return t + std * scale * torch.randn_like(t)
-            def _noisy_psd(M):
-                dim = M.shape[-1]
-                eye = torch.eye(dim, device=M.device, dtype=M.dtype)
-                S = eye.expand(*M.shape[:-2], dim, dim) + std * torch.randn_like(M)
-                return S @ M @ S.transpose(-1, -2)
-            A_seq = _noisy(A_seq)
-            B_seq = _noisy(B_seq)
-            Q_seq = _noisy_psd(Q_seq)
-            q_seq = _noisy(q_seq)
-            R_seq = _noisy_psd(R_seq)
-            r_seq = _noisy(r_seq)
+            state_t,
+            action_t,
+            obs_t,
+            sample_dynamics=not eval_mode,
+            dynamics_noise_scale=float(getattr(self.cfg, 'dynamics_ensemble_noise_scale', 1.0)),
+        )
 
         # Extract single-sample tensors
         A_seq_t      = A_seq[0]          # (H, D, D)

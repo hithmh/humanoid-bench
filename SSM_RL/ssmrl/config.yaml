@@ -6,9 +6,9 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: -H24-rho1-param_nois_2e-1-new_arch-pi_avgQ-value_coef1e1
+exp_name: -H24-rho1-param_nois_2e-1-new_arch-pi_avgQ
 #agent_name: SSM_agent_v15_const
-agent_name: SSM_agent_v36
+agent_name: SSM_agent_v37
 
 # evaluation
 checkpoint: ???
@@ -21,7 +21,7 @@ device: auto
 replay_device: auto
 batch_size: 256
 reward_coef: 1e3
-value_coef: 1e1
+value_coef: 1e0
 consistency_coef: 1e-2
 rho: 1.0
 lr: 3e-4
