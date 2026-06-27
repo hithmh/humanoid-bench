@@ -42,7 +42,7 @@ import jax.numpy as jnp
 import qpax  # pip install qpax
 
 
-from ssmrl.common.ssm_world_model_v372 import SSMWorldModel
+from ssmrl.common.ssm_world_model_v37 import SSMWorldModel
 from ssmrl.common.scale import RunningScale
 
 
@@ -86,10 +86,8 @@ class SSMAgent:
             {'params': self.model._B_net.parameters()},
             {'params': [self.model._B_basis]},
             {'params': self.model._Q_net.parameters()},
-            {'params': [self.model._Q_basis]},
             {'params': self.model._q_net.parameters()},
             {'params': self.model._R_net.parameters()},
-            {'params': [self.model._R_basis]},
             {'params': self.model._r_net.parameters()},
             {'params': [self.model._b]},
             {'params': self.model._q_func.parameters(),
