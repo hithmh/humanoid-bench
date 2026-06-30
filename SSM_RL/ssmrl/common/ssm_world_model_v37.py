@@ -163,18 +163,19 @@ class SSMWorldModel(nn.Module):
         self._B_num_bases = int(getattr(cfg, 'dynamics_b_num_bases', self._A_num_bases))
         self._B_scale = float(getattr(cfg, 'dynamics_b_scale', 0.1))
         b_basis_init = float(getattr(cfg, 'dynamics_b_basis_init', a_basis_init))
-        # self._A_net = _mlp(ctx_dim, encoder_hidden, self._A_num_bases * prediction_horizon)
+        # Each dynamics head predicts all ensemble heads in one output tensor.
+        # encode_context reduces that ensemble to a mean for training/eval, or
+        # mean plus scaled ensemble std for exploration.
         self._A_net = layers.mlp(
             ctx_dim,
             2 * [cfg.mlp_dim],
-            self._A_num_bases * prediction_horizon,
+            num_ensembles * self._A_num_bases * prediction_horizon,
         )
         self._A_basis = nn.Parameter(torch.randn(self._A_num_bases, latent_dim, latent_dim) * a_basis_init)
-        # self._B_net = _mlp(ctx_dim, encoder_hidden, self._B_num_bases * prediction_horizon)
         self._B_net = layers.mlp(
             ctx_dim,
             2 * [cfg.mlp_dim],
-            self._B_num_bases * prediction_horizon,
+            num_ensembles * self._B_num_bases * prediction_horizon,
         )
         self._B_basis = nn.Parameter(torch.randn(self._B_num_bases, latent_dim, act_dim) * b_basis_init)
 
@@ -321,7 +322,15 @@ class SSMWorldModel(nn.Module):
         encoder = self._encoder_mean_target if target else self._encoder_mean
         return encoder[self.cfg.obs](obs)
 
-    def encode_context(self, state_history, action_history, current_obs):
+    def encode_context(
+        self,
+        state_history,
+        action_history,
+        current_obs,
+        sample_dynamics=False,
+        dynamics_noise_scale=1.0,
+        return_dynamics_ensemble=False,
+    ):
         """
         Run transformer on history and produce (A, B, Q_seq, q_seq, R_seq, r_seq, encoder_in) for the current step.
 
@@ -329,9 +338,16 @@ class SSMWorldModel(nn.Module):
             state_history:  [batch, history_horizon, state_dim]
             action_history: [batch, history_horizon, act_dim]
             current_obs:    [batch, state_dim]
+            sample_dynamics: if True, sample A/B basis weights as
+                             ensemble_mean + noise * ensemble_std
+            dynamics_noise_scale: multiplier on the ensemble std exploration noise
+            return_dynamics_ensemble: if True, return every A/B ensemble head
+                                      without mean/sample reduction
         Returns:
             A_seq:      [batch, prediction_horizon, latent_dim, latent_dim]
+                        or [batch, num_ensembles, prediction_horizon, latent_dim, latent_dim]
             B_seq:      [batch, prediction_horizon, latent_dim, act_dim]
+                        or [batch, num_ensembles, prediction_horizon, latent_dim, act_dim]
             Q_seq:      [batch, prediction_horizon, latent_dim, latent_dim] per-step state PSD matrix
             q_seq:      [batch, prediction_horizon, latent_dim]   per-step state linear coefficient
             R_seq:      [batch, prediction_horizon, act_dim, act_dim] per-step action PSD matrix
@@ -343,13 +359,29 @@ class SSMWorldModel(nn.Module):
         encoder_in = torch.cat([transformer_out, current_obs], dim=-1)
 
         H = self.prediction_horizon
-        A_weight_flat = self._A_net(encoder_in)  # [batch, H * num_bases]
-        A_weights = A_weight_flat.view(-1, H, self._A_num_bases)
+        A_weights = self._dynamics_ensemble_weights(
+            self._A_net,
+            encoder_in,
+            self.num_ensembles,
+            H,
+            self._A_num_bases,
+            sample_dynamics,
+            dynamics_noise_scale,
+            return_dynamics_ensemble,
+        )
         A_seq = self._basis_dynamics_matrix(
             A_weights, self._A_basis, self._A_identity_scale, self._A_scale)
 
-        B_weight_flat = self._B_net(encoder_in)  # [batch, H * B_num_bases]
-        B_weights = B_weight_flat.view(-1, H, self._B_num_bases)
+        B_weights = self._dynamics_ensemble_weights(
+            self._B_net,
+            encoder_in,
+            self.num_ensembles,
+            H,
+            self._B_num_bases,
+            sample_dynamics,
+            dynamics_noise_scale,
+            return_dynamics_ensemble,
+        )
         B_seq = self._basis_matrix(B_weights, self._B_basis, self._B_scale)
 
         H = self.prediction_horizon
@@ -373,21 +405,50 @@ class SSMWorldModel(nn.Module):
         return A_seq, B_seq, Q_seq, q_seq, R_seq, r_seq, encoder_in
 
     @staticmethod
+    def _dynamics_ensemble_weights(
+        net,
+        encoder_in,
+        num_ensembles,
+        horizon,
+        num_bases,
+        sample_dynamics=False,
+        dynamics_noise_scale=1.0,
+        return_ensemble=False,
+    ):
+        """
+        Return basis weights from a multi-head predictor.
+
+        By default, the ensemble dimension is reduced before basis mixing so
+        eval uses the mean predicted weights and exploration can sample from
+        the empirical ensemble spread. Training can request all heads and apply
+        losses independently.
+        """
+        weight_flat = net(encoder_in)
+        weights = weight_flat.view(-1, num_ensembles, horizon, num_bases)
+        if return_ensemble:
+            return weights
+        mean = weights.mean(dim=1)
+        if sample_dynamics and num_ensembles > 1 and dynamics_noise_scale != 0.0:
+            std = weights.std(dim=1, unbiased=False)
+            return mean + float(dynamics_noise_scale) * torch.randn_like(mean) * std
+        return mean
+
+    @staticmethod
     def _basis_matrix(weights, basis, matrix_scale=1.0):
         """
         Mix learned dense basis matrices using bounded context coefficients.
 
         Args:
-            weights: [batch, horizon, num_bases] context-dependent coefficients
+            weights: [..., horizon, num_bases] context-dependent coefficients
             basis: [num_bases, rows, cols] learned dense basis matrices
             matrix_scale: non-negative scale applied to the mixed matrix
         Returns:
-            [batch, horizon, rows, cols] dense matrix sequence
+            [..., horizon, rows, cols] dense matrix sequence
         """
         num_bases = basis.shape[0]
         coeffs = torch.tanh(weights)
         bounded_basis = torch.tanh(basis)
-        mixed = torch.einsum('bhk,kij->bhij', coeffs, bounded_basis) / (num_bases ** 0.5)
+        mixed = torch.einsum('...k,kij->...ij', coeffs, bounded_basis) / (num_bases ** 0.5)
         return matrix_scale * mixed
 
     @staticmethod
@@ -396,16 +457,16 @@ class SSMWorldModel(nn.Module):
         Mix learned dense basis matrices into bounded near-identity dynamics.
 
         Args:
-            weights: [batch, horizon, num_bases] context-dependent coefficients
+            weights: [..., horizon, num_bases] context-dependent coefficients
             basis: [num_bases, dim, dim] learned dense basis matrices
             identity_scale: coefficient on identity matrix for stable initialization
             dynamics_scale: bound for learned dense residual entries
         Returns:
-            [batch, horizon, dim, dim] dense dynamics matrices
+            [..., horizon, dim, dim] dense dynamics matrices
         """
         dim = basis.shape[-1]
         eye = torch.eye(dim, device=weights.device, dtype=weights.dtype)
-        eye = eye.expand(weights.shape[0], weights.shape[1], dim, dim)
+        eye = eye.expand(*weights.shape[:-1], dim, dim)
         residual = SSMWorldModel._basis_matrix(weights, basis)
         return identity_scale * eye + dynamics_scale * residual
 
