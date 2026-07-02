@@ -6,7 +6,7 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: -H32-rho1-param_nois_2e-1-new_arch-pi_avgQ
+exp_name: -H24-reward_loss1e3-consistent0-discounted_MPC-rewardl1loss
 #agent_name: SSM_agent_v15_const
 agent_name: SSM_agent_v37
 
@@ -22,7 +22,7 @@ replay_device: auto
 batch_size: 256
 reward_coef: 1e3
 value_coef: 1e0
-consistency_coef: 1e-2
+consistency_coef: 0
 rho: 1.0
 lr: 3e-4
 l2_regularizer: 1e-4
@@ -34,19 +34,25 @@ param_noise_std: 2e-1
 discount_min: 0.95
 discount_max: 0.995
 buffer_size: 3_000_000
+reward_priority_sampling: false
+reward_priority_alpha: 0.6
+reward_priority_beta: 0.0
+reward_priority_eps: 1e-3
+reward_priority_uniform_mix: 0.1
+reward_priority_max_index_size: 50_000_000
 
 data_dir: ???
 
 # ssm agent
 num_ensembles: 10
-
+dynamics_ensemble_noise_scale: 5.0
 
 
 # ssm transformer
 transformer_d_model: 128
 transformer_num_heads: 4
 transformer_dff: 512
-transformer_num_layers: 6
+transformer_num_layers: 2
 transformer_dropout: 0.1
 history_horizon: 6
 
@@ -61,7 +67,7 @@ solver: SCS
 mpc: true
 iterations: 6
 num_samples: 512
-horizon: 32
+horizon: 24
 control_horizon: 8
 min_std: 0.05
 max_std: 2

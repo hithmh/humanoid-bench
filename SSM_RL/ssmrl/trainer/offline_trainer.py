@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from tdmpc2.common.buffer import Buffer
+from ssmrl.common.buffer import Buffer
 from tdmpc2.trainer.base import Trainer
 from ssmrl.common.reward_visualization import log_reward_visualization_to_wandb
 
