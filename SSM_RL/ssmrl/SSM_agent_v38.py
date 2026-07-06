@@ -1,5 +1,5 @@
 """
-SSM Agent v37- transformer-conditioned SSM-RL with JAX/qpax MPC.
+SSM Agent v38- transformer-conditioned SSM-RL with JAX/qpax MPC.
 
 This agent wraps ``SSMWorldModel`` and provides both model learning and
 inference-time control. During inference, recent state/action history is used
@@ -13,17 +13,19 @@ MPC controller:
   * Dense latent dynamics are analytically unrolled, eliminating equality
     dynamics constraints:
       z_{t+1} = A_t ... A_0 z_0 + T_u[t] @ U_flat
-  * Per-step action bounds are encoded as box inequalities ``G U <= h``.
-  * The terminal Q cost uses a single quadratic arrival Q-function over state
-    and action terms.
+  * Per-step action bounds and reward epigraph constraints are encoded as
+    inequalities ``G x <= h``.
+  * The stage reward is a concave ReLU network represented in MPC with
+    epigraph variables, while the terminal Q cost remains quadratic.
   * Training-time exploration samples dynamics parameters from the A/B
     ensemble mean plus Gaussian noise times ensemble standard deviation, then
     adds policy-standard-deviation action noise after planning.
   * PyTorch tensors are passed to JAX through DLPack before the JIT solve.
 
 QP form passed to ``qpax``:
-  min   0.5 * U^T Q_qp U + c_qp^T U
-  s.t.  G U <= h
+  min   0.5 * x^T Q_qp x + c_qp^T x
+  s.t.  G x <= h
+  where x = [U_flat, reward_relu_epigraphs]
 
 Training loop:
   sample replay buffer -> encode context -> latent rollout -> optimize
@@ -42,7 +44,7 @@ import jax.numpy as jnp
 import qpax  # pip install qpax
 
 
-from ssmrl.common.ssm_world_model_v37 import SSMWorldModel
+from ssmrl.common.ssm_world_model_v38 import SSMWorldModel
 from ssmrl.common.scale import RunningScale
 
 
@@ -85,11 +87,7 @@ class SSMAgent:
             {'params': [self.model._A_basis]},
             {'params': self.model._B_net.parameters()},
             {'params': [self.model._B_basis]},
-            {'params': self.model._Q_net.parameters()},
-            {'params': self.model._q_net.parameters()},
-            {'params': self.model._R_net.parameters()},
-            {'params': self.model._r_net.parameters()},
-            {'params': [self.model._b]},
+            {'params': self.model.reward_head_parameters()},
             {'params': self.model._q_func.parameters(),
              'lr': lr * critic_lr_scale},
             {'params': self.model._arrival_q.parameters(),
@@ -247,7 +245,10 @@ class SSMAgent:
         action_t = torch.tensor(action_seq, device=self.device).unsqueeze(0)
         obs_t    = torch.tensor(x0, dtype=torch.float32, device=self.device).unsqueeze(0)
 
-        A_seq, B_seq, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
+        (A_seq, B_seq,
+         reward_w1_seq, reward_w2_seq, reward_w3_seq,
+         reward_b1_seq, reward_b2_seq,
+         encoder_in) = self.model.encode_context(
             state_t,
             action_t,
             obs_t,
@@ -256,13 +257,14 @@ class SSMAgent:
         )
 
         # Extract single-sample tensors
-        A_seq_t      = A_seq[0]          # (H, D, D)
-        B_seq_t      = B_seq[0]          # (H, D, nU)
-        Q_seq_t      = Q_seq[0]          # (H, D, D)
-        q_seq_t      = q_seq[0]          # (H, D)
-        R_seq_t      = R_seq[0]          # (H, nU, nU)
-        r_seq_t      = r_seq[0]          # (H, nU)
-        z_t          = z[0]              # (D,)
+        A_seq_t = A_seq[0]                         # (H, D, D)
+        B_seq_t = B_seq[0]                         # (H, D, nU)
+        reward_alpha_t = -reward_w1_seq[0]         # (H, K), positive cost weight
+        reward_w2_t = reward_w2_seq[0]             # (H, K, D)
+        reward_w3_t = reward_w3_seq[0]             # (H, K, nU)
+        reward_b1_t = reward_b1_seq[0]             # (H, K)
+        reward_b2_t = reward_b2_seq[0]             # (H, 1), constant for MPC
+        z_t = z[0]                                 # (D,)
 
         P_diag, p_vec, pb_vec, Rc_diag, rc_vec = self.model.arrival_Q_params(
             encoder_in, target=False)
@@ -277,10 +279,11 @@ class SSMAgent:
             'z': z_t,
             'A': A_seq_t,
             'B': B_seq_t,
-            'Q': Q_seq_t,
-            'q': q_seq_t,
-            'R': R_seq_t,
-            'r': r_seq_t,
+            'reward_alpha': reward_alpha_t,
+            'reward_w2': reward_w2_t,
+            'reward_w3': reward_w3_t,
+            'reward_b1': reward_b1_t,
+            'reward_b2': reward_b2_t,
             'P_arrival': P_diag_t,
             'p_arrival': p_vec_t,
             'pb_arrival': pb_vec_t,
@@ -320,10 +323,10 @@ class SSMAgent:
                 to_jax(z_t),
                 to_jax(A_seq_t),
                 to_jax(B_seq_t),
-                to_jax(Q_seq_t),
-                to_jax(q_seq_t),
-                to_jax(R_seq_t),
-                to_jax(r_seq_t),
+                to_jax(reward_alpha_t),
+                to_jax(reward_w2_t),
+                to_jax(reward_w3_t),
+                to_jax(reward_b1_t),
                 to_jax(P_diag_t),
                 to_jax(p_vec_t),
                 to_jax(pb_vec_t),
@@ -363,12 +366,19 @@ class SSMAgent:
 
             z_{t+1} = A_t ... A_0 z_0   +   T_u[t] @ U_flat
 
-        Substituting into the MPC cost yields a strict convex QP in U_flat:
-            min   ½ U^T Q_qp U + c_qp^T U
-            s.t.  G U ≤ h   (box constraints on each u_t)
+        Substituting into the reward ReLU pre-activations keeps each
+        pre-activation affine in U_flat. The concave stage reward is handled
+        by epigraph variables y:
 
-        Stage reward:  r(z_t, u_t) = -(z_t^T Q_r z_t + q_r^T z_t
-                                        + u_t^T R_r u_t + r_r^T u_t + b)
+            y_t >= W2 z_t + W3 u_t + b1
+            y_t >= 0
+
+        The QP decision vector is x = [U_flat, y_flat].
+            min   1/2 x^T Q_qp x + c_qp^T x
+            s.t.  G x <= h
+
+        Stage reward:  r(z_t, u_t) = W1 ReLU(W2 z_t + W3 u_t + b1) + b2,
+        with W1 <= 0. Equivalently, -r has non-negative linear weights on y.
         Terminal cost (Q-value): Q(z_H, u_H) from the quadratic arrival Q-function.
         """
         D   = self.latent_dim
@@ -376,14 +386,13 @@ class SSMAgent:
         H   = self.horizon
         CH  = H
         discount = self.discount
-        # discount = 1.0
-        u_penalty = float(getattr(self.cfg, 'u_penalty', 0.0))
+        qp_diag_reg = float(getattr(self.cfg, 'mpc_qp_diag_reg', 1e-6))
 
         self._control_horizon = CH
-        n = CH * nU   # total QP decision-variable size
+        n_u = CH * nU
 
-        def _build_and_solve(z0, A_seq, B_seq, Q_seq, q_seq,
-                             R_seq, r_seq,
+        def _build_and_solve(z0, A_seq, B_seq,
+                             reward_alpha, reward_w2, reward_w3, reward_b1,
                              P_diag, p_vec, pb,
                              Rc_diag, rc_vec,
                              a_low, a_high):
@@ -393,10 +402,10 @@ class SSMAgent:
             z0          : (D,)       initial latent state
             A_seq       : (H, D, D)  per-step dynamics matrix
             B_seq       : (H, D, nU) per-step input matrix
-            Q_seq       : (H, D, D)  per-step PSD stage state-cost matrix
-            q_seq       : (H, D)     per-step linear state-cost coefficient
-            R_seq       : (H, nU, nU) per-step PSD stage action-cost matrix
-            r_seq       : (H, nU)    per-step linear action-cost coefficient
+            reward_alpha: (H, K)     non-negative weights for -reward epigraph cost
+            reward_w2   : (H, K, D)  latent reward hidden weights
+            reward_w3   : (H, K, nU) action reward hidden weights
+            reward_b1   : (H, K)     reward hidden bias
             P_diag      : (D,)       diagonal terminal state-cost coefficients
             p_vec       : (D,)       linear terminal state-cost coefficients
             pb          : ()         terminal critic bias (constant for QP)
@@ -410,6 +419,10 @@ class SSMAgent:
             U         : (CH, nU)  optimal control sequence
             converged : bool
             """
+            K = reward_alpha.shape[1]
+            n_y = H * K
+            n = n_u + n_y
+
             # ----------------------------------------------------------
             # 1. State trajectory matrices (per-step A and B)
             # ----------------------------------------------------------
@@ -423,7 +436,7 @@ class SSMAgent:
                     A_cum = A_seq[s] @ A_cum
                 f_list.append(A_cum @ z0)
 
-                T_u_t = jnp.zeros((D, n))
+                T_u_t = jnp.zeros((D, n_u))
                 for k in range(CH):
                     s_k = k * nU
                     e_k = (k + 1) * nU
@@ -449,43 +462,28 @@ class SSMAgent:
 
             # ----------------------------------------------------------
             # 2. Assemble Q_qp and c_qp
-            #    qpax minimises  ½ U^T Q_qp U + c_qp^T U
-            #    so  Q_qp = 2 * H_UU,  c_qp = h_U
+            #    qpax minimises  1/2 x^T Q_qp x + c_qp^T x.
             # ----------------------------------------------------------
             Q_qp = jnp.zeros((n, n))
             c_qp = jnp.zeros(n)
 
             for t in range(H):
-                k_u = min(t, CH - 1)
-                s_u = k_u * nU
-                e_u = (k_u + 1) * nU
-                Tu  = T_u_list[t]   # (D, n)
-                f   = f_list[t]     # (D,)
+                s_y = n_u + t * K
+                e_y = s_y + K
 
-                # Stage state cost: z^T Q[t] z + q[t]^T z  (per-step Q and q)
-                Q_t = Q_seq[t]                   # (D, D)
-                q_t = q_seq[t]                   # (D,)
-                QTu = Q_t @ Tu                   # (D, n)
-                Q_qp = Q_qp + (discount ** t) * 2.0 * (Tu.T @ QTu)
-                c_qp = c_qp + (discount ** t) * (2.0 * (QTu.T @ f) + Tu.T @ q_t)
-
-                # Stage action cost: u_t^T R[t] u_t + r[t]^T u_t  (per-step, block k_u)
-                Q_qp = Q_qp.at[s_u:e_u, s_u:e_u].add(
-                    (discount ** t) * 2.0 * R_seq[t])
-                c_qp = c_qp.at[s_u:e_u].add(
-                    (discount ** t) * r_seq[t])
-
-                # # Stage control regularisation: u_penalty * ||u||^2  (block k_u)
-                # Q_qp = Q_qp.at[s_u:e_u, s_u:e_u].add(
-                #     (discount ** t) * 2.0 * u_penalty * jnp.eye(nU))
+                # -r contributes alpha^T y. Constants from b2 do not affect
+                # the optimizer and are omitted from the QP objective.
+                c_qp = c_qp.at[s_y:e_y].add((discount ** t) * reward_alpha[t])
 
             # Terminal arrival cost from the quadratic Q-function.
-            Tu_H = T_u_list[H - 1]   # (D, n)
+            Tu_H = T_u_list[H - 1]   # (D, n_u)
             f_H = f_list[H - 1]      # (D,)
 
             PTu = P_diag[:, None] * Tu_H
-            Q_qp = Q_qp + (discount ** H) * 2.0 * (Tu_H.T @ PTu)
-            c_qp = c_qp + (discount ** H) * (2.0 * (PTu.T @ f_H) + Tu_H.T @ p_vec)
+            Q_qp = Q_qp.at[:n_u, :n_u].add(
+                (discount ** H) * 2.0 * (Tu_H.T @ PTu))
+            c_qp = c_qp.at[:n_u].add(
+                (discount ** H) * (2.0 * (PTu.T @ f_H) + Tu_H.T @ p_vec))
 
             s_u_H = (CH - 1) * nU
             e_u_H = CH * nU
@@ -495,13 +493,45 @@ class SSMAgent:
             c_qp = c_qp.at[s_u_H:e_u_H].add(
                 (discount ** H) * rc_vec)
 
+            if qp_diag_reg > 0.0:
+                Q_qp = Q_qp + qp_diag_reg * jnp.eye(n)
+
             # ----------------------------------------------------------
-            # 3. Inequality constraints: a_low ≤ u_t ≤ a_high  ∀t
+            # 3. Inequality constraints
             # ----------------------------------------------------------
-            a_high_t = jnp.tile(a_high, CH)           # (n,)
-            a_low_t  = jnp.tile(a_low,  CH)           # (n,)
-            G = jnp.concatenate([ jnp.eye(n), -jnp.eye(n)], axis=0)   # (2n, n)
-            h = jnp.concatenate([a_high_t, -a_low_t], axis=0)          # (2n,)
+            a_high_t = jnp.tile(a_high, CH)     # (n_u,)
+            a_low_t = jnp.tile(a_low, CH)       # (n_u,)
+            zeros_action_y = jnp.zeros((n_u, n_y))
+            G_parts = [
+                jnp.concatenate([jnp.eye(n_u), zeros_action_y], axis=1),
+                jnp.concatenate([-jnp.eye(n_u), zeros_action_y], axis=1),
+            ]
+            h_parts = [a_high_t, -a_low_t]
+
+            for t in range(H):
+                k_u = min(t, CH - 1)
+                s_u = k_u * nU
+                e_u = (k_u + 1) * nU
+                s_y = n_u + t * K
+                e_y = s_y + K
+                Tu = T_u_list[t]
+                f = f_list[t]
+
+                relu_u = reward_w2[t] @ Tu
+                relu_u = relu_u.at[:, s_u:e_u].add(reward_w3[t])
+                relu_row = jnp.zeros((K, n))
+                relu_row = relu_row.at[:, :n_u].set(relu_u)
+                relu_row = relu_row.at[:, s_y:e_y].set(-jnp.eye(K))
+                relu_rhs = -(reward_w2[t] @ f + reward_b1[t])
+
+                nonneg_row = jnp.zeros((K, n))
+                nonneg_row = nonneg_row.at[:, s_y:e_y].set(-jnp.eye(K))
+
+                G_parts.extend([relu_row, nonneg_row])
+                h_parts.extend([relu_rhs, jnp.zeros(K)])
+
+            G = jnp.concatenate(G_parts, axis=0)
+            h = jnp.concatenate(h_parts, axis=0)
 
             # No equality constraints
             A_eq = jnp.zeros((0, n))
@@ -512,7 +542,7 @@ class SSMAgent:
             # ----------------------------------------------------------
             x, _s, _z, _y, converged, _iters = qpax.solve_qp(
                 Q_qp, c_qp, A_eq, b_eq, G, h)
-            return x.reshape(CH, nU), converged
+            return x[:n_u].reshape(CH, nU), converged
 
         self._jax_solve_mpc = jax.jit(_build_and_solve)
 
@@ -536,7 +566,8 @@ class SSMAgent:
         self.qpax_solver_solution_nonfinite = 0
         self.qpax_nonfinite_inputs = {
             name: 0 for name in (
-                'z', 'A', 'B', 'Q', 'q', 'R', 'r',
+                'z', 'A', 'B', 'reward_alpha', 'reward_w2',
+                'reward_w3', 'reward_b1', 'reward_b2',
                 'P_arrival', 'p_arrival', 'pb_arrival', 'Rc_arrival', 'rc_arrival',
             )
         }
@@ -780,7 +811,7 @@ class SSMAgent:
         #     # Build encoder_in for target computation using history
         #     ctx_state_tgt = obs[:self.history_horizon].permute(1, 0, 2)
         #     ctx_action_tgt = action[:self.history_horizon].permute(1, 0, 2)
-        #     _, _, _, _, _, _, encoder_in = self.model.encode_context(
+        #     _, _, _, _, _, _, _, encoder_in = self.model.encode_context(
         #         ctx_state_tgt, ctx_action_tgt, obs[self.history_horizon]
         #     )
         #     td_targets = self._td_target(next_mean, reward, encoder_in)
@@ -801,7 +832,10 @@ class SSMAgent:
         ## rearrange the dimension from  [history_horizon, batch, state_dim] to  [batch, history_horizon, state_dim]
         ctx_state = ctx_state.permute(1, 0, 2)
         ctx_action = ctx_action.permute(1, 0, 2)
-        A_seq, B_seq, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
+        (A_seq, B_seq,
+         reward_w1_seq, reward_w2_seq, reward_w3_seq,
+         reward_b1_seq, reward_b2_seq,
+         encoder_in) = self.model.encode_context(
             ctx_state, ctx_action, obs[self.history_horizon]
         )
 
@@ -824,7 +858,9 @@ class SSMAgent:
         for t in range(H):
             r_pred = self.model.reward(
                 zs[t+1], action[t+self.history_horizon],
-                Q_seq[:, t], q_seq[:, t, :], R_seq[:, t], r_seq[:, t, :]
+                reward_w1_seq[:, t], reward_w2_seq[:, t],
+                reward_w3_seq[:, t], reward_b1_seq[:, t],
+                reward_b2_seq[:, t],
             )
             reward_step = F.smooth_l1_loss(
                 r_pred, reward[t+self.history_horizon], reduction='none'
@@ -952,7 +988,10 @@ class SSMAgent:
             # Build context
             ctx_state = obs[:self.history_horizon].permute(1, 0, 2)
             ctx_action = action[:self.history_horizon].permute(1, 0, 2)
-            A_seq, B_seq, Q_seq, q_seq, R_seq, r_seq, encoder_in = self.model.encode_context(
+            (A_seq, B_seq,
+             reward_w1_seq, reward_w2_seq, reward_w3_seq,
+             reward_b1_seq, reward_b2_seq,
+             encoder_in) = self.model.encode_context(
                 ctx_state, ctx_action, obs[self.history_horizon]
             )
 
@@ -965,7 +1004,9 @@ class SSMAgent:
                 z = self.model.next(z, action[t+self.history_horizon], A_seq[:, t], B_seq[:, t])
                 r_pred = self.model.reward(
                     z, action[t+self.history_horizon],
-                    Q_seq[:, t], q_seq[:, t, :], R_seq[:, t], r_seq[:, t, :]
+                    reward_w1_seq[:, t], reward_w2_seq[:, t],
+                    reward_w3_seq[:, t], reward_b1_seq[:, t],
+                    reward_b2_seq[:, t],
                 )
                 predicted_rewards.append(r_pred.detach().cpu().numpy())
 

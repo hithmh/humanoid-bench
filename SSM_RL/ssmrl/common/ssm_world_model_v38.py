@@ -4,8 +4,8 @@ Implements a state-space model with:
   - Variational encoder (mean + log_sigma)
   - Transformer-based temporal context encoder
   - Dense per-step linear dynamics: z' = A*z + B*u
-  - Quadratic reward: z^T Q z + q^T z + u^T R u + r^T u + b
-    with full PSD Q and R matrices
+  - Concave one-hidden-layer ReLU reward:
+      r = W1 ReLU(W2 z + W3 u + b1) + b2, with W1 <= 0
   - Ensemble Q-function conditioned on latent state and action
   - Ensemble quadratic Q-function for MPC arrival cost
   - Raw-observation policy network (tanh-squashed)
@@ -100,7 +100,7 @@ class SSMWorldModel(nn.Module):
     Key differences from the vanilla TD-MPC2 WorldModel:
     * Dynamics are linear: z' = A*z + B*u  (dense A and B are mixed from
       learned basis matrices).
-    * Reward is a learned quadratic form over latent state and action.
+    * Reward is a learned concave ReLU network over latent state and action.
     * Critic is a TD-MPC2-style ensemble over (raw observation, action).
     * Arrival-cost critic is a context-conditioned quadratic form in latent
       state and action.
@@ -179,44 +179,17 @@ class SSMWorldModel(nn.Module):
         )
         self._B_basis = nn.Parameter(torch.randn(self._B_num_bases, latent_dim, act_dim) * b_basis_init)
 
-        # ---- Quadratic reward heads (state part) ----
-        # Each predicts basis weights for lower-triangular factors. PSD is
-        # enforced after basis mixing via L @ L.T.
-        self._Q_num_bases = int(getattr(cfg, 'reward_q_num_bases', self._A_num_bases))
-        self._Q_scale = max(0.0, float(getattr(cfg, 'reward_q_scale', 1.0)))
-        q_basis_init = float(getattr(cfg, 'reward_q_basis_init', a_basis_init))
-        # self._Q_net = _mlp(ctx_dim, encoder_hidden, self._Q_num_bases * prediction_horizon)
-        self._Q_net = layers.mlp(
-            ctx_dim,
-            2 * [cfg.mlp_dim],
-            self._Q_num_bases * prediction_horizon,
-        )
-        self._Q_basis = nn.Parameter(torch.randn(self._Q_num_bases, latent_dim, latent_dim) * q_basis_init)
-        # self._q_net = _mlp(ctx_dim, encoder_hidden, latent_dim * prediction_horizon)
-        self._q_net = layers.mlp(
-            ctx_dim,
-            2 * [cfg.mlp_dim],
-            latent_dim * prediction_horizon,
-        )
-        self._b = nn.Parameter(torch.zeros(1))
-
-        # ---- Quadratic reward heads (action part) ----
-        self._R_num_bases = int(getattr(cfg, 'reward_r_num_bases', self._A_num_bases))
-        self._R_scale = max(0.0, float(getattr(cfg, 'reward_r_scale', 1.0)))
-        r_basis_init = float(getattr(cfg, 'reward_r_basis_init', a_basis_init))
-        # self._R_net = _mlp(ctx_dim, encoder_hidden, self._R_num_bases * prediction_horizon)
-        self._R_net = layers.mlp(
-            ctx_dim,
-            2 * [cfg.mlp_dim],
-            self._R_num_bases * prediction_horizon,
-        )
-        self._R_basis = nn.Parameter(torch.randn(self._R_num_bases, act_dim, act_dim) * r_basis_init)
-        # self._r_net = _mlp(ctx_dim, encoder_hidden, act_dim * prediction_horizon)
-        self._r_net = layers.mlp(
-            ctx_dim,
-            2 * [cfg.mlp_dim],
-            act_dim * prediction_horizon,
-        )
+        # ---- Concave ReLU reward head ----
+        # r(z, u) = W1 ReLU(W2 z + W3 u + b1) + b2.
+        # W1 is parameterized as -softplus(raw), so the reward is concave in
+        # (z, u) and -reward remains convex for MPC.
+        self.reward_hidden_dim = int(getattr(cfg, 'reward_relu_hidden_dim', 32))
+        reward_init = float(getattr(cfg, 'reward_relu_weight_init', 0.01))
+        self._reward_w1_raw = nn.Parameter(torch.full((self.reward_hidden_dim,), -2.0))
+        self._reward_w2 = nn.Parameter(torch.randn(self.reward_hidden_dim, latent_dim) * reward_init)
+        self._reward_w3 = nn.Parameter(torch.randn(self.reward_hidden_dim, act_dim) * reward_init)
+        self._reward_b1 = nn.Parameter(torch.zeros(self.reward_hidden_dim))
+        self._reward_b2 = nn.Parameter(torch.zeros(1))
         # ---- Policy (SAC-style stochastic: outputs mean + log_std) ----
         log_std_min = getattr(cfg, 'log_std_min', -5)
         log_std_max = getattr(cfg, 'log_std_max', 2)
@@ -329,7 +302,8 @@ class SSMWorldModel(nn.Module):
         return_dynamics_ensemble=False,
     ):
         """
-        Run transformer on history and produce (A, B, Q_seq, q_seq, R_seq, r_seq, encoder_in) for the current step.
+        Run transformer on history and produce dynamics plus concave ReLU
+        reward parameters for the current step.
 
         Args:
             state_history:  [batch, history_horizon, state_dim]
@@ -345,10 +319,11 @@ class SSMWorldModel(nn.Module):
                         or [batch, num_ensembles, prediction_horizon, latent_dim, latent_dim]
             B_seq:      [batch, prediction_horizon, latent_dim, act_dim]
                         or [batch, num_ensembles, prediction_horizon, latent_dim, act_dim]
-            Q_seq:      [batch, prediction_horizon, latent_dim, latent_dim] per-step state PSD matrix
-            q_seq:      [batch, prediction_horizon, latent_dim]   per-step state linear coefficient
-            R_seq:      [batch, prediction_horizon, act_dim, act_dim] per-step action PSD matrix
-            r_seq:      [batch, prediction_horizon, act_dim]      per-step action linear coefficient
+            reward_w1:  [batch, prediction_horizon, reward_hidden_dim] negative output weights
+            reward_w2:  [batch, prediction_horizon, reward_hidden_dim, latent_dim]
+            reward_w3:  [batch, prediction_horizon, reward_hidden_dim, act_dim]
+            reward_b1:  [batch, prediction_horizon, reward_hidden_dim]
+            reward_b2:  [batch, prediction_horizon, 1]
             encoder_in: [batch, ctx_dim]  (transformer_out || current_obs)
         """
         ctx_input = torch.cat([state_history, action_history], dim=-1)
@@ -381,25 +356,14 @@ class SSMWorldModel(nn.Module):
         )
         B_seq = self._basis_matrix(B_weights, self._B_basis, self._B_scale)
 
-        H = self.prediction_horizon
-        # Q_net and q_net output sequences of length H
-        Q_weight_flat = self._Q_net(encoder_in)  # [batch, H * Q_num_bases]
-        Q_weights = Q_weight_flat.view(-1, H, self._Q_num_bases)
-        Q_raw_seq = self._basis_matrix(Q_weights, self._Q_basis)
-        Q_seq = self._Q_scale * self._psd_from_raw_factor(Q_raw_seq)
+        reward_params = self.reward_params(
+            batch_size=encoder_in.shape[0],
+            horizon=H,
+            device=encoder_in.device,
+            dtype=encoder_in.dtype,
+        )
 
-        q_flat = self._q_net(encoder_in)  # [batch, latent_dim * H]
-        q_seq = q_flat.view(-1, H, self.latent_dim)       # [batch, H, latent_dim]
-
-        R_weight_flat = self._R_net(encoder_in)  # [batch, H * R_num_bases]
-        R_weights = R_weight_flat.view(-1, H, self._R_num_bases)
-        R_raw_seq = self._basis_matrix(R_weights, self._R_basis)
-        R_seq = self._R_scale * self._psd_from_raw_factor(R_raw_seq)
-
-        r_flat = self._r_net(encoder_in)  # [batch, act_dim * H]
-        r_seq = r_flat.view(-1, H, self.act_dim)       # [batch, H, act_dim]
-
-        return A_seq, B_seq, Q_seq, q_seq, R_seq, r_seq, encoder_in
+        return A_seq, B_seq, *reward_params, encoder_in
 
     @staticmethod
     def _dynamics_ensemble_weights(
@@ -503,27 +467,77 @@ class SSMWorldModel(nn.Module):
         return Az + Bu
 
     # ------------------------------------------------------------------
-    # Reward (quadratic in z and action)
+    # Reward (concave ReLU in z and action)
     # ------------------------------------------------------------------
-    def reward(self, z, a, Q, q, R, r_vec):
+    def reward_head_parameters(self):
+        """Return the trainable parameters of the concave ReLU reward head."""
+        return [
+            self._reward_w1_raw,
+            self._reward_w2,
+            self._reward_w3,
+            self._reward_b1,
+            self._reward_b2,
+        ]
+
+    def reward_params(self, batch_size=None, horizon=None, device=None, dtype=None):
         """
-        Compute quadratic reward: -(z^T Q z + q^T z + a^T R a + r^T a + b)
+        Return reward parameters, optionally expanded over batch and horizon.
+
+        W1 is always non-positive, making the reward concave in (z, a).
+        """
+        w1 = -F.softplus(self._reward_w1_raw)
+        w2 = self._reward_w2
+        w3 = self._reward_w3
+        b1 = self._reward_b1
+        b2 = self._reward_b2
+        if device is not None or dtype is not None:
+            w1 = w1.to(device=device, dtype=dtype)
+            w2 = w2.to(device=device, dtype=dtype)
+            w3 = w3.to(device=device, dtype=dtype)
+            b1 = b1.to(device=device, dtype=dtype)
+            b2 = b2.to(device=device, dtype=dtype)
+        if batch_size is None and horizon is None:
+            return w1, w2, w3, b1, b2
+        if batch_size is None or horizon is None:
+            raise ValueError("batch_size and horizon must be provided together")
+        w1 = w1.view(1, 1, -1).expand(batch_size, horizon, -1)
+        w2 = w2.view(1, 1, self.reward_hidden_dim, self.latent_dim).expand(batch_size, horizon, -1, -1)
+        w3 = w3.view(1, 1, self.reward_hidden_dim, self.act_dim).expand(batch_size, horizon, -1, -1)
+        b1 = b1.view(1, 1, -1).expand(batch_size, horizon, -1)
+        b2 = b2.view(1, 1, 1).expand(batch_size, horizon, -1)
+        return w1, w2, w3, b1, b2
+
+    def reward(self, z, a, w1=None, w2=None, w3=None, b1=None, b2=None):
+        """
+        Compute r(z, a) = W1 ReLU(W2 z + W3 a + b1) + b2.
 
         Args:
             z:      [batch, latent_dim]
             a:      [batch, act_dim]
-            Q:      [batch, latent_dim, latent_dim] state quadratic PSD matrix
-            q:      [batch, latent_dim]   state linear coefficient
-            R:      [batch, act_dim, act_dim] action quadratic PSD matrix
-            r_vec:  [batch, act_dim]      action linear coefficient
+            w1:     [batch, reward_hidden_dim] non-positive output weights
+            w2:     [batch, reward_hidden_dim, latent_dim]
+            w3:     [batch, reward_hidden_dim, act_dim]
+            b1:     [batch, reward_hidden_dim]
+            b2:     [batch, 1]
         Returns:
             r: [batch, 1]
         """
-        quad_z = torch.bmm(z.unsqueeze(1), torch.bmm(Q, z.unsqueeze(-1)))
-        lin_z  = (q * z).sum(dim=-1, keepdim=True)
-        quad_a = torch.bmm(a.unsqueeze(1), torch.bmm(R, a.unsqueeze(-1)))
-        lin_a  = (r_vec * a).sum(dim=-1, keepdim=True)
-        return -(quad_z.squeeze(-1) + lin_z + quad_a.squeeze(-1) + lin_a + self._b)
+        if w1 is None:
+            w1, w2, w3, b1, b2 = self.reward_params(
+                batch_size=z.shape[0],
+                horizon=1,
+                device=z.device,
+                dtype=z.dtype,
+            )
+            w1, w2, w3, b1, b2 = w1[:, 0], w2[:, 0], w3[:, 0], b1[:, 0], b2[:, 0]
+
+        preact = (
+            torch.bmm(w2, z.unsqueeze(-1)).squeeze(-1)
+            + torch.bmm(w3, a.unsqueeze(-1)).squeeze(-1)
+            + b1
+        )
+        hidden = F.relu(preact)
+        return (w1 * hidden).sum(dim=-1, keepdim=True) + b2
 
     # ------------------------------------------------------------------
     # Policy

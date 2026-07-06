@@ -347,7 +347,7 @@ class SSMAgent:
             std = self.model.get_pi_std(obs_t)[0]
             epsilon = (std * torch.randn(self.act_dim, device=std.device)
                        ).detach().cpu().numpy()
-            u = u + epsilon
+            u = u #+ epsilon
 
         return self._sanitize_action(u)
 
@@ -375,8 +375,8 @@ class SSMAgent:
         nU  = self.act_dim
         H   = self.horizon
         CH  = H
-        discount = self.discount
-        # discount = 1.0
+        # discount = self.discount
+        discount = 1.0
         u_penalty = float(getattr(self.cfg, 'u_penalty', 0.0))
 
         self._control_horizon = CH
