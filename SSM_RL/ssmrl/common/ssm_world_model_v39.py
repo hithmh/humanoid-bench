@@ -7,7 +7,7 @@ Implements a state-space model with:
   - Concave one-hidden-layer ReLU reward:
       r = W1 ReLU(W2 z + W3 u + b1) + b2, with W1 <= 0
   - Ensemble Q-function conditioned on latent state and action
-  - Ensemble quadratic Q-function for MPC arrival cost
+  - Concave one-hidden-layer ReLU arrival Q-function for MPC arrival cost
   - Raw-observation policy network (tanh-squashed)
 
 Follows the architecture of WorldModel in ssmrl/common/world_model.py.
@@ -102,8 +102,8 @@ class SSMWorldModel(nn.Module):
       learned basis matrices).
     * Reward is a learned concave ReLU network over latent state and action.
     * Critic is a TD-MPC2-style ensemble over (raw observation, action).
-    * Arrival-cost critic is a context-conditioned quadratic form in latent
-      state and action.
+    * Arrival-cost critic is a learned concave ReLU network over latent state
+      and action.
     * The policy consumes raw observations directly.
     """
 
@@ -183,7 +183,7 @@ class SSMWorldModel(nn.Module):
         # r(z, u) = W1 ReLU(W2 z + W3 u + b1) + b2.
         # W1 is parameterized as -softplus(raw), so the reward is concave in
         # (z, u) and -reward remains convex for MPC.
-        self.reward_hidden_dim = int(getattr(cfg, 'reward_relu_hidden_dim', 32))
+        self.reward_hidden_dim = int(getattr(cfg, 'reward_relu_hidden_dim', latent_dim))
         reward_init = float(getattr(cfg, 'reward_relu_weight_init', 0.01))
         self._reward_w1_raw = nn.Parameter(torch.full((self.reward_hidden_dim,), -2.0))
         self._reward_w2 = nn.Parameter(torch.randn(self.reward_hidden_dim, latent_dim) * reward_init)
@@ -246,17 +246,16 @@ class SSMWorldModel(nn.Module):
         for p in self._q_func_target.parameters():
             p.requires_grad_(False)
 
-        # ---- Quadratic Q-function for MPC arrival cost ----
-        # Each MLP maps encoder_in -> [P_diag, p, pb, Rc_diag, rc].
-        # The scalar _q_func above remains the actor/training critic; this
-        # module provides convex quadratic coefficients for the QP terminal term.
-        arrival_q_out_dim = 2 * latent_dim + 1 + 2 * act_dim
-        # self._arrival_q = _mlp(ctx_dim, critic_hidden, arrival_q_out_dim)
-        self._arrival_q = layers.mlp(
-            ctx_dim,
-            2 * [cfg.mlp_dim],
-            arrival_q_out_dim,
-        )
+        # ---- Concave ReLU arrival Q-function for MPC arrival cost ----
+        # Q_arr(z, u) = W1 ReLU(W2 z + W3 u + b1) + b2, with W1 <= 0.
+        # MPC minimizes -Q_arr, represented with terminal epigraph variables.
+        self.arrival_hidden_dim = int(getattr(cfg, 'arrival_relu_hidden_dim', self.reward_hidden_dim))
+        arrival_init = float(getattr(cfg, 'arrival_relu_weight_init', reward_init))
+        self._arrival_w1_raw = nn.Parameter(torch.full((self.arrival_hidden_dim,), -2.0))
+        self._arrival_w2 = nn.Parameter(torch.randn(self.arrival_hidden_dim, latent_dim) * arrival_init)
+        self._arrival_w3 = nn.Parameter(torch.randn(self.arrival_hidden_dim, act_dim) * arrival_init)
+        self._arrival_b1 = nn.Parameter(torch.zeros(self.arrival_hidden_dim))
+        self._arrival_b2 = nn.Parameter(torch.zeros(1))
 
 
     # ------------------------------------------------------------------
@@ -644,42 +643,56 @@ class SSMWorldModel(nn.Module):
         return out.mean(dim=0)
 
     # ------------------------------------------------------------------
-    # Quadratic Q-Function for MPC arrival cost
+    # ReLU Q-Function for MPC arrival cost
     # ------------------------------------------------------------------
+    def arrival_head_parameters(self):
+        """Return the trainable parameters of the concave ReLU arrival Q head."""
+        return [
+            self._arrival_w1_raw,
+            self._arrival_w2,
+            self._arrival_w3,
+            self._arrival_b1,
+            self._arrival_b2,
+        ]
+
     def arrival_Q_params(self, encoder_in, target=False):
         """
-        Return context-conditioned quadratic Q coefficients.
+        Return concave ReLU arrival Q parameters.
 
         The arrival Q-function represents:
-            Q(z, a) = -(z^T diag(P) z + p^T z + pb
-                       + a^T diag(Rc) a + rc^T a)
+            Q(z, a) = W1 ReLU(W2 z + W3 a + b1) + b2
 
         Args:
-            encoder_in: [batch, ctx_dim]
-            target:     whether to use the target network
+            encoder_in: [batch, ctx_dim], used for batch/device/dtype only
+            target:     kept for API compatibility
         Returns:
-            P_diag:  [batch, latent_dim]
-            p_vec:   [batch, latent_dim]
-            pb:      [batch]
-            Rc_diag: [batch, act_dim]
-            rc_vec:  [batch, act_dim]
+            w1: [batch, arrival_hidden_dim], non-positive output weights
+            w2: [batch, arrival_hidden_dim, latent_dim]
+            w3: [batch, arrival_hidden_dim, act_dim]
+            b1: [batch, arrival_hidden_dim]
+            b2: [batch, 1]
         """
-        net = self._arrival_q
-        D = self.latent_dim
-        nU = self.act_dim
-
-        out = net(encoder_in)
-        P_diag = F.relu(out[:, :D])
-        p_vec = out[:, D:2 * D]
-        pb = out[:, 2 * D:2 * D + 1].squeeze(-1)
-        Rc_diag = F.relu(out[:, 2 * D + 1:2 * D + 1 + nU])
-        rc_vec = out[:, 2 * D + 1 + nU:]
-
-        return P_diag, p_vec, pb, Rc_diag, rc_vec
+        batch_size = encoder_in.shape[0]
+        w1 = -F.softplus(self._arrival_w1_raw)
+        w2 = self._arrival_w2
+        w3 = self._arrival_w3
+        b1 = self._arrival_b1
+        b2 = self._arrival_b2
+        w1 = w1.to(device=encoder_in.device, dtype=encoder_in.dtype)
+        w2 = w2.to(device=encoder_in.device, dtype=encoder_in.dtype)
+        w3 = w3.to(device=encoder_in.device, dtype=encoder_in.dtype)
+        b1 = b1.to(device=encoder_in.device, dtype=encoder_in.dtype)
+        b2 = b2.to(device=encoder_in.device, dtype=encoder_in.dtype)
+        w1 = w1.view(1, -1).expand(batch_size, -1)
+        w2 = w2.view(1, self.arrival_hidden_dim, self.latent_dim).expand(batch_size, -1, -1)
+        w3 = w3.view(1, self.arrival_hidden_dim, self.act_dim).expand(batch_size, -1, -1)
+        b1 = b1.view(1, -1).expand(batch_size, -1)
+        b2 = b2.view(1, 1).expand(batch_size, -1)
+        return w1, w2, w3, b1, b2
 
     def arrival_Q_value(self, z, a, encoder_in, target=False, return_type='min'):
         """
-        Evaluate the quadratic arrival Q-function.
+        Evaluate the concave ReLU arrival Q-function.
 
         Args:
             z:          [batch, latent_dim]
@@ -690,13 +703,13 @@ class SSMWorldModel(nn.Module):
         Returns:
             Arrival Q value [batch, 1]
         """
-        P_diag, p_vec, pb, Rc_diag, rc_vec = self.arrival_Q_params(encoder_in, target=target)
-
-        quad_z = (P_diag * z * z).sum(dim=-1, keepdim=True)
-        lin_z = (p_vec * z).sum(dim=-1, keepdim=True)
-        quad_a = (Rc_diag * a * a).sum(dim=-1, keepdim=True)
-        lin_a = (rc_vec * a).sum(dim=-1, keepdim=True)
-        value = -(quad_z + lin_z + pb.unsqueeze(-1) + quad_a + lin_a)
+        w1, w2, w3, b1, b2 = self.arrival_Q_params(encoder_in, target=target)
+        preact = (
+            torch.bmm(w2, z.unsqueeze(-1)).squeeze(-1)
+            + torch.bmm(w3, a.unsqueeze(-1)).squeeze(-1)
+            + b1
+        )
+        value = (w1 * F.relu(preact)).sum(dim=-1, keepdim=True) + b2
 
         if return_type in {'all', 'max', 'min', 'avg', None}:
             return value
@@ -710,7 +723,7 @@ class SSMWorldModel(nn.Module):
         """Enable / disable gradients for Q-function parameters."""
         for p in self._q_func.parameters():
             p.requires_grad_(mode)
-        for p in self._arrival_q.parameters():
+        for p in self.arrival_head_parameters():
             p.requires_grad_(mode)
 
     # ------------------------------------------------------------------
