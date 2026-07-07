@@ -36,7 +36,9 @@ def _configure_jax_mpc_runtime(cfg):
     )
     os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", str(mem_fraction))
 
-    if platform not in {"auto", "default", "none", ""}:
+    if platform in {"auto", "default", "none", ""}:
+        platform = "cpu"
+    if platform:
         os.environ.setdefault(
             "JAX_PLATFORMS", "cuda" if platform == "gpu" else platform
         )

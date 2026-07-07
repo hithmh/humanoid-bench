@@ -1,31 +1,33 @@
 """
-SSM Agent v38- transformer-conditioned SSM-RL with JAX/qpax MPC.
+SSM Agent v39- transformer-conditioned SSM-RL with JAX smooth convex MPC.
 
 This agent wraps ``SSMWorldModel`` and provides both model learning and
 inference-time control. During inference, recent state/action history is used
-by ``encode_context`` to produce local linear SSM parameters, concave ReLU
+by ``encode_context`` to produce local linear SSM parameters, concave softplus
 reward parameters, and critic context. Until enough history is available, or
-if the QP solver fails, actions come from the learned policy.
+if the convex solver fails, actions come from the learned policy.
 
 MPC controller:
-  * The finite-horizon control problem is assembled in JAX and JIT-compiled.
-  * ``qpax`` solves the dense QP over stacked actions plus ReLU epigraphs.
+  * The finite-horizon control objective is assembled once as a JAX function
+    and JIT-compiled.
+  * A projected first-order optimizer solves over the stacked action sequence
+    directly with box projection.
   * Dense latent dynamics are analytically unrolled, eliminating equality
     dynamics constraints:
       z_{t+1} = A_t ... A_0 z_0 + T_u[t] @ U_flat
-  * Per-step action bounds and reward epigraph constraints are encoded as
-    inequalities ``G x <= h``.
-  * The stage reward and terminal arrival Q are concave ReLU networks
-    represented in MPC with epigraph variables.
+  * Per-step action bounds are encoded as box constraints.
+  * The stage reward and terminal arrival Q are concave softplus networks, so
+    minimizing their negation is a convex smooth optimization problem.
   * Training-time exploration samples dynamics parameters from the A/B
     ensemble mean plus Gaussian noise times ensemble standard deviation, then
     adds policy-standard-deviation action noise after planning.
-  * PyTorch tensors are passed to JAX through DLPack before the JIT solve.
+  * PyTorch tensors are passed to JAX through DLPack when the backends share a
+    device, avoiding per-step NumPy conversion.
 
-QP form passed to ``qpax``:
-  min   0.5 * x^T Q_qp x + c_qp^T x
-  s.t.  G x <= h
-  where x = [U_flat, reward_relu_epigraphs, arrival_relu_epigraphs]
+Convex MPC objective:
+  min_U  sum_t gamma^t alpha_t^T softplus(W2_t z_t(U) + W3_t u_t + b1_t)
+       + gamma^H alpha_H^T softplus(W2_H z_H(U) + W3_H u_H + b1_H)
+  s.t.  a_low <= u_t <= a_high
 
 Training loop:
   sample replay buffer -> encode context -> latent rollout -> optimize
@@ -41,7 +43,6 @@ import torch.nn.functional as F
 
 import jax
 import jax.numpy as jnp
-import qpax  # pip install qpax
 
 
 from ssmrl.common.ssm_world_model_v39 import SSMWorldModel
@@ -60,7 +61,17 @@ class SSMAgent:
     def __init__(self, cfg):
         self.cfg = cfg
         self.device = self._resolve_device(getattr(cfg, "device", "auto"))
-        self._jax_has_cuda = any(d.platform in ('cuda', 'gpu') for d in jax.devices())
+        self._jax_cpu_device = jax.devices("cpu")[0]
+        jax_platform = str(getattr(cfg, "jax_mpc_platform", "cpu")).lower()
+        self._jax_mpc_cuda_requested = jax_platform in {"cuda", "gpu"}
+        self._jax_has_cuda = (
+            self._jax_mpc_cuda_requested
+            and any(d.platform in ('cuda', 'gpu') for d in jax.devices())
+        )
+        self._jax_disable_cuda_after_error = bool(getattr(
+            cfg, 'jax_mpc_disable_cuda_after_error', True))
+        self._jax_mpc_cuda_disabled = False
+        self._jax_mpc_cuda_disable_reason = ''
 
         # World model
         self.model = SSMWorldModel(cfg).to(self.device)
@@ -131,10 +142,12 @@ class SSMAgent:
         # History buffers and episode-scoped control diagnostics
         self.state_history = []
         self.action_history = []
-        self._reset_qpax_diagnostics()
+        self._state_history_tensors = []
+        self._action_history_tensors = []
+        self._reset_convex_diagnostics()
 
-        # Build JAX + qpax MPC controller
-        self._build_jax_controller()
+        # Build JAX smooth convex MPC controller
+        self._build_convex_controller()
 
     def _resolve_device(self, requested):
         requested = str(requested).lower()
@@ -192,27 +205,26 @@ class SSMAgent:
         """
         # Normalise observation
         if isinstance(obs, torch.Tensor):
-            obs_np = obs.cpu().numpy()
+            obs_t = obs.to(device=self.device, dtype=torch.float32).reshape(1, -1)
+            obs_np = None
         else:
             obs_np = np.asarray(obs, dtype=np.float32)
-        x0 = obs_np
-        obs_t = torch.tensor(x0, dtype=torch.float32, device=self.device).unsqueeze(0)
+            obs_t = torch.as_tensor(
+                obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         # Encode
         z = self.model.encode(obs_t)
 
         # Decide action
-        if len(self.state_history) < self.history_horizon:
+        if len(self._state_history_tensors) < self.history_horizon:
             # Not enough history for transformer - use policy net on raw obs
             u_norm = self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy()
         else:
-            # Attempt JAX/qpax planning
-            u_norm = self._plan_jax(z, x0, eval_mode)
-            # u_norm = self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy()
+            # Attempt JAX smooth convex planning
+            u_norm = self._plan_convex(z, obs_t, eval_mode)
         u_norm = self._sanitize_action(u_norm)
         # Update history
-        self.action_history.append(u_norm.copy())
-        self.state_history.append(x0.copy())
+        self._append_history(obs_np, obs_t, u_norm)
 
         ## convert to float32
         u = np.asarray(u_norm, dtype=np.float32)
@@ -229,21 +241,59 @@ class SSMAgent:
             action = np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
         return np.clip(action, -1.0, 1.0).astype(np.float32)
 
-    def _plan_jax(self, z: torch.Tensor, x0: np.ndarray, eval_mode: bool):
+    @staticmethod
+    def _is_jax_cuda_error(exc):
+        msg = str(exc).lower()
+        return any(token in msg for token in (
+            'cuda_error',
+            'cuda error',
+            'failed to allocate device memory',
+            'unknown backend cuda',
+            'gpu backend',
+        ))
+
+    def _disable_jax_cuda_mpc(self, reason):
+        if not self._jax_disable_cuda_after_error:
+            return
+        self._jax_has_cuda = False
+        self._jax_mpc_cuda_disabled = True
+        self._jax_mpc_cuda_disable_reason = str(reason)[:512]
+        self._mpc_warm_start = None
+
+    def _append_history(self, obs_np: np.ndarray, obs_t: torch.Tensor,
+                        action_np: np.ndarray):
+        if obs_np is not None:
+            self.state_history.append(np.asarray(obs_np, dtype=np.float32).copy())
+        self.action_history.append(np.asarray(action_np, dtype=np.float32).copy())
+        self._state_history_tensors.append(obs_t[0].detach().clone())
+        self._action_history_tensors.append(
+            torch.as_tensor(action_np, dtype=torch.float32, device=self.device).detach().clone())
+
+    def _rebuild_tensor_histories(self):
+        self._state_history_tensors = [
+            torch.as_tensor(x, dtype=torch.float32, device=self.device)
+            for x in self.state_history
+        ]
+        self._action_history_tensors = [
+            torch.as_tensor(u, dtype=torch.float32, device=self.device)
+            for u in self.action_history
+        ]
+
+    def _plan_convex(self, z: torch.Tensor, obs_t: torch.Tensor, eval_mode: bool):
         """
-        Solve the JAX/qpax MPC problem.  Falls back to the policy net on
+        Solve the JAX smooth convex MPC problem. Falls back to the policy net on
         numerical failure or solver non-convergence.
 
         Returns:
             u_norm: normalised action, shape [act_dim]
         """
-        state_seq = np.array(self.state_history[-self.history_horizon:],
-                             dtype=np.float32)
-        action_seq = np.array(self.action_history[-self.history_horizon:],
-                              dtype=np.float32)
-        state_t  = torch.tensor(state_seq,  device=self.device).unsqueeze(0)
-        action_t = torch.tensor(action_seq, device=self.device).unsqueeze(0)
-        obs_t    = torch.tensor(x0, dtype=torch.float32, device=self.device).unsqueeze(0)
+        if (len(self._state_history_tensors) < self.history_horizon
+                or len(self._action_history_tensors) < self.history_horizon):
+            self._rebuild_tensor_histories()
+        state_t = torch.stack(
+            self._state_history_tensors[-self.history_horizon:], dim=0).unsqueeze(0)
+        action_t = torch.stack(
+            self._action_history_tensors[-self.history_horizon:], dim=0).unsqueeze(0)
 
         (A_seq, B_seq,
          reward_w1_seq, reward_w2_seq, reward_w3_seq,
@@ -274,7 +324,7 @@ class SSMAgent:
         arrival_b1_t = arrival_b1[0]      # (K_arr,)
         arrival_b2_t = arrival_b2[0]      # (1,), constant for MPC
 
-        self.qpax_solver_attempts += 1
+        self.convex_solver_attempts += 1
         input_tensors = {
             'z': z_t,
             'A': A_seq_t,
@@ -293,35 +343,50 @@ class SSMAgent:
         bad_inputs = [name for name, tensor in input_tensors.items()
                       if not torch.isfinite(tensor).all().item()]
         if bad_inputs:
-            self._record_qpax_failure('input_nonfinite', ','.join(bad_inputs))
+            self._record_convex_failure('input_nonfinite', ','.join(bad_inputs))
             for name in bad_inputs:
-                self.qpax_nonfinite_inputs[name] += 1
+                self.convex_nonfinite_inputs[name] += 1
             return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
 
-        # ---- PyTorch -> JAX. Use DLPack when both libraries share a backend;
-        # otherwise copy through CPU so CUDA Torch + CPU-only JAX still works.
+        def to_jax_cpu(t: torch.Tensor):
+            return jax.device_put(t.detach().cpu().numpy(), self._jax_cpu_device)
+
         def to_jax(t: torch.Tensor):
             t = t.detach().contiguous()
             if t.is_cuda and not self._jax_has_cuda:
-                return jnp.asarray(t.cpu().numpy())
+                return to_jax_cpu(t)
             try:
                 return jax.dlpack.from_dlpack(t)
             except TypeError:
                 try:
                     return jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(t))
                 except RuntimeError as exc:
-                    if t.is_cuda and 'Unknown backend cuda' in str(exc):
-                        return jnp.asarray(t.cpu().numpy())
+                    if t.is_cuda and self._is_jax_cuda_error(exc):
+                        self._disable_jax_cuda_mpc(exc)
+                        return to_jax_cpu(t)
                     raise
             except RuntimeError as exc:
-                if t.is_cuda and 'Unknown backend cuda' in str(exc):
-                    return jnp.asarray(t.cpu().numpy())
+                if t.is_cuda and self._is_jax_cuda_error(exc):
+                    self._disable_jax_cuda_mpc(exc)
+                    return to_jax_cpu(t)
                 raise
 
         try:
+            z_jax = to_jax(z_t)
+            A_jax = to_jax(A_seq_t)
+            U_init = self._mpc_warm_start
+            if U_init is None or U_init.shape != (self._control_horizon, self.act_dim):
+                U_init = jax.device_put(
+                    np.zeros((self._control_horizon, self.act_dim), dtype=np.float32),
+                    z_jax.device,
+                ).astype(z_jax.dtype)
+            else:
+                U_init = jax.device_put(U_init, z_jax.device).astype(z_jax.dtype)
+            a_low_jax = jax.device_put(self._a_low_np, z_jax.device).astype(z_jax.dtype)
+            a_high_jax = jax.device_put(self._a_high_np, z_jax.device).astype(z_jax.dtype)
             U_sol, converged = self._jax_solve_mpc(
-                to_jax(z_t),
-                to_jax(A_seq_t),
+                z_jax,
+                A_jax,
                 to_jax(B_seq_t),
                 to_jax(reward_alpha_t),
                 to_jax(reward_w2_t),
@@ -331,18 +396,23 @@ class SSMAgent:
                 to_jax(arrival_w2_t),
                 to_jax(arrival_w3_t),
                 to_jax(arrival_b1_t),
-                self._a_low_jax,
-                self._a_high_jax,
+                U_init,
+                a_low_jax,
+                a_high_jax,
             )
             if not bool(converged):
-                self._record_qpax_failure('nonconverged')
+                self._record_convex_failure('nonconverged')
                 return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
             u = np.asarray(U_sol[0], dtype=np.float32)   # first control step
             if not np.isfinite(u).all():
-                self._record_qpax_failure('solution_nonfinite')
+                self._record_convex_failure('solution_nonfinite')
                 return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
+            self._mpc_warm_start = jnp.concatenate(
+                [U_sol[1:], U_sol[-1:]], axis=0)
         except Exception as exc:
-            self._record_qpax_failure('exception', exc)
+            if self._is_jax_cuda_error(exc):
+                self._disable_jax_cuda_mpc(exc)
+            self._record_convex_failure('exception', exc)
             return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
 
         if not eval_mode:
@@ -354,222 +424,124 @@ class SSMAgent:
         return self._sanitize_action(u)
 
     # ------------------------------------------------------------------
-    # JAX + qpax MPC controller builder
+    # JAX smooth convex MPC controller
     # ------------------------------------------------------------------
-    def _build_jax_controller(self):
+    def _build_convex_controller(self):
         """
-        Build and JIT-compile the JAX/qpax MPC solve function.
+        Build and JIT-compile the projected optimizer for smooth convex MPC.
 
-        Dynamics constraints are analytically eliminated by expressing the full
-        state trajectory as a linear map of the stacked control vector U_flat:
-
-            z_{t+1} = A_t ... A_0 z_0   +   T_u[t] @ U_flat
-
-        Substituting into the reward ReLU pre-activations keeps each
-        pre-activation affine in U_flat. The concave stage reward is handled
-        by epigraph variables y:
-
-            y_t >= W2 z_t + W3 u_t + b1
-            y_t >= 0
-
-        The terminal arrival Q uses the same epigraph representation. The QP
-        decision vector is x = [U_flat, stage_y_flat, arrival_y].
-            min   1/2 x^T Q_qp x + c_qp^T x
-            s.t.  G x <= h
-
-        Stage reward:  r(z_t, u_t) = W1 ReLU(W2 z_t + W3 u_t + b1) + b2,
-        with W1 <= 0. Equivalently, -r has non-negative linear weights on y.
-        Terminal cost: -Q_arr(z_H, u_H), with Q_arr in the same ReLU form.
+        Dynamics are unrolled inside the objective. Since W1 <= 0,
+        minimizing -reward and -arrival_Q is a convex sum of softplus-affine
+        terms with box constraints on actions.
         """
-        D   = self.latent_dim
         nU  = self.act_dim
-        H   = self.horizon
-        CH  = H
-        discount = self.discount
-        qp_diag_reg = float(getattr(self.cfg, 'mpc_qp_diag_reg', 1e-6))
+        self._control_horizon = max(
+            1, min(int(getattr(self.cfg, 'control_horizon', self.horizon)), self.horizon))
+        self._softplus_beta_reward = float(getattr(
+            self.cfg, 'reward_softplus_beta', 1.0))
+        self._softplus_beta_arrival = float(getattr(
+            self.cfg, 'arrival_softplus_beta', self._softplus_beta_reward))
+        self._convex_action_l2 = float(getattr(
+            self.cfg, 'mpc_convex_action_l2', 0.0))
+        self._convex_num_iters = int(getattr(self.cfg, 'mpc_convex_num_iters', 64))
+        self._convex_step_size = float(getattr(self.cfg, 'mpc_convex_step_size', 0.03))
+        self._convex_adam_beta1 = float(getattr(self.cfg, 'mpc_convex_adam_beta1', 0.9))
+        self._convex_adam_beta2 = float(getattr(self.cfg, 'mpc_convex_adam_beta2', 0.999))
+        self._convex_adam_eps = float(getattr(self.cfg, 'mpc_convex_adam_eps', 1e-8))
+        self._mpc_warm_start = None
 
-        self._control_horizon = CH
-        n_u = CH * nU
-
-        def _build_and_solve(z0, A_seq, B_seq,
-                             reward_alpha, reward_w2, reward_w3, reward_b1,
-                             arrival_alpha, arrival_w2, arrival_w3, arrival_b1,
-                             a_low, a_high):
-            """
-            Args
-            ----
-            z0          : (D,)       initial latent state
-            A_seq       : (H, D, D)  per-step dynamics matrix
-            B_seq       : (H, D, nU) per-step input matrix
-            reward_alpha: (H, K)     non-negative weights for -reward epigraph cost
-            reward_w2   : (H, K, D)  latent reward hidden weights
-            reward_w3   : (H, K, nU) action reward hidden weights
-            reward_b1   : (H, K)     reward hidden bias
-            arrival_alpha: (K_arr,)   non-negative weights for -arrival Q cost
-            arrival_w2   : (K_arr, D) latent arrival hidden weights
-            arrival_w3   : (K_arr, nU) action arrival hidden weights
-            arrival_b1   : (K_arr,)   arrival hidden bias
-            a_low       : (nU,)      per-dim action lower bound
-            a_high      : (nU,)      per-dim action upper bound
-
-            Returns
-            -------
-            U         : (CH, nU)  optimal control sequence
-            converged : bool
-            """
-            K = reward_alpha.shape[1]
-            K_arr = arrival_alpha.shape[0]
-            n_stage_y = H * K
-            n_arrival_y = K_arr
-            n = n_u + n_stage_y + n_arrival_y
-
-            # ----------------------------------------------------------
-            # 1. State trajectory matrices (per-step A and B)
-            # ----------------------------------------------------------
-            f_list   = []
-            T_u_list = []
-
-            for t in range(H):
-                # f_t = A_t @ ... @ A_0 @ z0
-                A_cum = jnp.eye(D)
-                for s in range(t + 1):
-                    A_cum = A_seq[s] @ A_cum
-                f_list.append(A_cum @ z0)
-
-                T_u_t = jnp.zeros((D, n_u))
-                for k in range(CH):
-                    s_k = k * nU
-                    e_k = (k + 1) * nU
-                    if k < CH - 1:
-                        if k <= t:
-                            # coeff = A_t @ ... @ A_{k+1} @ B_k
-                            A_prod = jnp.eye(D)
-                            for s in range(k + 1, t + 1):
-                                A_prod = A_seq[s] @ A_prod
-                            coeff = A_prod @ B_seq[k]   # (D, nU)
-                            T_u_t = T_u_t.at[:, s_k:e_k].set(coeff)
-                    else:
-                        # Last ZOH block
-                        accum = jnp.zeros((D, nU))
-                        for j in range(CH - 1, t + 1):
-                            A_prod = jnp.eye(D)
-                            for s in range(j + 1, t + 1):
-                                A_prod = A_seq[s] @ A_prod
-                            accum = accum + A_prod @ B_seq[j]
-                        T_u_t = T_u_t.at[:, s_k:e_k].set(accum)
-
-                T_u_list.append(T_u_t)
-
-            # ----------------------------------------------------------
-            # 2. Assemble Q_qp and c_qp
-            #    qpax minimises  1/2 x^T Q_qp x + c_qp^T x.
-            # ----------------------------------------------------------
-            Q_qp = jnp.zeros((n, n))
-            c_qp = jnp.zeros(n)
-
-            for t in range(H):
-                s_y = n_u + t * K
-                e_y = s_y + K
-
-                # -r contributes alpha^T y. Constants from b2 do not affect
-                # the optimizer and are omitted from the QP objective.
-                c_qp = c_qp.at[s_y:e_y].add((discount ** t) * reward_alpha[t])
-
-            # Terminal arrival cost from the ReLU arrival Q-function.
-            Tu_H = T_u_list[H - 1]   # (D, n_u)
-            f_H = f_list[H - 1]      # (D,)
-            s_arrival_y = n_u + n_stage_y
-            e_arrival_y = s_arrival_y + K_arr
-            c_qp = c_qp.at[s_arrival_y:e_arrival_y].add(
-                (discount ** H) * arrival_alpha)
-
-            if qp_diag_reg > 0.0:
-                Q_qp = Q_qp + qp_diag_reg * jnp.eye(n)
-
-            # ----------------------------------------------------------
-            # 3. Inequality constraints
-            # ----------------------------------------------------------
-            a_high_t = jnp.tile(a_high, CH)     # (n_u,)
-            a_low_t = jnp.tile(a_low, CH)       # (n_u,)
-            zeros_action_y = jnp.zeros((n_u, n_stage_y + n_arrival_y))
-            G_parts = [
-                jnp.concatenate([jnp.eye(n_u), zeros_action_y], axis=1),
-                jnp.concatenate([-jnp.eye(n_u), zeros_action_y], axis=1),
-            ]
-            h_parts = [a_high_t, -a_low_t]
-
-            for t in range(H):
-                k_u = min(t, CH - 1)
-                s_u = k_u * nU
-                e_u = (k_u + 1) * nU
-                s_y = n_u + t * K
-                e_y = s_y + K
-                Tu = T_u_list[t]
-                f = f_list[t]
-
-                relu_u = reward_w2[t] @ Tu
-                relu_u = relu_u.at[:, s_u:e_u].add(reward_w3[t])
-                relu_row = jnp.zeros((K, n))
-                relu_row = relu_row.at[:, :n_u].set(relu_u)
-                relu_row = relu_row.at[:, s_y:e_y].set(-jnp.eye(K))
-                relu_rhs = -(reward_w2[t] @ f + reward_b1[t])
-
-                nonneg_row = jnp.zeros((K, n))
-                nonneg_row = nonneg_row.at[:, s_y:e_y].set(-jnp.eye(K))
-
-                G_parts.extend([relu_row, nonneg_row])
-                h_parts.extend([relu_rhs, jnp.zeros(K)])
-
-            s_u_H = (CH - 1) * nU
-            e_u_H = CH * nU
-            arrival_u = arrival_w2 @ Tu_H
-            arrival_u = arrival_u.at[:, s_u_H:e_u_H].add(arrival_w3)
-            arrival_row = jnp.zeros((K_arr, n))
-            arrival_row = arrival_row.at[:, :n_u].set(arrival_u)
-            arrival_row = arrival_row.at[:, s_arrival_y:e_arrival_y].set(-jnp.eye(K_arr))
-            arrival_rhs = -(arrival_w2 @ f_H + arrival_b1)
-
-            arrival_nonneg_row = jnp.zeros((K_arr, n))
-            arrival_nonneg_row = arrival_nonneg_row.at[:, s_arrival_y:e_arrival_y].set(
-                -jnp.eye(K_arr))
-            G_parts.extend([arrival_row, arrival_nonneg_row])
-            h_parts.extend([arrival_rhs, jnp.zeros(K_arr)])
-
-            G = jnp.concatenate(G_parts, axis=0)
-            h = jnp.concatenate(h_parts, axis=0)
-
-            # No equality constraints
-            A_eq = jnp.zeros((0, n))
-            b_eq = jnp.zeros((0,))
-
-            # ----------------------------------------------------------
-            # 4. Solve with qpax
-            # ----------------------------------------------------------
-            x, _s, _z, _y, converged, _iters = qpax.solve_qp(
-                Q_qp, c_qp, A_eq, b_eq, G, h)
-            return x[:n_u].reshape(CH, nU), converged
-
-        self._jax_solve_mpc = jax.jit(_build_and_solve)
-
-        # Pre-fetch action bound arrays (static across calls)
         a_high = np.asarray(
             getattr(self.cfg, 'a_bound_high', np.ones(nU)), dtype=np.float32)
         a_low = np.asarray(
             getattr(self.cfg, 'a_bound_low', -np.ones(nU)), dtype=np.float32)
-        self._a_high_jax = jnp.array(a_high)
-        self._a_low_jax  = jnp.array(a_low)
+        self._a_high_np = a_high
+        self._a_low_np = a_low
+
+        H = self.horizon
+        CH = self._control_horizon
+        discount = self.discount
+        beta_reward = self._softplus_beta_reward
+        beta_arrival = self._softplus_beta_arrival
+        action_l2 = self._convex_action_l2
+        num_iters = self._convex_num_iters
+        step_size = self._convex_step_size
+        adam_beta1 = self._convex_adam_beta1
+        adam_beta2 = self._convex_adam_beta2
+        adam_eps = self._convex_adam_eps
+
+        def _softplus(x, beta):
+            return jax.nn.softplus(beta * x) / beta
+
+        def _objective(U, z0, A_seq, B_seq,
+                       reward_alpha, reward_w2, reward_w3, reward_b1,
+                       arrival_alpha, arrival_w2, arrival_w3, arrival_b1):
+            z = z0
+            cost = jnp.array(0.0, dtype=U.dtype)
+            for t in range(H):
+                k_u = min(t, CH - 1)
+                u = U[k_u]
+                z = A_seq[t] @ z + B_seq[t] @ u
+                preact = reward_w2[t] @ z + reward_w3[t] @ u + reward_b1[t]
+                cost = cost + (discount ** t) * jnp.sum(
+                    reward_alpha[t] * _softplus(preact, beta_reward))
+
+            u_terminal = U[CH - 1]
+            arrival_preact = arrival_w2 @ z + arrival_w3 @ u_terminal + arrival_b1
+            cost = cost + (discount ** H) * jnp.sum(
+                arrival_alpha * _softplus(arrival_preact, beta_arrival))
+            if action_l2 > 0.0:
+                cost = cost + action_l2 * jnp.sum(U * U)
+            return cost
+
+        value_and_grad = jax.value_and_grad(_objective)
+
+        def _solve(z0, A_seq, B_seq,
+                   reward_alpha, reward_w2, reward_w3, reward_b1,
+                   arrival_alpha, arrival_w2, arrival_w3, arrival_b1,
+                   U_init, a_low, a_high):
+            U = jnp.clip(U_init, a_low, a_high)
+            m = jnp.zeros_like(U)
+            v = jnp.zeros_like(U)
+
+            def body(i, state):
+                U, m, v = state
+                _value, grad = value_and_grad(
+                    U, z0, A_seq, B_seq,
+                    reward_alpha, reward_w2, reward_w3, reward_b1,
+                    arrival_alpha, arrival_w2, arrival_w3, arrival_b1,
+                )
+                grad = jnp.nan_to_num(grad, nan=0.0, posinf=1e6, neginf=-1e6)
+                m = adam_beta1 * m + (1.0 - adam_beta1) * grad
+                v = adam_beta2 * v + (1.0 - adam_beta2) * (grad * grad)
+                step = i + 1
+                m_hat = m / (1.0 - adam_beta1 ** step)
+                v_hat = v / (1.0 - adam_beta2 ** step)
+                U = jnp.clip(U - step_size * m_hat / (jnp.sqrt(v_hat) + adam_eps),
+                             a_low, a_high)
+                return U, m, v
+
+            U, _m, _v = jax.lax.fori_loop(0, num_iters, body, (U, m, v))
+            final_value = _objective(
+                U, z0, A_seq, B_seq,
+                reward_alpha, reward_w2, reward_w3, reward_b1,
+                arrival_alpha, arrival_w2, arrival_w3, arrival_b1,
+            )
+            converged = jnp.isfinite(final_value) & jnp.all(jnp.isfinite(U))
+            return U, converged
+
+        self._jax_solve_mpc = jax.jit(_solve)
 
     # ------------------------------------------------------------------
     # Episode reset
     # ------------------------------------------------------------------
-    def _reset_qpax_diagnostics(self):
-        self.qpax_solver_attempts = 0
-        self.qpax_solver_failures = 0
-        self.qpax_solver_nonconverged = 0
-        self.qpax_solver_exceptions = 0
-        self.qpax_solver_input_nonfinite = 0
-        self.qpax_solver_solution_nonfinite = 0
-        self.qpax_nonfinite_inputs = {
+    def _reset_convex_diagnostics(self):
+        self.convex_solver_attempts = 0
+        self.convex_solver_failures = 0
+        self.convex_solver_nonconverged = 0
+        self.convex_solver_exceptions = 0
+        self.convex_solver_input_nonfinite = 0
+        self.convex_solver_solution_nonfinite = 0
+        self.convex_nonfinite_inputs = {
             name: 0 for name in (
                 'z', 'A', 'B', 'reward_alpha', 'reward_w2',
                 'reward_w3', 'reward_b1', 'reward_b2',
@@ -577,67 +549,71 @@ class SSMAgent:
                 'arrival_b1', 'arrival_b2',
             )
         }
-        self.qpax_last_failure_reason = 'none'
-        self.qpax_last_exception_type = 'none'
-        self.qpax_last_exception_message = ''
-        self.qpax_exception_samples = []
+        self.convex_last_failure_reason = 'none'
+        self.convex_last_exception_type = 'none'
+        self.convex_last_exception_message = ''
+        self.convex_exception_samples = []
 
-    def _add_qpax_exception_sample(self, sample):
+    def _add_convex_exception_sample(self, sample):
         sample = str(sample)[:512]
-        if sample and sample not in self.qpax_exception_samples:
-            self.qpax_exception_samples.append(sample)
-            self.qpax_exception_samples = self.qpax_exception_samples[-5:]
+        if sample and sample not in self.convex_exception_samples:
+            self.convex_exception_samples.append(sample)
+            self.convex_exception_samples = self.convex_exception_samples[-5:]
 
-    def _record_qpax_failure(self, reason, detail=None):
-        self.qpax_solver_failures += 1
-        self.qpax_last_failure_reason = reason
+    def _record_convex_failure(self, reason, detail=None):
+        self.convex_solver_failures += 1
+        self.convex_last_failure_reason = reason
         if reason == 'nonconverged':
-            self.qpax_solver_nonconverged += 1
+            self.convex_solver_nonconverged += 1
         elif reason == 'exception':
-            self.qpax_solver_exceptions += 1
-            self.qpax_last_exception_type = type(detail).__name__
-            self.qpax_last_exception_message = str(detail)[:512]
-            self._add_qpax_exception_sample(
-                f'{self.qpax_last_exception_type}: {self.qpax_last_exception_message}')
+            self.convex_solver_exceptions += 1
+            self.convex_last_exception_type = type(detail).__name__
+            self.convex_last_exception_message = str(detail)[:512]
+            self._add_convex_exception_sample(
+                f'{self.convex_last_exception_type}: {self.convex_last_exception_message}')
         elif reason == 'input_nonfinite':
-            self.qpax_solver_input_nonfinite += 1
-            self.qpax_last_exception_type = 'input_nonfinite'
-            self.qpax_last_exception_message = str(detail)
-            self._add_qpax_exception_sample(f'input_nonfinite: {detail}')
+            self.convex_solver_input_nonfinite += 1
+            self.convex_last_exception_type = 'input_nonfinite'
+            self.convex_last_exception_message = str(detail)
+            self._add_convex_exception_sample(f'input_nonfinite: {detail}')
         elif reason == 'solution_nonfinite':
-            self.qpax_solver_solution_nonfinite += 1
-            self.qpax_last_exception_type = 'solution_nonfinite'
-            self.qpax_last_exception_message = ''
-            self._add_qpax_exception_sample('solution_nonfinite')
+            self.convex_solver_solution_nonfinite += 1
+            self.convex_last_exception_type = 'solution_nonfinite'
+            self.convex_last_exception_message = ''
+            self._add_convex_exception_sample('solution_nonfinite')
 
     def reset_for_control(self):
         self.state_history = []
         self.action_history = []
-        self._reset_qpax_diagnostics()
+        self._state_history_tensors = []
+        self._action_history_tensors = []
+        self._reset_convex_diagnostics()
 
     def get_control_metrics(self):
-        successes = self.qpax_solver_attempts - self.qpax_solver_failures
-        failure_rate = (self.qpax_solver_failures / self.qpax_solver_attempts
-                        if self.qpax_solver_attempts else 0.0)
+        successes = self.convex_solver_attempts - self.convex_solver_failures
+        failure_rate = (self.convex_solver_failures / self.convex_solver_attempts
+                        if self.convex_solver_attempts else 0.0)
         metrics = {
-            'qpax_solver_attempts': int(self.qpax_solver_attempts),
-            'qpax_solver_successes': int(successes),
-            'qpax_solver_failures': int(self.qpax_solver_failures),
-            'qpax_solver_failure_rate': float(failure_rate),
-            'qpax_solver_nonconverged': int(self.qpax_solver_nonconverged),
-            'qpax_solver_exceptions': int(self.qpax_solver_exceptions),
-            'qpax_solver_input_nonfinite': int(self.qpax_solver_input_nonfinite),
-            'qpax_solver_solution_nonfinite': int(self.qpax_solver_solution_nonfinite),
+            'convex_solver_attempts': int(self.convex_solver_attempts),
+            'convex_solver_successes': int(successes),
+            'convex_solver_failures': int(self.convex_solver_failures),
+            'convex_solver_failure_rate': float(failure_rate),
+            'convex_solver_nonconverged': int(self.convex_solver_nonconverged),
+            'convex_solver_exceptions': int(self.convex_solver_exceptions),
+            'convex_solver_input_nonfinite': int(self.convex_solver_input_nonfinite),
+            'convex_solver_solution_nonfinite': int(self.convex_solver_solution_nonfinite),
         }
         metrics.update({
-            f'qpax_nonfinite_{name}': int(count)
-            for name, count in self.qpax_nonfinite_inputs.items()
+            f'convex_nonfinite_{name}': int(count)
+            for name, count in self.convex_nonfinite_inputs.items()
         })
         metrics.update({
-            'qpax_last_failure_reason': self.qpax_last_failure_reason,
-            'qpax_last_exception_type': self.qpax_last_exception_type,
-            'qpax_last_exception_message': self.qpax_last_exception_message,
-            'qpax_exception_samples': ' | '.join(self.qpax_exception_samples),
+            'convex_last_failure_reason': self.convex_last_failure_reason,
+            'convex_last_exception_type': self.convex_last_exception_type,
+            'convex_last_exception_message': self.convex_last_exception_message,
+            'convex_exception_samples': ' | '.join(self.convex_exception_samples),
+            'convex_jax_cuda_disabled': bool(self._jax_mpc_cuda_disabled),
+            'convex_jax_cuda_disable_reason': self._jax_mpc_cuda_disable_reason,
         })
         return metrics
 
@@ -648,32 +624,39 @@ class SSMAgent:
         self._cached = copy.deepcopy({
             'state_history': self.state_history,
             'action_history': self.action_history,
-            'qpax_diagnostics': self.get_control_diagnostics(),
+            'state_history_tensors': self._state_history_tensors,
+            'action_history_tensors': self._action_history_tensors,
+            'convex_diagnostics': self.get_control_diagnostics(),
         })
 
     def restore_control_info(self):
         if hasattr(self, '_cached'):
             self.state_history = self._cached['state_history']
             self.action_history = self._cached['action_history']
-            self._reset_qpax_diagnostics()
-            diagnostics = self._cached.get('qpax_diagnostics')
+            self._state_history_tensors = self._cached.get('state_history_tensors', [])
+            self._action_history_tensors = self._cached.get('action_history_tensors', [])
+            if (len(self._state_history_tensors) != len(self.state_history)
+                    or len(self._action_history_tensors) != len(self.action_history)):
+                self._rebuild_tensor_histories()
+            self._reset_convex_diagnostics()
+            diagnostics = self._cached.get('convex_diagnostics')
             if diagnostics is None:
-                self.qpax_solver_failures = self._cached.get('qpax_solver_failures', 0)
-                self.qpax_solver_attempts = self.qpax_solver_failures
+                self.convex_solver_failures = self._cached.get('convex_solver_failures', 0)
+                self.convex_solver_attempts = self.convex_solver_failures
             else:
-                self.qpax_solver_attempts = diagnostics.get('qpax_solver_attempts', 0)
-                self.qpax_solver_failures = diagnostics.get('qpax_solver_failures', 0)
-                self.qpax_solver_nonconverged = diagnostics.get('qpax_solver_nonconverged', 0)
-                self.qpax_solver_exceptions = diagnostics.get('qpax_solver_exceptions', 0)
-                self.qpax_solver_input_nonfinite = diagnostics.get('qpax_solver_input_nonfinite', 0)
-                self.qpax_solver_solution_nonfinite = diagnostics.get('qpax_solver_solution_nonfinite', 0)
-                for name in self.qpax_nonfinite_inputs:
-                    self.qpax_nonfinite_inputs[name] = diagnostics.get(f'qpax_nonfinite_{name}', 0)
-                self.qpax_last_failure_reason = diagnostics.get('qpax_last_failure_reason', 'none')
-                self.qpax_last_exception_type = diagnostics.get('qpax_last_exception_type', 'none')
-                self.qpax_last_exception_message = diagnostics.get('qpax_last_exception_message', '')
-                samples = diagnostics.get('qpax_exception_samples', '')
-                self.qpax_exception_samples = [s for s in samples.split(' | ') if s]
+                self.convex_solver_attempts = diagnostics.get('convex_solver_attempts', 0)
+                self.convex_solver_failures = diagnostics.get('convex_solver_failures', 0)
+                self.convex_solver_nonconverged = diagnostics.get('convex_solver_nonconverged', 0)
+                self.convex_solver_exceptions = diagnostics.get('convex_solver_exceptions', 0)
+                self.convex_solver_input_nonfinite = diagnostics.get('convex_solver_input_nonfinite', 0)
+                self.convex_solver_solution_nonfinite = diagnostics.get('convex_solver_solution_nonfinite', 0)
+                for name in self.convex_nonfinite_inputs:
+                    self.convex_nonfinite_inputs[name] = diagnostics.get(f'convex_nonfinite_{name}', 0)
+                self.convex_last_failure_reason = diagnostics.get('convex_last_failure_reason', 'none')
+                self.convex_last_exception_type = diagnostics.get('convex_last_exception_type', 'none')
+                self.convex_last_exception_message = diagnostics.get('convex_last_exception_message', '')
+                samples = diagnostics.get('convex_exception_samples', '')
+                self.convex_exception_samples = [s for s in samples.split(' | ') if s]
         else:
             print('No cached control info found.')
 
@@ -875,7 +858,7 @@ class SSMAgent:
                 reward_step, sample_weight
             ) * (self.rho ** t)
 
-        # ---- Value loss (scalar Q ensemble + ReLU arrival Q-function) ----
+        # ---- Value loss (scalar Q ensemble + softplus arrival Q-function) ----
         obs_for_q = obs[0]
         obs_target = obs[1]
         # Sample target action from raw obs; evaluate it with raw target obs
@@ -902,7 +885,7 @@ class SSMAgent:
             a_target = self.model.pi(obs_target, target=True, deterministic=True)
 
         q_target_val = reward[self.history_horizon + H-1] + self.discount * self.model.Q_value(
-            obs_target, a_target, target=False
+            obs_target, a_target, target=True
         )
         arrival_q_pred = self.model.arrival_Q_value(
             z_for_q, a_for_q, encoder_in, target=False, return_type='all')

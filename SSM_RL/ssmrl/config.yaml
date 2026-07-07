@@ -6,7 +6,7 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: -H24-reward_loss1e3
+exp_name: -H24-reward_loss1e3-soft_plus-target_fix
 #agent_name: SSM_agent_v15_const
 agent_name: SSM_agent_v39
 
@@ -61,9 +61,13 @@ apply_action_constraints: true
 jax_mpc_platform: cpu
 jax_mpc_preallocate: false
 jax_mpc_mem_fraction: 0.20
+jax_mpc_disable_cuda_after_error: true
+mpc_convex_num_iters: 64
+mpc_convex_step_size: 0.03
+mpc_convex_action_l2: 0.0
 
 # planning
-solver: SCS
+solver: jax_projected_adam
 mpc: true
 iterations: 6
 num_samples: 512
