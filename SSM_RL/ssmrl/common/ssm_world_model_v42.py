@@ -4,10 +4,10 @@ Implements a state-space model with:
   - Variational encoder (mean + log_sigma)
   - Transformer-based temporal context encoder
   - Dense per-step linear dynamics: z' = A*z + B*u
-  - Concave one-hidden-layer softplus reward:
-      r = W1 softplus(W2 z + W3 u + b1) + b2, with W1 <= 0
+  - One-hidden-layer softplus reward:
+      r = W1 softplus(W2 z + W3 u + b1) + b2
   - Ensemble Q-function conditioned on latent state and action
-  - Concave one-hidden-layer softplus arrival Q-function for MPC arrival cost
+  - Two-hidden-layer softplus arrival Q-function for MPC arrival cost
   - Raw-observation policy network (tanh-squashed)
 
 Follows the architecture of WorldModel in ssmrl/common/world_model.py.
@@ -100,9 +100,9 @@ class SSMWorldModel(nn.Module):
     Key differences from the vanilla TD-MPC2 WorldModel:
     * Dynamics are linear: z' = A*z + B*u  (dense A and B are mixed from
       learned basis matrices).
-    * Reward is a learned concave softplus network over latent state and action.
+    * Reward is a learned softplus network over latent state and action.
     * Critic is a TD-MPC2-style ensemble over (raw observation, action).
-    * Arrival-cost critic is a learned concave softplus network over latent state
+    * Arrival-cost critic is a learned softplus network over latent state
       and action.
     * The policy consumes raw observations directly.
     """
@@ -179,10 +179,10 @@ class SSMWorldModel(nn.Module):
         )
         self._B_basis = nn.Parameter(torch.randn(self._B_num_bases, latent_dim, act_dim) * b_basis_init)
 
-        # ---- Concave softplus reward head ----
+        # ---- Softplus reward head ----
         # r(z, u) = W1 softplus(W2 z + W3 u + b1) + b2.
-        # W1 is parameterized as -softplus(raw), so the reward is concave in
-        # (z, u) and -reward remains convex for MPC.
+        # W1 is unconstrained; the "_raw" suffix is kept for checkpoint
+        # compatibility with earlier concave versions.
         self.reward_hidden_dim = int(getattr(
             cfg, 'reward_softplus_hidden_dim',
             getattr(cfg, 'reward_relu_hidden_dim', latent_dim)))
@@ -190,7 +190,8 @@ class SSMWorldModel(nn.Module):
         reward_init = float(getattr(
             cfg, 'reward_softplus_weight_init',
             getattr(cfg, 'reward_relu_weight_init', 0.01)))
-        self._reward_w1_raw = nn.Parameter(torch.full((self.reward_hidden_dim,), -2.0))
+        reward_w1_init = float(getattr(cfg, 'reward_w1_init', -0.126928011))
+        self._reward_w1_raw = nn.Parameter(torch.full((self.reward_hidden_dim,), reward_w1_init))
         self._reward_w2 = nn.Parameter(torch.randn(self.reward_hidden_dim, latent_dim) * reward_init)
         self._reward_w3 = nn.Parameter(torch.randn(self.reward_hidden_dim, act_dim) * reward_init)
         self._reward_b1 = nn.Parameter(torch.zeros(self.reward_hidden_dim))
@@ -251,17 +252,25 @@ class SSMWorldModel(nn.Module):
         for p in self._q_func_target.parameters():
             p.requires_grad_(False)
 
-        # ---- Concave softplus arrival Q-function for MPC arrival cost ----
-        # Q_arr(z, u) = W1 softplus(W2 z + W3 u + b1) + b2, with W1 <= 0.
+        # ---- Two-layer softplus arrival Q-function for MPC arrival cost ----
+        # h1 = softplus(W2 z + W3 u + b1)
+        # h2 = softplus(W4 h1 + b3)
+        # Q_arr(z, u) = W1 h2 + b2.
         self.arrival_hidden_dim = self.reward_hidden_dim
+        self.arrival_second_hidden_dim = int(getattr(
+            cfg, 'arrival_second_hidden_dim', self.arrival_hidden_dim))
         self.arrival_softplus_beta = self.reward_softplus_beta
         arrival_init = float(getattr(
             cfg, 'arrival_softplus_weight_init',
             getattr(cfg, 'arrival_relu_weight_init', reward_init)))
-        self._arrival_w1_raw = nn.Parameter(torch.full((self.arrival_hidden_dim,), -2.0))
+        arrival_w1_init = float(getattr(cfg, 'arrival_w1_init', reward_w1_init))
+        self._arrival_w1_raw = nn.Parameter(torch.full((self.arrival_second_hidden_dim,), arrival_w1_init))
         self._arrival_w2 = nn.Parameter(torch.randn(self.arrival_hidden_dim, latent_dim) * arrival_init)
         self._arrival_w3 = nn.Parameter(torch.randn(self.arrival_hidden_dim, act_dim) * arrival_init)
+        self._arrival_w4 = nn.Parameter(
+            torch.randn(self.arrival_second_hidden_dim, self.arrival_hidden_dim) * arrival_init)
         self._arrival_b1 = nn.Parameter(torch.zeros(self.arrival_hidden_dim))
+        self._arrival_b3 = nn.Parameter(torch.zeros(self.arrival_second_hidden_dim))
         self._arrival_b2 = nn.Parameter(torch.zeros(1))
 
 
@@ -308,7 +317,7 @@ class SSMWorldModel(nn.Module):
         return_dynamics_ensemble=False,
     ):
         """
-        Run transformer on history and produce dynamics plus concave softplus
+        Run transformer on history and produce dynamics plus softplus
         reward parameters for the current step.
 
         Args:
@@ -325,7 +334,7 @@ class SSMWorldModel(nn.Module):
                         or [batch, num_ensembles, prediction_horizon, latent_dim, latent_dim]
             B_seq:      [batch, prediction_horizon, latent_dim, act_dim]
                         or [batch, num_ensembles, prediction_horizon, latent_dim, act_dim]
-            reward_w1:  [batch, prediction_horizon, reward_hidden_dim] negative output weights
+            reward_w1:  [batch, prediction_horizon, reward_hidden_dim] signed output weights
             reward_w2:  [batch, prediction_horizon, reward_hidden_dim, latent_dim]
             reward_w3:  [batch, prediction_horizon, reward_hidden_dim, act_dim]
             reward_b1:  [batch, prediction_horizon, reward_hidden_dim]
@@ -473,10 +482,10 @@ class SSMWorldModel(nn.Module):
         return Az + Bu
 
     # ------------------------------------------------------------------
-    # Reward (concave softplus in z and action)
+    # Reward (softplus in z and action)
     # ------------------------------------------------------------------
     def reward_head_parameters(self):
-        """Return the trainable parameters of the concave softplus reward head."""
+        """Return the trainable parameters of the softplus reward head."""
         return [
             self._reward_w1_raw,
             self._reward_w2,
@@ -489,9 +498,9 @@ class SSMWorldModel(nn.Module):
         """
         Return reward parameters, optionally expanded over batch and horizon.
 
-        W1 is always non-positive, making the reward concave in (z, a).
+        W1 is unconstrained, so the reward is not required to be concave.
         """
-        w1 = -F.softplus(self._reward_w1_raw)
+        w1 = self._reward_w1_raw
         w2 = self._reward_w2
         w3 = self._reward_w3
         b1 = self._reward_b1
@@ -520,7 +529,7 @@ class SSMWorldModel(nn.Module):
         Args:
             z:      [batch, latent_dim]
             a:      [batch, act_dim]
-            w1:     [batch, reward_hidden_dim] non-positive output weights
+            w1:     [batch, reward_hidden_dim] signed output weights
             w2:     [batch, reward_hidden_dim, latent_dim]
             w3:     [batch, reward_hidden_dim, act_dim]
             b1:     [batch, reward_hidden_dim]
@@ -653,53 +662,65 @@ class SSMWorldModel(nn.Module):
     # Softplus Q-Function for MPC arrival cost
     # ------------------------------------------------------------------
     def arrival_head_parameters(self):
-        """Return the trainable parameters of the concave softplus arrival Q head."""
+        """Return the trainable parameters of the two-layer softplus arrival Q head."""
         return [
             self._arrival_w1_raw,
             self._arrival_w2,
             self._arrival_w3,
+            self._arrival_w4,
             self._arrival_b1,
+            self._arrival_b3,
             self._arrival_b2,
         ]
 
     def arrival_Q_params(self, encoder_in, target=False):
         """
-        Return concave softplus arrival Q parameters.
+        Return two-layer softplus arrival Q parameters.
 
         The arrival Q-function represents:
-            Q(z, a) = W1 softplus(W2 z + W3 a + b1) + b2
+            h1 = softplus(W2 z + W3 a + b1)
+            h2 = softplus(W4 h1 + b3)
+            Q(z, a) = W1 h2 + b2
 
         Args:
             encoder_in: [batch, ctx_dim], used for batch/device/dtype only
             target:     kept for API compatibility
         Returns:
-            w1: [batch, arrival_hidden_dim], non-positive output weights
+            w1: [batch, arrival_second_hidden_dim], signed output weights
             w2: [batch, arrival_hidden_dim, latent_dim]
             w3: [batch, arrival_hidden_dim, act_dim]
+            w4: [batch, arrival_second_hidden_dim, arrival_hidden_dim]
             b1: [batch, arrival_hidden_dim]
+            b3: [batch, arrival_second_hidden_dim]
             b2: [batch, 1]
         """
         batch_size = encoder_in.shape[0]
-        w1 = -F.softplus(self._arrival_w1_raw)
+        w1 = self._arrival_w1_raw
         w2 = self._arrival_w2
         w3 = self._arrival_w3
+        w4 = self._arrival_w4
         b1 = self._arrival_b1
+        b3 = self._arrival_b3
         b2 = self._arrival_b2
         w1 = w1.to(device=encoder_in.device, dtype=encoder_in.dtype)
         w2 = w2.to(device=encoder_in.device, dtype=encoder_in.dtype)
         w3 = w3.to(device=encoder_in.device, dtype=encoder_in.dtype)
+        w4 = w4.to(device=encoder_in.device, dtype=encoder_in.dtype)
         b1 = b1.to(device=encoder_in.device, dtype=encoder_in.dtype)
+        b3 = b3.to(device=encoder_in.device, dtype=encoder_in.dtype)
         b2 = b2.to(device=encoder_in.device, dtype=encoder_in.dtype)
         w1 = w1.view(1, -1).expand(batch_size, -1)
         w2 = w2.view(1, self.arrival_hidden_dim, self.latent_dim).expand(batch_size, -1, -1)
         w3 = w3.view(1, self.arrival_hidden_dim, self.act_dim).expand(batch_size, -1, -1)
+        w4 = w4.view(1, self.arrival_second_hidden_dim, self.arrival_hidden_dim).expand(batch_size, -1, -1)
         b1 = b1.view(1, -1).expand(batch_size, -1)
+        b3 = b3.view(1, -1).expand(batch_size, -1)
         b2 = b2.view(1, 1).expand(batch_size, -1)
-        return w1, w2, w3, b1, b2
+        return w1, w2, w3, w4, b1, b3, b2
 
     def arrival_Q_value(self, z, a, encoder_in, target=False, return_type='min'):
         """
-        Evaluate the concave softplus arrival Q-function.
+        Evaluate the two-layer softplus arrival Q-function.
 
         Args:
             z:          [batch, latent_dim]
@@ -710,20 +731,20 @@ class SSMWorldModel(nn.Module):
         Returns:
             Arrival Q value [batch, 1]
         """
-        w1, w2, w3, b1, b2 = self.arrival_Q_params(encoder_in, target=target)
-        preact = (
+        w1, w2, w3, w4, b1, b3, b2 = self.arrival_Q_params(encoder_in, target=target)
+        preact1 = (
             torch.bmm(w2, z.unsqueeze(-1)).squeeze(-1)
             + torch.bmm(w3, a.unsqueeze(-1)).squeeze(-1)
             + b1
         )
+        hidden1 = F.softplus(preact1, beta=self.arrival_softplus_beta)
+        preact2 = torch.bmm(w4, hidden1.unsqueeze(-1)).squeeze(-1) + b3
+        hidden2 = F.softplus(preact2, beta=self.arrival_softplus_beta)
         value = (
-            w1 * F.softplus(preact, beta=self.arrival_softplus_beta)
+            w1 * hidden2
         ).sum(dim=-1, keepdim=True) + b2
+        return value
 
-        if return_type in {'all', 'max', 'min', 'avg', None}:
-            return value
-        else:
-            raise ValueError(f"Unknown return_type: {return_type}")
 
     # ------------------------------------------------------------------
     # Gradient control helpers

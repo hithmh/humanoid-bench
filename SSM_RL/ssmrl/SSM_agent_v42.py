@@ -1,11 +1,11 @@
 """
-SSM Agent v39- transformer-conditioned SSM-RL with JAX smooth convex MPC.
+SSM Agent v42- transformer-conditioned SSM-RL with JAX smooth MPC.
 
 This agent wraps ``SSMWorldModel`` and provides both model learning and
 inference-time control. During inference, recent state/action history is used
-by ``encode_context`` to produce local linear SSM parameters, concave softplus
+by ``encode_context`` to produce local linear SSM parameters, softplus
 reward parameters, and critic context. Until enough history is available, or
-if the convex solver fails, actions come from the learned policy.
+if the MPC solver fails, actions come from the learned policy.
 
 MPC controller:
   * The finite-horizon control objective is assembled once as a JAX function
@@ -16,17 +16,18 @@ MPC controller:
     dynamics constraints:
       z_{t+1} = A_t ... A_0 z_0 + T_u[t] @ U_flat
   * Per-step action bounds are encoded as box constraints.
-  * The stage reward and terminal arrival Q are concave softplus networks, so
-    minimizing their negation is a convex smooth optimization problem.
+  * The stage reward and terminal arrival Q are softplus networks. With signed
+    output weights, minimizing their negation is generally nonconvex; the JAX
+    projected Adam optimizer is a local smooth box-constrained solver.
   * Training-time exploration samples dynamics parameters from the A/B
     ensemble mean plus Gaussian noise times ensemble standard deviation, then
     adds policy-standard-deviation action noise after planning.
   * PyTorch tensors are passed to JAX through DLPack when the backends share a
     device, avoiding per-step NumPy conversion.
 
-Convex MPC objective:
-  min_U  sum_t gamma^t alpha_t^T softplus(W2_t z_t(U) + W3_t u_t + b1_t)
-       + gamma^H alpha_H^T softplus(W2_H z_H(U) + W3_H u_H + b1_H)
+MPC objective:
+  min_U -sum_t gamma^t w1_t^T softplus(W2_t z_t(U) + W3_t u_t + b1_t)
+        -gamma^H w1_H^T softplus(W4_H softplus(W2_H z_H(U) + W3_H u_H + b1_H) + b3_H)
   s.t.  a_low <= u_t <= a_high
 
 Training loop:
@@ -45,7 +46,7 @@ import jax
 import jax.numpy as jnp
 
 
-from ssmrl.common.ssm_world_model_v39 import SSMWorldModel
+from ssmrl.common.ssm_world_model_v42 import SSMWorldModel
 from ssmrl.common.scale import RunningScale
 
 
@@ -146,7 +147,7 @@ class SSMAgent:
         self._action_history_tensors = []
         self._reset_convex_diagnostics()
 
-        # Build JAX smooth convex MPC controller
+        # Build JAX smooth MPC controller
         self._build_convex_controller()
 
     def _resolve_device(self, requested):
@@ -177,7 +178,15 @@ class SSMAgent:
     def load(self, fp):
         """Load agent state dict."""
         state_dict = fp if isinstance(fp, dict) else torch.load(fp, weights_only=False)
-        self.model.load_state_dict(state_dict['model'])
+        missing, unexpected = self.model.load_state_dict(state_dict['model'], strict=False)
+        allowed_missing = {'_arrival_w4', '_arrival_b3'}
+        unexpected = list(unexpected)
+        disallowed_missing = [name for name in missing if name not in allowed_missing]
+        if disallowed_missing or unexpected:
+            raise RuntimeError(
+                f'Incompatible model state_dict. Missing={disallowed_missing}, '
+                f'unexpected={unexpected}'
+            )
 
     # ------------------------------------------------------------------
     # Shift / scale management
@@ -281,7 +290,7 @@ class SSMAgent:
 
     def _plan_convex(self, z: torch.Tensor, obs_t: torch.Tensor, eval_mode: bool):
         """
-        Solve the JAX smooth convex MPC problem. Falls back to the policy net on
+        Solve the JAX smooth MPC problem. Falls back to the policy net on
         numerical failure or solver non-convergence.
 
         Returns:
@@ -309,19 +318,22 @@ class SSMAgent:
         # Extract single-sample tensors
         A_seq_t = A_seq[0]                         # (H, D, D)
         B_seq_t = B_seq[0]                         # (H, D, nU)
-        reward_alpha_t = -reward_w1_seq[0]         # (H, K), positive cost weight
+        reward_w1_t = reward_w1_seq[0]             # (H, K), signed output weight
         reward_w2_t = reward_w2_seq[0]             # (H, K, D)
         reward_w3_t = reward_w3_seq[0]             # (H, K, nU)
         reward_b1_t = reward_b1_seq[0]             # (H, K)
         reward_b2_t = reward_b2_seq[0]             # (H, 1), constant for MPC
         z_t = z[0]                                 # (D,)
 
-        arrival_w1, arrival_w2, arrival_w3, arrival_b1, arrival_b2 = self.model.arrival_Q_params(
+        (arrival_w1, arrival_w2, arrival_w3, arrival_w4,
+         arrival_b1, arrival_b3, arrival_b2) = self.model.arrival_Q_params(
             encoder_in, target=False)
-        arrival_alpha_t = -arrival_w1[0]  # (K_arr,), positive cost weight
-        arrival_w2_t = arrival_w2[0]      # (K_arr, D)
-        arrival_w3_t = arrival_w3[0]      # (K_arr, nU)
-        arrival_b1_t = arrival_b1[0]      # (K_arr,)
+        arrival_w1_t = arrival_w1[0]      # (K2_arr,), signed output weight
+        arrival_w2_t = arrival_w2[0]      # (K1_arr, D)
+        arrival_w3_t = arrival_w3[0]      # (K1_arr, nU)
+        arrival_w4_t = arrival_w4[0]      # (K2_arr, K1_arr)
+        arrival_b1_t = arrival_b1[0]      # (K1_arr,)
+        arrival_b3_t = arrival_b3[0]      # (K2_arr,)
         arrival_b2_t = arrival_b2[0]      # (1,), constant for MPC
 
         self.convex_solver_attempts += 1
@@ -329,15 +341,17 @@ class SSMAgent:
             'z': z_t,
             'A': A_seq_t,
             'B': B_seq_t,
-            'reward_alpha': reward_alpha_t,
+            'reward_w1': reward_w1_t,
             'reward_w2': reward_w2_t,
             'reward_w3': reward_w3_t,
             'reward_b1': reward_b1_t,
             'reward_b2': reward_b2_t,
-            'arrival_alpha': arrival_alpha_t,
+            'arrival_w1': arrival_w1_t,
             'arrival_w2': arrival_w2_t,
             'arrival_w3': arrival_w3_t,
+            'arrival_w4': arrival_w4_t,
             'arrival_b1': arrival_b1_t,
+            'arrival_b3': arrival_b3_t,
             'arrival_b2': arrival_b2_t,
         }
         bad_inputs = [name for name, tensor in input_tensors.items()
@@ -388,14 +402,16 @@ class SSMAgent:
                 z_jax,
                 A_jax,
                 to_jax(B_seq_t),
-                to_jax(reward_alpha_t),
+                to_jax(reward_w1_t),
                 to_jax(reward_w2_t),
                 to_jax(reward_w3_t),
                 to_jax(reward_b1_t),
-                to_jax(arrival_alpha_t),
+                to_jax(arrival_w1_t),
                 to_jax(arrival_w2_t),
                 to_jax(arrival_w3_t),
+                to_jax(arrival_w4_t),
                 to_jax(arrival_b1_t),
+                to_jax(arrival_b3_t),
                 U_init,
                 a_low_jax,
                 a_high_jax,
@@ -424,15 +440,15 @@ class SSMAgent:
         return self._sanitize_action(u)
 
     # ------------------------------------------------------------------
-    # JAX smooth convex MPC controller
+    # JAX smooth MPC controller
     # ------------------------------------------------------------------
     def _build_convex_controller(self):
         """
-        Build and JIT-compile the projected optimizer for smooth convex MPC.
+        Build and JIT-compile the projected optimizer for smooth MPC.
 
-        Dynamics are unrolled inside the objective. Since W1 <= 0,
-        minimizing -reward and -arrival_Q is a convex sum of softplus-affine
-        terms with box constraints on actions.
+        Dynamics are unrolled inside the objective. Signed W1 removes the
+        concavity guarantee, so this is generally a nonconvex smooth
+        box-constrained problem optimized locally with projected Adam.
         """
         nU  = self.act_dim
         self._control_horizon = max(
@@ -448,6 +464,7 @@ class SSMAgent:
         self._convex_adam_beta1 = float(getattr(self.cfg, 'mpc_convex_adam_beta1', 0.9))
         self._convex_adam_beta2 = float(getattr(self.cfg, 'mpc_convex_adam_beta2', 0.999))
         self._convex_adam_eps = float(getattr(self.cfg, 'mpc_convex_adam_eps', 1e-8))
+        self._mpc_objective_convex = False
         self._mpc_warm_start = None
 
         a_high = np.asarray(
@@ -473,8 +490,9 @@ class SSMAgent:
             return jax.nn.softplus(beta * x) / beta
 
         def _objective(U, z0, A_seq, B_seq,
-                       reward_alpha, reward_w2, reward_w3, reward_b1,
-                       arrival_alpha, arrival_w2, arrival_w3, arrival_b1):
+                       reward_w1, reward_w2, reward_w3, reward_b1,
+                       arrival_w1, arrival_w2, arrival_w3, arrival_w4,
+                       arrival_b1, arrival_b3):
             z = z0
             cost = jnp.array(0.0, dtype=U.dtype)
             for t in range(H):
@@ -482,13 +500,15 @@ class SSMAgent:
                 u = U[k_u]
                 z = A_seq[t] @ z + B_seq[t] @ u
                 preact = reward_w2[t] @ z + reward_w3[t] @ u + reward_b1[t]
-                cost = cost + (discount ** t) * jnp.sum(
-                    reward_alpha[t] * _softplus(preact, beta_reward))
+                cost = cost - (discount ** t) * jnp.sum(
+                    reward_w1[t] * _softplus(preact, beta_reward))
 
             u_terminal = U[CH - 1]
-            arrival_preact = arrival_w2 @ z + arrival_w3 @ u_terminal + arrival_b1
-            cost = cost + (discount ** H) * jnp.sum(
-                arrival_alpha * _softplus(arrival_preact, beta_arrival))
+            arrival_preact1 = arrival_w2 @ z + arrival_w3 @ u_terminal + arrival_b1
+            arrival_hidden1 = _softplus(arrival_preact1, beta_arrival)
+            arrival_preact2 = arrival_w4 @ arrival_hidden1 + arrival_b3
+            cost = cost - (discount ** H) * jnp.sum(
+                arrival_w1 * _softplus(arrival_preact2, beta_arrival))
             if action_l2 > 0.0:
                 cost = cost + action_l2 * jnp.sum(U * U)
             return cost
@@ -496,8 +516,9 @@ class SSMAgent:
         value_and_grad = jax.value_and_grad(_objective)
 
         def _solve(z0, A_seq, B_seq,
-                   reward_alpha, reward_w2, reward_w3, reward_b1,
-                   arrival_alpha, arrival_w2, arrival_w3, arrival_b1,
+                   reward_w1, reward_w2, reward_w3, reward_b1,
+                   arrival_w1, arrival_w2, arrival_w3, arrival_w4,
+                   arrival_b1, arrival_b3,
                    U_init, a_low, a_high):
             U = jnp.clip(U_init, a_low, a_high)
             m = jnp.zeros_like(U)
@@ -507,8 +528,9 @@ class SSMAgent:
                 U, m, v = state
                 _value, grad = value_and_grad(
                     U, z0, A_seq, B_seq,
-                    reward_alpha, reward_w2, reward_w3, reward_b1,
-                    arrival_alpha, arrival_w2, arrival_w3, arrival_b1,
+                    reward_w1, reward_w2, reward_w3, reward_b1,
+                    arrival_w1, arrival_w2, arrival_w3, arrival_w4,
+                    arrival_b1, arrival_b3,
                 )
                 grad = jnp.nan_to_num(grad, nan=0.0, posinf=1e6, neginf=-1e6)
                 m = adam_beta1 * m + (1.0 - adam_beta1) * grad
@@ -523,8 +545,9 @@ class SSMAgent:
             U, _m, _v = jax.lax.fori_loop(0, num_iters, body, (U, m, v))
             final_value = _objective(
                 U, z0, A_seq, B_seq,
-                reward_alpha, reward_w2, reward_w3, reward_b1,
-                arrival_alpha, arrival_w2, arrival_w3, arrival_b1,
+                reward_w1, reward_w2, reward_w3, reward_b1,
+                arrival_w1, arrival_w2, arrival_w3, arrival_w4,
+                arrival_b1, arrival_b3,
             )
             converged = jnp.isfinite(final_value) & jnp.all(jnp.isfinite(U))
             return U, converged
@@ -543,10 +566,11 @@ class SSMAgent:
         self.convex_solver_solution_nonfinite = 0
         self.convex_nonfinite_inputs = {
             name: 0 for name in (
-                'z', 'A', 'B', 'reward_alpha', 'reward_w2',
+                'z', 'A', 'B', 'reward_w1', 'reward_w2',
                 'reward_w3', 'reward_b1', 'reward_b2',
-                'arrival_alpha', 'arrival_w2', 'arrival_w3',
-                'arrival_b1', 'arrival_b2',
+                'arrival_w1', 'arrival_w2', 'arrival_w3',
+                'arrival_w4', 'arrival_b1', 'arrival_b3',
+                'arrival_b2',
             )
         }
         self.convex_last_failure_reason = 'none'
@@ -614,6 +638,7 @@ class SSMAgent:
             'convex_exception_samples': ' | '.join(self.convex_exception_samples),
             'convex_jax_cuda_disabled': bool(self._jax_mpc_cuda_disabled),
             'convex_jax_cuda_disable_reason': self._jax_mpc_cuda_disable_reason,
+            'mpc_objective_convex': bool(self._mpc_objective_convex),
         })
         return metrics
 
@@ -877,10 +902,11 @@ class SSMAgent:
         ).mean(dim=(0, 2))
         q_loss = self._weighted_mean(q_loss_per_sample, sample_weight)
 
-        z_for_q = self.model.encode(obs[self.history_horizon + H-1])
-        z_for_q = zs[t + 1]
-        obs_target = obs[self.history_horizon + H-1]
+
+        z_for_q = zs[-2]
         a_for_q = action[self.history_horizon+ H-1]
+
+        obs_target = obs[self.history_horizon + H-1]
         # Sample target action from raw obs; evaluate it with raw target obs
         # with torch.no_grad():
         #     a_target = self.model.pi(obs_target, target=True, deterministic=True)
