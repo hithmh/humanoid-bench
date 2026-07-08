@@ -878,13 +878,14 @@ class SSMAgent:
         q_loss = self._weighted_mean(q_loss_per_sample, sample_weight)
 
         z_for_q = self.model.encode(obs[self.history_horizon + H-1])
-        obs_target = obs[self.history_horizon + H]
+        z_for_q = zs[t + 1]
+        obs_target = obs[self.history_horizon + H-1]
         a_for_q = action[self.history_horizon+ H-1]
         # Sample target action from raw obs; evaluate it with raw target obs
-        with torch.no_grad():
-            a_target = self.model.pi(obs_target, target=True, deterministic=True)
-
-        q_target_val = reward[self.history_horizon + H-1] + self.discount * self.model.Q_value(
+        # with torch.no_grad():
+        #     a_target = self.model.pi(obs_target, target=True, deterministic=True)
+        a_target = action[self.history_horizon + H-1]
+        q_target_val = self.model.Q_value(
             obs_target, a_target, target=True
         )
         arrival_q_pred = self.model.arrival_Q_value(

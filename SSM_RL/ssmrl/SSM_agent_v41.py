@@ -88,8 +88,6 @@ class SSMAgent:
             {'params': self.model._B_net.parameters()},
             {'params': [self.model._B_basis]},
             {'params': self.model.reward_head_parameters()},
-            {'params': self.model._q_func.parameters(),
-             'lr': lr * critic_lr_scale},
             {'params': self.model.arrival_head_parameters(),
              'lr': lr * critic_lr_scale},
         ], lr=lr, weight_decay=self.l2_regularizer)
@@ -689,7 +687,8 @@ class SSMAgent:
 
     def update_pi(self, obs0, sample_weight=None):
         """
-        Update policy using raw observations for both actor and critic.
+        Update policy using raw observations for the actor and the
+        observation-parameterized concave Q function.
 
         The gradient path is:
             obs0 -> pi(obs0) -> action -> Q_value(obs0, action)
@@ -708,7 +707,10 @@ class SSMAgent:
         action, log_prob = self.model.pi(obs0, return_log_prob=True)  # [B, act_dim], [B, 1]
 
         # Q value at (obs0, action) - critic grad frozen, actor grad flows via action
-        val = self.model.Q_value(obs0, action, target=False, return_type='avg')  # [B, 1]
+        with torch.no_grad():
+            z0 = self.model.encode(obs0)
+        val = self.model.arrival_Q_value(
+            z0, action, obs0, target=False, return_type='avg')  # [B, 1]
 
         self.scale.update(val)
         val = self.scale(val)
@@ -769,11 +771,12 @@ class SSMAgent:
             'reward_loss': 0.0,
             'value_loss': 0.0,
             'q_loss': 0.0,
-            'arrival_q_loss': 0.0,
+            'terminal_q_loss': 0.0,
             'pi_loss': 0.0,
             'total_loss': 0.0,
             'grad_norm': 0.0,
             'pi_scale': float(self.scale.value),
+            'critic_horizon': 0.0,
             'skipped_update': 1.0,
             'nonfinite_batch': float(nonfinite_batch),
             'nonfinite_loss': float(nonfinite_loss),
@@ -876,52 +879,44 @@ class SSMAgent:
                 reward_step, sample_weight
             ) * (self.rho ** t)
 
-        # ---- Value loss (scalar Q ensemble + weighted ReLU arrival Q ensemble) ----
-        obs_for_q = obs[0]
-        obs_target = obs[1]
-        # Sample target action from raw obs; evaluate it with raw target obs
-        with torch.no_grad():
-            a_target = self.model.pi(obs_target, target=True, deterministic=True)
-
-        q_target_val = reward[0] + self.discount * self.model.Q_value(
-            obs_target, a_target, target=True
+        # ---- Value loss for the single concave ReLU Q ensemble ----
+        # Train on every replay tuple in the sampled sequence:
+        # (obs_t, action_t, reward_t, obs_{t+1}) for
+        # t = 0 .. history_horizon + H - 1.
+        critic_horizon = min(
+            action.shape[0],
+            reward.shape[0],
+            obs.shape[0] - 1,
+            self.history_horizon + H,
         )
-        # Replay action for Q(obs, a)
-        a_for_q = action[0]
-        q_pred_all = self.model.Q_value(obs_for_q, a_for_q, target=False, return_type='all')
-        q_target = q_target_val.detach().expand_as(q_pred_all)
+        obs_for_q = obs[:critic_horizon]
+        a_for_q = action[:critic_horizon]
+        reward_for_q = reward[:critic_horizon]
+        obs_target = obs[1:critic_horizon + 1]
+
+        q_obs_flat = obs_for_q.reshape(critic_horizon * B, -1)
+        q_action_flat = a_for_q.reshape(critic_horizon * B, -1)
+        q_reward_flat = reward_for_q.reshape(critic_horizon * B, -1)
+        q_obs_target_flat = obs_target.reshape(critic_horizon * B, -1)
+
+        with torch.no_grad():
+            a_target = self.model.pi(
+                q_obs_target_flat, target=True, deterministic=True)
+            q_target_val = q_reward_flat + self.discount * self.model.Q_value(
+                q_obs_target_flat, a_target, target=True)
+
+        q_pred_all = self.model.Q_value(
+            q_obs_flat, q_action_flat, target=False, return_type='all')
+        q_target = q_target_val.expand_as(q_pred_all)
         q_loss_per_sample = F.mse_loss(
             q_pred_all, q_target, reduction='none'
-        ).mean(dim=(0, 2))
-        q_loss = self._weighted_mean(q_loss_per_sample, sample_weight)
+        ).reshape(self.model.num_q, critic_horizon, B, -1).mean(dim=(0, 3))
+        q_loss = self._weighted_mean(q_loss_per_sample.transpose(0, 1), sample_weight)
 
-        z_for_q = zs[-1]
-        obs_for_arrival_q = obs[self.history_horizon]
-        obs_target = obs[self.history_horizon + H-1]
-        a_for_q = action[self.history_horizon+ H-1]
-        # Sample target action from raw obs; evaluate it with raw target obs
-        # with torch.no_grad():
-        #     a_target = self.model.pi(obs_target, target=True, deterministic=True)
-
-        q_target_val = self.model.Q_value(
-            obs_target, a_for_q, target=False
-        )
-        arrival_q_pred = self.model.arrival_Q_value(
-            z_for_q, a_for_q, obs_for_arrival_q, return_type='weighted')
-        arrival_q_target = q_target_val.detach()
-        arrival_q_weighted_loss = F.mse_loss(
-            arrival_q_pred, arrival_q_target, reduction='none'
-        ).mean(dim=-1)
-
-
-        arrival_q_loss_per_sample = arrival_q_weighted_loss
-        arrival_q_loss = self._weighted_mean(
-            arrival_q_loss_per_sample, sample_weight
-        )
         # Normalise
         consistency_loss = consistency_loss / H
         reward_loss = reward_loss / H
-        value_loss = q_loss + arrival_q_loss
+        value_loss = q_loss
 
         total_loss = (
             self.consistency_coef * consistency_loss
@@ -939,8 +934,8 @@ class SSMAgent:
         )
         self.model_optim.step()
 
-        # ---- Update policy from raw observations; critic also uses raw observations ----
-        pi_loss = self.update_pi(obs[self.history_horizon], sample_weight)
+        # ---- Update policy against the same concave Q parameterization ----
+        pi_loss = self.update_pi(obs[0], sample_weight)
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()
@@ -952,7 +947,6 @@ class SSMAgent:
             'reward_loss': float(reward_loss.item()),
             'value_loss': float(value_loss.item()),
             'q_loss': float(q_loss.item()),
-            'arrival_q_loss': float(arrival_q_loss.item()),
             'pi_loss': pi_loss,
             'total_loss': float(total_loss.item()),
             'grad_norm': float(grad_norm),
@@ -960,6 +954,7 @@ class SSMAgent:
             'sample_weight_mean': float(sample_weight.mean().item()),
             'sample_weight_min': float(sample_weight.min().item()),
             'sample_weight_max': float(sample_weight.max().item()),
+            'critic_horizon': float(critic_horizon),
             'skipped_update': 0.0,
             'nonfinite_batch': 0.0,
             'nonfinite_loss': 0.0,

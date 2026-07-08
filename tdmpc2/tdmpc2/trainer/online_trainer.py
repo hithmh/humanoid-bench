@@ -142,6 +142,7 @@ class OnlineTrainer(Trainer):
                             reward_preds["actual_rewards"],
                             reward_preds["predicted_rewards"],
                             step=self._step,
+                            trajectory_length=self.cfg.horizon,
                             save_dir=self.logger._log_dir
                             if hasattr(self.logger, "_log_dir")
                             else None,

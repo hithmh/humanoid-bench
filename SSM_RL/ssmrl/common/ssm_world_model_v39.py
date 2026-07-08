@@ -253,11 +253,8 @@ class SSMWorldModel(nn.Module):
 
         # ---- Concave softplus arrival Q-function for MPC arrival cost ----
         # Q_arr(z, u) = W1 softplus(W2 z + W3 u + b1) + b2, with W1 <= 0.
-        self.arrival_hidden_dim = int(getattr(
-            cfg, 'arrival_softplus_hidden_dim',
-            getattr(cfg, 'arrival_relu_hidden_dim', self.reward_hidden_dim)))
-        self.arrival_softplus_beta = float(getattr(
-            cfg, 'arrival_softplus_beta', self.reward_softplus_beta))
+        self.arrival_hidden_dim = self.reward_hidden_dim
+        self.arrival_softplus_beta = self.reward_softplus_beta
         arrival_init = float(getattr(
             cfg, 'arrival_softplus_weight_init',
             getattr(cfg, 'arrival_relu_weight_init', reward_init)))

@@ -164,7 +164,7 @@ class OnlineTrainer(Trainer):
                     num_updates = self.cfg.seed_steps
                     print("Pretraining agent on seed data...")
                 else:
-                    num_updates = 1
+                    num_updates = self.cfg.num_updates
                 for _ in range(num_updates):
                     _train_metrics = self.agent.update(self.buffer)
                 train_metrics.update(_train_metrics)
@@ -178,6 +178,7 @@ class OnlineTrainer(Trainer):
                             reward_preds['actual_rewards'],
                             reward_preds['predicted_rewards'],
                             step=self._step,
+                            trajectory_length=self.cfg.horizon,
                             save_dir=self.logger._log_dir if hasattr(self.logger, '_log_dir') else None
                         )
                     except Exception as e:

@@ -929,7 +929,7 @@ class SSMAgent:
         self.model_optim.step()
 
         # ---- Update policy from raw observations; critic also uses raw observations ----
-        pi_loss = self.update_pi(obs[self.history_horizon], sample_weight)
+        pi_loss = self.update_pi(obs[0], sample_weight)
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()

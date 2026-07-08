@@ -3,9 +3,9 @@ SSM Agent v40- transformer-conditioned SSM-RL with JAX/qpax MPC.
 
 This agent wraps ``SSMWorldModel`` and provides both model learning and
 inference-time control. During inference, recent state/action history is used
-by ``encode_context`` to produce local linear SSM parameters, reconstruction
-matrix ``C``, reward quadratics, and critic context. Until enough history is
-available, or if the QP solver fails, actions come from the learned policy.
+by ``encode_context`` to produce local linear SSM parameters, reward ReLU
+parameters, and critic context. Until enough history is available, or if the
+QP solver fails, actions come from the learned policy.
 
 MPC controller:
   * The finite-horizon control problem is assembled in JAX and JIT-compiled.
@@ -15,8 +15,8 @@ MPC controller:
       z_{t+1} = A_t ... A_0 z_0 + T_u[t] @ U_flat
   * Per-step action bounds and reward epigraph constraints are encoded as
     inequalities ``G x <= h``.
-  * The stage reward is a concave ReLU network represented in MPC with
-    epigraph variables, while the terminal Q cost remains quadratic.
+  * The stage reward and terminal arrival Q are concave ReLU networks
+    represented in MPC with epigraph variables.
   * Training-time exploration samples dynamics parameters from the A/B
     ensemble mean plus Gaussian noise times ensemble standard deviation, then
     adds policy-standard-deviation action noise after planning.
@@ -25,7 +25,7 @@ MPC controller:
 QP form passed to ``qpax``:
   min   0.5 * x^T Q_qp x + c_qp^T x
   s.t.  G x <= h
-  where x = [U_flat, reward_relu_epigraphs]
+  where x = [U_flat, reward_relu_epigraphs, arrival_q_relu_epigraphs]
 
 Training loop:
   sample replay buffer -> encode context -> latent rollout -> optimize
@@ -90,7 +90,7 @@ class SSMAgent:
             {'params': self.model.reward_head_parameters()},
             {'params': self.model._q_func.parameters(),
              'lr': lr * critic_lr_scale},
-            {'params': self.model._arrival_q.parameters(),
+            {'params': self.model.arrival_head_parameters(),
              'lr': lr * critic_lr_scale},
         ], lr=lr, weight_decay=self.l2_regularizer)
 
@@ -266,13 +266,14 @@ class SSMAgent:
         reward_b2_t = reward_b2_seq[0]             # (H, 1), constant for MPC
         z_t = z[0]                                 # (D,)
 
-        P_diag, p_vec, pb_vec, Rc_diag, rc_vec = self.model.arrival_Q_params(
-            encoder_in, target=False)
-        P_diag_t  = P_diag[0]            # (D,)
-        p_vec_t   = p_vec[0]             # (D,)
-        pb_vec_t  = pb_vec[0]            # ()
-        Rc_diag_t = Rc_diag[0]           # (nU,)
-        rc_vec_t  = rc_vec[0]            # (nU,)
+        (arrival_w1, arrival_w2, arrival_w3, arrival_b1,
+         _arrival_b2, _arrival_head_idx, _arrival_weights) = (
+            self.model.sample_arrival_Q_params(obs_t, target=False)
+        )
+        arrival_alpha_t = -arrival_w1[0]       # (K_arr,), positive cost weight
+        arrival_w2_t = arrival_w2[0]           # (K_arr, D)
+        arrival_w3_t = arrival_w3[0]           # (K_arr, nU)
+        arrival_b1_t = arrival_b1[0]           # (K_arr,)
 
         self.qpax_solver_attempts += 1
         input_tensors = {
@@ -284,11 +285,10 @@ class SSMAgent:
             'reward_w3': reward_w3_t,
             'reward_b1': reward_b1_t,
             'reward_b2': reward_b2_t,
-            'P_arrival': P_diag_t,
-            'p_arrival': p_vec_t,
-            'pb_arrival': pb_vec_t,
-            'Rc_arrival': Rc_diag_t,
-            'rc_arrival': rc_vec_t,
+            'arrival_alpha': arrival_alpha_t,
+            'arrival_w2': arrival_w2_t,
+            'arrival_w3': arrival_w3_t,
+            'arrival_b1': arrival_b1_t,
         }
         bad_inputs = [name for name, tensor in input_tensors.items()
                       if not torch.isfinite(tensor).all().item()]
@@ -327,11 +327,10 @@ class SSMAgent:
                 to_jax(reward_w2_t),
                 to_jax(reward_w3_t),
                 to_jax(reward_b1_t),
-                to_jax(P_diag_t),
-                to_jax(p_vec_t),
-                to_jax(pb_vec_t),
-                to_jax(Rc_diag_t),
-                to_jax(rc_vec_t),
+                to_jax(arrival_alpha_t),
+                to_jax(arrival_w2_t),
+                to_jax(arrival_w3_t),
+                to_jax(arrival_b1_t),
                 self._a_low_jax,
                 self._a_high_jax,
             )
@@ -366,20 +365,20 @@ class SSMAgent:
 
             z_{t+1} = A_t ... A_0 z_0   +   T_u[t] @ U_flat
 
-        Substituting into the reward ReLU pre-activations keeps each
-        pre-activation affine in U_flat. The concave stage reward is handled
-        by epigraph variables y:
+        Substituting into the reward and arrival-Q ReLU pre-activations keeps
+        each pre-activation affine in U_flat. The concave stage reward and
+        terminal arrival Q are handled by epigraph variables y:
 
             y_t >= W2 z_t + W3 u_t + b1
             y_t >= 0
 
-        The QP decision vector is x = [U_flat, y_flat].
+        The QP decision vector is x = [U_flat, reward_y_flat, arrival_y].
             min   1/2 x^T Q_qp x + c_qp^T x
             s.t.  G x <= h
 
         Stage reward:  r(z_t, u_t) = W1 ReLU(W2 z_t + W3 u_t + b1) + b2,
         with W1 <= 0. Equivalently, -r has non-negative linear weights on y.
-        Terminal cost (Q-value): Q(z_H, u_H) from the quadratic arrival Q-function.
+        Terminal arrival Q uses the same concave ReLU epigraph form.
         """
         D   = self.latent_dim
         nU  = self.act_dim
@@ -393,8 +392,7 @@ class SSMAgent:
 
         def _build_and_solve(z0, A_seq, B_seq,
                              reward_alpha, reward_w2, reward_w3, reward_b1,
-                             P_diag, p_vec, pb,
-                             Rc_diag, rc_vec,
+                             arrival_alpha, arrival_w2, arrival_w3, arrival_b1,
                              a_low, a_high):
             """
             Args
@@ -406,11 +404,10 @@ class SSMAgent:
             reward_w2   : (H, K, D)  latent reward hidden weights
             reward_w3   : (H, K, nU) action reward hidden weights
             reward_b1   : (H, K)     reward hidden bias
-            P_diag      : (D,)       diagonal terminal state-cost coefficients
-            p_vec       : (D,)       linear terminal state-cost coefficients
-            pb          : ()         terminal critic bias (constant for QP)
-            Rc_diag     : (nU,)      diagonal terminal action-cost coefficients
-            rc_vec      : (nU,)      linear terminal action-cost coefficients
+            arrival_alpha: (K_arr,)   non-negative weights for -arrival-Q epigraph cost
+            arrival_w2  : (K_arr, D)  latent arrival hidden weights
+            arrival_w3  : (K_arr, nU) action arrival hidden weights
+            arrival_b1  : (K_arr,)    arrival hidden bias
             a_low       : (nU,)      per-dim action lower bound
             a_high      : (nU,)      per-dim action upper bound
 
@@ -420,7 +417,9 @@ class SSMAgent:
             converged : bool
             """
             K = reward_alpha.shape[1]
-            n_y = H * K
+            K_arr = arrival_alpha.shape[0]
+            n_reward_y = H * K
+            n_y = n_reward_y + K_arr
             n = n_u + n_y
 
             # ----------------------------------------------------------
@@ -475,23 +474,12 @@ class SSMAgent:
                 # the optimizer and are omitted from the QP objective.
                 c_qp = c_qp.at[s_y:e_y].add((discount ** t) * reward_alpha[t])
 
-            # Terminal arrival cost from the quadratic Q-function.
-            Tu_H = T_u_list[H - 1]   # (D, n_u)
-            f_H = f_list[H - 1]      # (D,)
-
-            PTu = P_diag[:, None] * Tu_H
-            Q_qp = Q_qp.at[:n_u, :n_u].add(
-                (discount ** H) * 2.0 * (Tu_H.T @ PTu))
-            c_qp = c_qp.at[:n_u].add(
-                (discount ** H) * (2.0 * (PTu.T @ f_H) + Tu_H.T @ p_vec))
-
-            s_u_H = (CH - 1) * nU
-            e_u_H = CH * nU
-
-            Q_qp = Q_qp.at[s_u_H:e_u_H, s_u_H:e_u_H].add(
-                (discount ** H) * 2.0 * jnp.diag(Rc_diag))
-            c_qp = c_qp.at[s_u_H:e_u_H].add(
-                (discount ** H) * rc_vec)
+            # Terminal arrival-Q value contributes -Q to the minimization
+            # objective, using a ReLU epigraph just like the stage reward.
+            s_arr_y = n_u + n_reward_y
+            e_arr_y = s_arr_y + K_arr
+            c_qp = c_qp.at[s_arr_y:e_arr_y].add(
+                (discount ** H) * arrival_alpha)
 
             if qp_diag_reg > 0.0:
                 Q_qp = Q_qp + qp_diag_reg * jnp.eye(n)
@@ -529,6 +517,25 @@ class SSMAgent:
 
                 G_parts.extend([relu_row, nonneg_row])
                 h_parts.extend([relu_rhs, jnp.zeros(K)])
+
+            Tu_H = T_u_list[H - 1]
+            f_H = f_list[H - 1]
+            s_u_H = (CH - 1) * nU
+            e_u_H = CH * nU
+
+            arrival_u = arrival_w2 @ Tu_H
+            arrival_u = arrival_u.at[:, s_u_H:e_u_H].add(arrival_w3)
+            arrival_row = jnp.zeros((K_arr, n))
+            arrival_row = arrival_row.at[:, :n_u].set(arrival_u)
+            arrival_row = arrival_row.at[:, s_arr_y:e_arr_y].set(-jnp.eye(K_arr))
+            arrival_rhs = -(arrival_w2 @ f_H + arrival_b1)
+
+            arrival_nonneg_row = jnp.zeros((K_arr, n))
+            arrival_nonneg_row = arrival_nonneg_row.at[:, s_arr_y:e_arr_y].set(
+                -jnp.eye(K_arr))
+
+            G_parts.extend([arrival_row, arrival_nonneg_row])
+            h_parts.extend([arrival_rhs, jnp.zeros(K_arr)])
 
             G = jnp.concatenate(G_parts, axis=0)
             h = jnp.concatenate(h_parts, axis=0)
@@ -568,7 +575,7 @@ class SSMAgent:
             name: 0 for name in (
                 'z', 'A', 'B', 'reward_alpha', 'reward_w2',
                 'reward_w3', 'reward_b1', 'reward_b2',
-                'P_arrival', 'p_arrival', 'pb_arrival', 'Rc_arrival', 'rc_arrival',
+                'arrival_alpha', 'arrival_w2', 'arrival_w3', 'arrival_b1',
             )
         }
         self.qpax_last_failure_reason = 'none'
@@ -869,7 +876,7 @@ class SSMAgent:
                 reward_step, sample_weight
             ) * (self.rho ** t)
 
-        # ---- Value loss (scalar Q ensemble + quadratic arrival Q-function) ----
+        # ---- Value loss (scalar Q ensemble + weighted ReLU arrival Q ensemble) ----
         obs_for_q = obs[0]
         obs_target = obs[1]
         # Sample target action from raw obs; evaluate it with raw target obs
@@ -888,22 +895,26 @@ class SSMAgent:
         ).mean(dim=(0, 2))
         q_loss = self._weighted_mean(q_loss_per_sample, sample_weight)
 
-        z_for_q = self.model.encode(obs[self.history_horizon + H-1])
-        obs_target = obs[self.history_horizon + H]
+        z_for_q = zs[-1]
+        obs_for_arrival_q = obs[self.history_horizon]
+        obs_target = obs[self.history_horizon + H-1]
         a_for_q = action[self.history_horizon+ H-1]
         # Sample target action from raw obs; evaluate it with raw target obs
-        with torch.no_grad():
-            a_target = self.model.pi(obs_target, target=True, deterministic=True)
+        # with torch.no_grad():
+        #     a_target = self.model.pi(obs_target, target=True, deterministic=True)
 
-        q_target_val = reward[self.history_horizon + H-1] + self.discount * self.model.Q_value(
-            obs_target, a_target, target=False
+        q_target_val = self.model.Q_value(
+            obs_target, a_for_q, target=False
         )
         arrival_q_pred = self.model.arrival_Q_value(
-            z_for_q, a_for_q, encoder_in, target=False, return_type='all')
-        arrival_q_target = q_target_val.detach().expand_as(arrival_q_pred)
-        arrival_q_loss_per_sample = F.smooth_l1_loss(
+            z_for_q, a_for_q, obs_for_arrival_q, return_type='weighted')
+        arrival_q_target = q_target_val.detach()
+        arrival_q_weighted_loss = F.mse_loss(
             arrival_q_pred, arrival_q_target, reduction='none'
         ).mean(dim=-1)
+
+
+        arrival_q_loss_per_sample = arrival_q_weighted_loss
         arrival_q_loss = self._weighted_mean(
             arrival_q_loss_per_sample, sample_weight
         )
@@ -929,7 +940,7 @@ class SSMAgent:
         self.model_optim.step()
 
         # ---- Update policy from raw observations; critic also uses raw observations ----
-        pi_loss = self.update_pi(obs[self.history_horizon], sample_weight)
+        pi_loss = self.update_pi(obs[0], sample_weight)
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()

@@ -6,9 +6,8 @@ Implements a state-space model with:
   - Dense per-step linear dynamics: z' = A*z + B*u
   - Concave one-hidden-layer reward:
       r = W1 ReLU(W2 z + W3 u + b1) + b2, with W1 <= 0
-  - Ensemble Q-function conditioned on latent state and action
-  - Observation-weighted ensemble of concave one-hidden-layer ReLU arrival
-    Q-functions for MPC arrival cost
+  - Observation-weighted ensemble of concave one-hidden-layer ReLU
+    Q-functions over latent state and action, also used for MPC arrival cost
   - Raw-observation policy network (tanh-squashed)
 
 Follows the architecture of WorldModel in ssmrl/common/world_model.py.
@@ -102,9 +101,9 @@ class SSMWorldModel(nn.Module):
     * Dynamics are linear: z' = A*z + B*u  (dense A and B are mixed from
       learned basis matrices).
     * Reward is a learned concave network over latent state and action.
-    * Critic is a TD-MPC2-style ensemble over (raw observation, action).
-    * Arrival-cost critic is an observation-weighted ensemble of learned
-      concave ReLU networks over latent state and action.
+    * Critic is an observation-weighted ensemble of learned concave ReLU
+      networks over latent state and action. The same Q parameterization is
+      used for SAC-style updates and MPC arrival cost.
     * The policy consumes raw observations directly.
     """
 
@@ -134,7 +133,6 @@ class SSMWorldModel(nn.Module):
         self.state_dim = state_dim
         self.history_horizon = history_horizon
         self.num_ensembles = num_ensembles
-        self.num_q = num_q
         self.prediction_horizon = prediction_horizon
 
         # ---- Deterministic encoder: obs → latent (for world model) ----
@@ -223,42 +221,14 @@ class SSMWorldModel(nn.Module):
             self._pi_target_trunk, self._pi_target_mean_head, self._pi_target_log_std_head
         ])
 
-        # ---- Scalar Q-function ensemble ----
-        # Each head takes (raw obs, a) and outputs a scalar Q-value.
-        q_func_input_dim = state_dim + act_dim
-        q_func_output_dim = 1
-        critic_hidden = getattr(cfg, 'critic_struct', encoder_hidden)
-
-        # self._q_func = layers.Ensemble([
-        #     _mlp(
-        #         q_func_input_dim,
-        #         critic_hidden,
-        #         q_func_output_dim,
-        #     )
-        #     for _ in range(num_q)
-        # ])
-        self._q_func = layers.Ensemble(
-            [
-                layers.mlp(
-                    q_func_input_dim,
-                    2 * [cfg.mlp_dim],
-                    q_func_output_dim,
-                    dropout=cfg.dropout,
-                )
-                for _ in range(cfg.num_q)
-            ]
-        )
-        self._q_func_target = deepcopy(self._q_func)
-        for p in self._q_func_target.parameters():
-            p.requires_grad_(False)
-
-        # ---- Concave ReLU arrival Q-function ensemble for MPC arrival cost ----
-        # Q_arr(z, u | obs) = sum_e pi_e(obs) *
+        # ---- Concave ReLU Q-function ensemble for values and MPC arrival cost ----
+        # Q(z, u | obs) = sum_e pi_e(obs) *
         #     (W1_e ReLU(W2_e z + W3_e u + b1_e) + b2_e), with W1_e <= 0.
         self.arrival_hidden_dim = self.reward_hidden_dim
         self.num_arrival_q = int(getattr(
             cfg, 'num_arrival_q',
             getattr(cfg, 'arrival_q_num_ensembles', num_q)))
+        self.num_q = self.num_arrival_q
         arrival_init = float(getattr(
             cfg, 'arrival_relu_weight_init',
             getattr(cfg, 'arrival_softplus_weight_init', reward_init)))
@@ -278,6 +248,19 @@ class SSMWorldModel(nn.Module):
             output_act=nn.Softmax(dim=-1),
             dropout=getattr(cfg, 'dropout', 0.0),
         )
+        self._arrival_w1_raw_target = nn.Parameter(
+            self._arrival_w1_raw.detach().clone(), requires_grad=False)
+        self._arrival_w2_target = nn.Parameter(
+            self._arrival_w2.detach().clone(), requires_grad=False)
+        self._arrival_w3_target = nn.Parameter(
+            self._arrival_w3.detach().clone(), requires_grad=False)
+        self._arrival_b1_target = nn.Parameter(
+            self._arrival_b1.detach().clone(), requires_grad=False)
+        self._arrival_b2_target = nn.Parameter(
+            self._arrival_b2.detach().clone(), requires_grad=False)
+        self._arrival_q_weight_net_target = deepcopy(self._arrival_q_weight_net)
+        for p in self._arrival_q_weight_net_target.parameters():
+            p.requires_grad_(False)
 
 
     # ------------------------------------------------------------------
@@ -294,7 +277,7 @@ class SSMWorldModel(nn.Module):
         super().train(mode)
         for m in self._pi_target:
             m.train(False)
-        self._q_func_target.train(False)
+        self._arrival_q_weight_net_target.train(False)
         return self
 
     # ------------------------------------------------------------------
@@ -637,32 +620,23 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     def Q_value(self, obs, a, encoder_in=None, target=False, return_type='min'):
         """
-        Predict state-action value with a scalar Q ensemble.
+        Predict state-action value with the concave ReLU arrival-Q ensemble.
 
         Args:
             obs:        [batch, state_dim]
             a:          [batch, act_dim]
             encoder_in: ignored; kept for compatibility with older call sites
             target:     whether to use target network
-            return_type: 'min', 'avg', or 'all'
+            return_type: 'weighted', 'min', 'avg', or 'all'
         Returns:
             If 'min'/'avg': scalar Q value [batch, 1]
-            If 'all':       scalar Q values [num_q, batch, 1]
+            If 'weighted':  observation-weighted Q value [batch, 1]
+            If 'all':       scalar Q values [num_arrival_q, batch, 1]
         """
         if return_type is None:
             return_type = 'min'
-        assert return_type in {'min', 'avg', 'all'}
-
-        q_func = self._q_func_target if target else self._q_func
-        x = torch.cat([obs, a], dim=-1)  # [batch, state_dim + act_dim]
-        out = q_func(x)  # [num_q, batch, 1]
-
-        if return_type == 'all':
-            return out
-
-        if return_type == 'min':
-            return out.min(dim=0).values
-        return out.mean(dim=0)
+        z = self.encode(obs, target=target)
+        return self.arrival_Q_value(z, a, obs, target=target, return_type=return_type)
 
     # ------------------------------------------------------------------
     # ReLU Q-Function ensemble for MPC arrival cost
@@ -678,16 +652,25 @@ class SSMWorldModel(nn.Module):
             *self._arrival_q_weight_net.parameters(),
         ]
 
-    def arrival_Q_weights(self, observation_t):
+    def arrival_Q_weights(self, observation_t, target=False):
         """Return softmax weights over arrival-Q ensemble heads from observation_t."""
-        return self._arrival_q_weight_net(observation_t)
+        weight_net = self._arrival_q_weight_net_target if target else self._arrival_q_weight_net
+        return weight_net(observation_t)
 
-    def _arrival_Q_base_params(self, device=None, dtype=None):
-        w1 = -F.softplus(self._arrival_w1_raw)
-        w2 = self._arrival_w2
-        w3 = self._arrival_w3
-        b1 = self._arrival_b1
-        b2 = self._arrival_b2
+    def _arrival_Q_base_params(self, target=False, device=None, dtype=None):
+        if target:
+            w1_raw = self._arrival_w1_raw_target
+            w2 = self._arrival_w2_target
+            w3 = self._arrival_w3_target
+            b1 = self._arrival_b1_target
+            b2 = self._arrival_b2_target
+        else:
+            w1_raw = self._arrival_w1_raw
+            w2 = self._arrival_w2
+            w3 = self._arrival_w3
+            b1 = self._arrival_b1
+            b2 = self._arrival_b2
+        w1 = -F.softplus(w1_raw)
         if device is not None or dtype is not None:
             w1 = w1.to(device=device, dtype=dtype)
             w2 = w2.to(device=device, dtype=dtype)
@@ -716,9 +699,9 @@ class SSMWorldModel(nn.Module):
             b2: [batch, 1]
         """
         batch_size = observation_t.shape[0]
-        weights = self.arrival_Q_weights(observation_t)
+        weights = self.arrival_Q_weights(observation_t, target=target)
         w1, w2, w3, b1, b2 = self._arrival_Q_base_params(
-            device=observation_t.device, dtype=observation_t.dtype)
+            target=target, device=observation_t.device, dtype=observation_t.dtype)
 
         weighted_w1 = weights[:, :, None] * w1[None]
         weighted_b2 = weights @ b2
@@ -750,10 +733,10 @@ class SSMWorldModel(nn.Module):
             head_idx: [batch], sampled ensemble head indices
             weights: [batch, num_arrival_q], sampling probabilities
         """
-        weights = self.arrival_Q_weights(observation_t)
+        weights = self.arrival_Q_weights(observation_t, target=target)
         head_idx = torch.multinomial(weights, num_samples=1).squeeze(-1)
         w1, w2, w3, b1, b2 = self._arrival_Q_base_params(
-            device=observation_t.device, dtype=observation_t.dtype)
+            target=target, device=observation_t.device, dtype=observation_t.dtype)
         return (
             w1[head_idx],
             w2[head_idx],
@@ -781,9 +764,9 @@ class SSMWorldModel(nn.Module):
             return_type = 'weighted'
         assert return_type in {'weighted', 'all', 'min', 'avg'}
 
-        weights = self.arrival_Q_weights(observation_t)
+        weights = self.arrival_Q_weights(observation_t, target=target)
         w1, w2, w3, b1, b2 = self._arrival_Q_base_params(
-            device=z.device, dtype=z.dtype)
+            target=target, device=z.device, dtype=z.dtype)
         preact = (
             torch.einsum('ekd,bd->bek', w2, z)
             + torch.einsum('eka,ba->bek', w3, a)
@@ -806,8 +789,6 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     def track_critic_grad(self, mode=True):
         """Enable / disable gradients for Q-function parameters."""
-        for p in self._q_func.parameters():
-            p.requires_grad_(mode)
         for p in self.arrival_head_parameters():
             p.requires_grad_(mode)
 
@@ -815,7 +796,7 @@ class SSMWorldModel(nn.Module):
     # Soft target updates
     # ------------------------------------------------------------------
     def soft_update_targets(self, tau=None):
-        """Polyak-average update of target encoder, Q-functions and target policy."""
+        """Polyak-average update of target encoder, Q-function and target policy."""
         if tau is None:
             tau = self.cfg.tau
         with torch.no_grad():
@@ -824,7 +805,17 @@ class SSMWorldModel(nn.Module):
                                  self._encoder_mean.parameters()):
                 p_tgt.data.lerp_(p.data, tau)
             # Q-function target
-            for p_tgt, p in zip(self._q_func_target.parameters(), self._q_func.parameters()):
+            arrival_target_pairs = [
+                (self._arrival_w1_raw_target, self._arrival_w1_raw),
+                (self._arrival_w2_target, self._arrival_w2),
+                (self._arrival_w3_target, self._arrival_w3),
+                (self._arrival_b1_target, self._arrival_b1),
+                (self._arrival_b2_target, self._arrival_b2),
+            ]
+            for p_tgt, p in arrival_target_pairs:
+                p_tgt.data.lerp_(p.data, tau)
+            for p_tgt, p in zip(self._arrival_q_weight_net_target.parameters(),
+                                self._arrival_q_weight_net.parameters()):
                 p_tgt.data.lerp_(p.data, tau)
             # Update all three policy heads
             pi_pairs = [
