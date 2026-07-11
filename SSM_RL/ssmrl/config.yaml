@@ -6,7 +6,7 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: -coef_r1e3_v1e0-two_layer_predictive_arrival
+exp_name: -coef_r1e3_c0-update_pi_zs_11071841
 #agent_name: SSM_agent_v15_const
 agent_name: SSM_agent_v42
 
@@ -17,16 +17,16 @@ eval_freq: 10000
 
 # training
 steps: 10_000_000
-device: auto
-replay_device: auto
+device: cuda
+replay_device: cpu
 batch_size: 256
 reward_coef: 1e3
 value_coef: 1e0
-consistency_coef: 0
+consistency_coef: 1e-3
 rho: 1.0
 lr: 3e-4
 num_updates: 1
-l2_regularizer: 1e-4
+l2_regularizer: 0
 enc_lr_scale: 0.3
 grad_clip_norm: 20
 tau: 0.01
@@ -73,7 +73,7 @@ mpc: true
 iterations: 6
 num_samples: 512
 horizon: 24
-control_horizon: 8
+control_horizon: 24
 min_std: 0.05
 max_std: 2
 temperature: 0.5
@@ -113,7 +113,7 @@ disable_wandb: false
 save_csv: true
 
 # misc
-save_video: true
+save_video: false
 save_agent: true
 seed: 1
 

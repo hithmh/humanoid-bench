@@ -118,7 +118,6 @@ class NormedLinear(nn.Linear):
 
 def mlp(in_dim, mlp_dims, out_dim, act=None, dropout=0.0):
     """
-    Basic building block of TD-MPC2.
     MLP with LayerNorm, Mish activations, and optionally dropout.
     """
     if isinstance(mlp_dims, int):

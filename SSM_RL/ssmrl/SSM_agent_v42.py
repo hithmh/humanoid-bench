@@ -12,6 +12,9 @@ MPC controller:
     and JIT-compiled.
   * A projected first-order optimizer solves over the stacked action sequence
     directly with box projection.
+  * The optimizer is initialized from a policy rollout through the local
+    predictive latent dynamics; stochastic policy actions are used during
+    training control and deterministic actions during evaluation.
   * Dense latent dynamics are analytically unrolled, eliminating equality
     dynamics constraints:
       z_{t+1} = A_t ... A_0 z_0 + T_u[t] @ U_flat
@@ -19,9 +22,8 @@ MPC controller:
   * The stage reward and terminal arrival Q are softplus networks. With signed
     output weights, minimizing their negation is generally nonconvex; the JAX
     projected Adam optimizer is a local smooth box-constrained solver.
-  * Training-time exploration samples dynamics parameters from the A/B
-    ensemble mean plus Gaussian noise times ensemble standard deviation, then
-    adds policy-standard-deviation action noise after planning.
+  * Training-time exploration uses stochastic policy rollout initialization
+    and adds policy-standard-deviation action noise after planning.
   * PyTorch tensors are passed to JAX through DLPack when the backends share a
     device, avoiding per-step NumPy conversion.
 
@@ -82,11 +84,9 @@ class SSMAgent:
         self.act_dim = self.model.act_dim
         self.state_dim = self.model.state_dim
         self.history_horizon = self.model.history_horizon
-        self.num_ensembles = self.model.num_ensembles
 
         # ---- Optimizers (following ssmrl.py pattern: model optim + pi optim) ----
         enc_lr_scale = getattr(cfg, 'enc_lr_scale', 0.3)
-        critic_lr_scale = getattr(cfg, 'critic_lr_scale', 0.1)
         lr = cfg.lr
         self.l2_regularizer = float(getattr(cfg, 'l2_regularizer', 0.0))
 
@@ -100,18 +100,13 @@ class SSMAgent:
             {'params': self.model._B_net.parameters()},
             {'params': [self.model._B_basis]},
             {'params': self.model.reward_head_parameters()},
-            {'params': self.model._q_func.parameters(),
-             'lr': lr * critic_lr_scale},
-            {'params': self.model.arrival_head_parameters(),
-             'lr': lr * critic_lr_scale},
+            {'params': self.model.arrival_head_parameters()},
         ], lr=lr, weight_decay=self.l2_regularizer)
 
 
-        # Group 2 - raw-observation policy trunk and action heads
+        # Group 2 - TD-MPC2-style latent policy prior
         self.pi_optim = torch.optim.Adam(
-            list(self.model._pi_trunk.parameters())
-            + list(self.model._pi_mean_head.parameters())
-            + list(self.model._pi_log_std_head.parameters()),
+            self.model._pi.parameters(),
             lr=lr, eps=1e-5, weight_decay=self.l2_regularizer
         )
 
@@ -133,12 +128,6 @@ class SSMAgent:
         self.entropy_coef = getattr(cfg, 'entropy_coef', 1e-4)
         self.rho = getattr(cfg, 'rho', 0.5)
         self.horizon = getattr(cfg, 'horizon', 3)
-
-        # Shift / scale for observation and action normalisation
-        self.shift = np.zeros(self.state_dim)
-        self.scale_obs = np.ones(self.state_dim)
-        self.shift_u = np.zeros(self.act_dim)
-        self.scale_u = np.ones(self.act_dim)
 
         # History buffers and episode-scoped control diagnostics
         self.state_history = []
@@ -178,24 +167,8 @@ class SSMAgent:
     def load(self, fp):
         """Load agent state dict."""
         state_dict = fp if isinstance(fp, dict) else torch.load(fp, weights_only=False)
-        missing, unexpected = self.model.load_state_dict(state_dict['model'], strict=False)
-        allowed_missing = {'_arrival_w4', '_arrival_b3'}
-        unexpected = list(unexpected)
-        disallowed_missing = [name for name in missing if name not in allowed_missing]
-        if disallowed_missing or unexpected:
-            raise RuntimeError(
-                f'Incompatible model state_dict. Missing={disallowed_missing}, '
-                f'unexpected={unexpected}'
-            )
+        self.model.load_state_dict(state_dict['model'])
 
-    # ------------------------------------------------------------------
-    # Shift / scale management
-    # ------------------------------------------------------------------
-    def set_shift_and_scale(self, shift, scale, shift_u, scale_u):
-        self.shift = np.asarray(shift, dtype=np.float32)
-        self.scale_obs = np.asarray(scale, dtype=np.float32)
-        self.shift_u = np.asarray(shift_u, dtype=np.float32)
-        self.scale_u = np.asarray(scale_u, dtype=np.float32)
 
     # ------------------------------------------------------------------
     # Inference
@@ -226,12 +199,12 @@ class SSMAgent:
 
         # Decide action
         if len(self._state_history_tensors) < self.history_horizon:
-            # Not enough history for transformer - use policy net on raw obs
-            u_norm = self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy()
+            # Not enough history for transformer - use policy net on latent state
+            u_norm = self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy()
         else:
             # Attempt JAX smooth convex planning
             u_norm = self._plan_convex(z, obs_t, eval_mode)
-        u_norm = self._sanitize_action(u_norm)
+        # u_norm = self._sanitize_action(u_norm)
         # Update history
         self._append_history(obs_np, obs_t, u_norm)
 
@@ -267,26 +240,52 @@ class SSMAgent:
         self._jax_has_cuda = False
         self._jax_mpc_cuda_disabled = True
         self._jax_mpc_cuda_disable_reason = str(reason)[:512]
-        self._mpc_warm_start = None
 
     def _append_history(self, obs_np: np.ndarray, obs_t: torch.Tensor,
                         action_np: np.ndarray):
-        if obs_np is not None:
-            self.state_history.append(np.asarray(obs_np, dtype=np.float32).copy())
-        self.action_history.append(np.asarray(action_np, dtype=np.float32).copy())
+        # if obs_np is not None:
+        #     self.state_history.append(np.asarray(obs_np, dtype=np.float32).copy())
+        # self.action_history.append(np.asarray(action_np, dtype=np.float32).copy())
         self._state_history_tensors.append(obs_t[0].detach().clone())
         self._action_history_tensors.append(
             torch.as_tensor(action_np, dtype=torch.float32, device=self.device).detach().clone())
 
-    def _rebuild_tensor_histories(self):
-        self._state_history_tensors = [
-            torch.as_tensor(x, dtype=torch.float32, device=self.device)
-            for x in self.state_history
-        ]
-        self._action_history_tensors = [
-            torch.as_tensor(u, dtype=torch.float32, device=self.device)
-            for u in self.action_history
-        ]
+    # def _rebuild_tensor_histories(self):
+    #     self._state_history_tensors = [
+    #         torch.as_tensor(x, dtype=torch.float32, device=self.device)
+    #         for x in self.state_history
+    #     ]
+    #     self._action_history_tensors = [
+    #         torch.as_tensor(u, dtype=torch.float32, device=self.device)
+    #         for u in self.action_history
+    #     ]
+
+    @torch.no_grad()
+    def _policy_rollout_mpc_init(self, z0: torch.Tensor, A_seq: torch.Tensor,
+                                 B_seq: torch.Tensor, eval_mode: bool):
+        """
+        Generate the MPC initial action sequence by rolling out pi through the
+        local predictive latent model.
+        """
+        z_roll = z0.view(1, -1)
+        a_low = torch.as_tensor(
+            self._a_low_np, dtype=z_roll.dtype, device=z_roll.device).view(1, -1)
+        a_high = torch.as_tensor(
+            self._a_high_np, dtype=z_roll.dtype, device=z_roll.device).view(1, -1)
+        actions = []
+        for t in range(self._control_horizon):
+            u = self.model.pi(z_roll, deterministic=eval_mode)
+            u = torch.nan_to_num(u, nan=0.0, posinf=1.0, neginf=-1.0)
+            u = torch.clamp(u, a_low, a_high)
+            actions.append(u[0])
+            dyn_t = min(t, A_seq.shape[0] - 1)
+            z_roll = self.model.next(
+                z_roll,
+                u,
+                A_seq[dyn_t].unsqueeze(0),
+                B_seq[dyn_t].unsqueeze(0),
+            )
+        return torch.stack(actions, dim=0)
 
     def _plan_convex(self, z: torch.Tensor, obs_t: torch.Tensor, eval_mode: bool):
         """
@@ -296,9 +295,9 @@ class SSMAgent:
         Returns:
             u_norm: normalised action, shape [act_dim]
         """
-        if (len(self._state_history_tensors) < self.history_horizon
-                or len(self._action_history_tensors) < self.history_horizon):
-            self._rebuild_tensor_histories()
+        # if (len(self._state_history_tensors) < self.history_horizon
+        #         or len(self._action_history_tensors) < self.history_horizon):
+        #     self._rebuild_tensor_histories()
         state_t = torch.stack(
             self._state_history_tensors[-self.history_horizon:], dim=0).unsqueeze(0)
         action_t = torch.stack(
@@ -311,8 +310,6 @@ class SSMAgent:
             state_t,
             action_t,
             obs_t,
-            sample_dynamics=not eval_mode,
-            dynamics_noise_scale=float(getattr(self.cfg, 'dynamics_ensemble_noise_scale', 1.0)),
         )
 
         # Extract single-sample tensors
@@ -327,7 +324,7 @@ class SSMAgent:
 
         (arrival_w1, arrival_w2, arrival_w3, arrival_w4,
          arrival_b1, arrival_b3, arrival_b2) = self.model.arrival_Q_params(
-            encoder_in, target=False)
+            encoder_in, target=False, return_type='first')
         arrival_w1_t = arrival_w1[0]      # (K2_arr,), signed output weight
         arrival_w2_t = arrival_w2[0]      # (K1_arr, D)
         arrival_w3_t = arrival_w3[0]      # (K1_arr, nU)
@@ -360,7 +357,14 @@ class SSMAgent:
             self._record_convex_failure('input_nonfinite', ','.join(bad_inputs))
             for name in bad_inputs:
                 self.convex_nonfinite_inputs[name] += 1
-            return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
+            return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
+
+        U_init_t = self._policy_rollout_mpc_init(
+            z_t, A_seq_t, B_seq_t, eval_mode)
+        if not torch.isfinite(U_init_t).all().item():
+            self._record_convex_failure('input_nonfinite', 'U_init')
+            self.convex_nonfinite_inputs['U_init'] += 1
+            return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
 
         def to_jax_cpu(t: torch.Tensor):
             return jax.device_put(t.detach().cpu().numpy(), self._jax_cpu_device)
@@ -388,14 +392,7 @@ class SSMAgent:
         try:
             z_jax = to_jax(z_t)
             A_jax = to_jax(A_seq_t)
-            U_init = self._mpc_warm_start
-            if U_init is None or U_init.shape != (self._control_horizon, self.act_dim):
-                U_init = jax.device_put(
-                    np.zeros((self._control_horizon, self.act_dim), dtype=np.float32),
-                    z_jax.device,
-                ).astype(z_jax.dtype)
-            else:
-                U_init = jax.device_put(U_init, z_jax.device).astype(z_jax.dtype)
+            U_init = jax.device_put(to_jax(U_init_t), z_jax.device).astype(z_jax.dtype)
             a_low_jax = jax.device_put(self._a_low_np, z_jax.device).astype(z_jax.dtype)
             a_high_jax = jax.device_put(self._a_high_np, z_jax.device).astype(z_jax.dtype)
             U_sol, converged = self._jax_solve_mpc(
@@ -418,24 +415,22 @@ class SSMAgent:
             )
             if not bool(converged):
                 self._record_convex_failure('nonconverged')
-                return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
+                return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
             u = np.asarray(U_sol[0], dtype=np.float32)   # first control step
             if not np.isfinite(u).all():
                 self._record_convex_failure('solution_nonfinite')
-                return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
-            self._mpc_warm_start = jnp.concatenate(
-                [U_sol[1:], U_sol[-1:]], axis=0)
+                return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
         except Exception as exc:
             if self._is_jax_cuda_error(exc):
                 self._disable_jax_cuda_mpc(exc)
             self._record_convex_failure('exception', exc)
-            return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
+            return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
 
         if not eval_mode:
-            std = self.model.get_pi_std(obs_t)[0]
+            std = self.model.get_pi_std(z)[0]
             epsilon = (std * torch.randn(self.act_dim, device=std.device)
                        ).detach().cpu().numpy()
-            u = u + epsilon
+            # u = u + epsilon
 
         return self._sanitize_action(u)
 
@@ -465,7 +460,6 @@ class SSMAgent:
         self._convex_adam_beta2 = float(getattr(self.cfg, 'mpc_convex_adam_beta2', 0.999))
         self._convex_adam_eps = float(getattr(self.cfg, 'mpc_convex_adam_eps', 1e-8))
         self._mpc_objective_convex = False
-        self._mpc_warm_start = None
 
         a_high = np.asarray(
             getattr(self.cfg, 'a_bound_high', np.ones(nU)), dtype=np.float32)
@@ -476,7 +470,7 @@ class SSMAgent:
 
         H = self.horizon
         CH = self._control_horizon
-        discount = self.discount
+        discount = 1
         beta_reward = self._softplus_beta_reward
         beta_arrival = self._softplus_beta_arrival
         action_l2 = self._convex_action_l2
@@ -509,8 +503,8 @@ class SSMAgent:
             arrival_preact2 = arrival_w4 @ arrival_hidden1 + arrival_b3
             cost = cost - (discount ** H) * jnp.sum(
                 arrival_w1 * _softplus(arrival_preact2, beta_arrival))
-            if action_l2 > 0.0:
-                cost = cost + action_l2 * jnp.sum(U * U)
+            # if action_l2 > 0.0:
+            #     cost = cost + action_l2 * jnp.sum(U * U)
             return cost
 
         value_and_grad = jax.value_and_grad(_objective)
@@ -570,7 +564,7 @@ class SSMAgent:
                 'reward_w3', 'reward_b1', 'reward_b2',
                 'arrival_w1', 'arrival_w2', 'arrival_w3',
                 'arrival_w4', 'arrival_b1', 'arrival_b3',
-                'arrival_b2',
+                'arrival_b2', 'U_init',
             )
         }
         self.convex_last_failure_reason = 'none'
@@ -642,48 +636,6 @@ class SSMAgent:
         })
         return metrics
 
-    def get_control_diagnostics(self):
-        return self.get_control_metrics()
-
-    def store_cached_control_info(self):
-        self._cached = copy.deepcopy({
-            'state_history': self.state_history,
-            'action_history': self.action_history,
-            'state_history_tensors': self._state_history_tensors,
-            'action_history_tensors': self._action_history_tensors,
-            'convex_diagnostics': self.get_control_diagnostics(),
-        })
-
-    def restore_control_info(self):
-        if hasattr(self, '_cached'):
-            self.state_history = self._cached['state_history']
-            self.action_history = self._cached['action_history']
-            self._state_history_tensors = self._cached.get('state_history_tensors', [])
-            self._action_history_tensors = self._cached.get('action_history_tensors', [])
-            if (len(self._state_history_tensors) != len(self.state_history)
-                    or len(self._action_history_tensors) != len(self.action_history)):
-                self._rebuild_tensor_histories()
-            self._reset_convex_diagnostics()
-            diagnostics = self._cached.get('convex_diagnostics')
-            if diagnostics is None:
-                self.convex_solver_failures = self._cached.get('convex_solver_failures', 0)
-                self.convex_solver_attempts = self.convex_solver_failures
-            else:
-                self.convex_solver_attempts = diagnostics.get('convex_solver_attempts', 0)
-                self.convex_solver_failures = diagnostics.get('convex_solver_failures', 0)
-                self.convex_solver_nonconverged = diagnostics.get('convex_solver_nonconverged', 0)
-                self.convex_solver_exceptions = diagnostics.get('convex_solver_exceptions', 0)
-                self.convex_solver_input_nonfinite = diagnostics.get('convex_solver_input_nonfinite', 0)
-                self.convex_solver_solution_nonfinite = diagnostics.get('convex_solver_solution_nonfinite', 0)
-                for name in self.convex_nonfinite_inputs:
-                    self.convex_nonfinite_inputs[name] = diagnostics.get(f'convex_nonfinite_{name}', 0)
-                self.convex_last_failure_reason = diagnostics.get('convex_last_failure_reason', 'none')
-                self.convex_last_exception_type = diagnostics.get('convex_last_exception_type', 'none')
-                self.convex_last_exception_message = diagnostics.get('convex_last_exception_message', '')
-                samples = diagnostics.get('convex_exception_samples', '')
-                self.convex_exception_samples = [s for s in samples.split(' | ') if s]
-        else:
-            print('No cached control info found.')
 
     # ------------------------------------------------------------------
     # Policy update (mirror SSMRL.update_pi)
@@ -694,77 +646,59 @@ class SSMAgent:
             sample_weight = sample_weight.unsqueeze(-1)
         return (per_sample_loss * sample_weight).mean()
 
-    def update_pi(self, obs0, sample_weight=None):
+    def update_pi(self, zs, sample_weight=None):
         """
-        Update policy using raw observations for both actor and critic.
+        Update policy from detached encoded observations.
 
         The gradient path is:
-            obs0 -> pi(obs0) -> action -> Q_value(obs0, action)
-        so policy parameters receive gradients through the action without using
-        the world-model encoder as the actor input.
+            obs0 -> encode(obs0).detach() -> pi(z) -> arrival_Q_value(z, action)
+        so policy parameters receive gradients through the action, while the
+        actor update does not backpropagate into the encoder.
 
         Args:
-            obs0:       [batch, state_dim]           raw observation for policy input
+            obs0:       [batch, state_dim]           raw observation for critic input
         Returns:
             pi_loss (float)
         """
         self.pi_optim.zero_grad(set_to_none=True)
         self.model.track_critic_grad(False)
 
-        # Sample action from policy at raw observation obs0
-        action, log_prob = self.model.pi(obs0, return_log_prob=True)  # [B, act_dim], [B, 1]
+        H = zs.size(0)
+        B = zs.size(1)
 
-        # Q value at (obs0, action) - critic grad frozen, actor grad flows via action
-        val = self.model.Q_value(obs0, action, target=False, return_type='avg')  # [B, 1]
+        z0 = zs.detach().view(-1, self.latent_dim)
+        action, log_prob = self.model.pi(z0, return_log_prob=True)  # [B, act_dim], [B, 1]
 
-        self.scale.update(val)
+        # Arrival Q at (z0, action) - critic grad frozen, actor grad flows via action.
+        val = self.model.arrival_Q_value(
+            z0, action, z0, target=False, return_type='avg')  # [B, 1]
+
+        self.scale.update(val.mean(0))
         val = self.scale(val)
 
         # SAC loss: maximise (Q - alpha * log_pi)
         pi_loss_per_sample = (self.entropy_coef * log_prob - val).squeeze(-1)
+        pi_loss_per_sample = pi_loss_per_sample.view(H, B, 1)
+        pi_loss_per_sample = pi_loss_per_sample.mean(dim=0)
+
         if sample_weight is None:
             pi_loss = pi_loss_per_sample.mean()
         else:
             pi_loss = self._weighted_mean(pi_loss_per_sample, sample_weight)
-        if not torch.isfinite(pi_loss):
-            self.pi_optim.zero_grad(set_to_none=True)
-            self.model.track_critic_grad(True)
-            return 0.0
+        # if not torch.isfinite(pi_loss):
+        #     self.pi_optim.zero_grad(set_to_none=True)
+        #     self.model.track_critic_grad(True)
+        #     return 0.0
 
         pi_loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            list(self.model._pi_trunk.parameters())
-            + list(self.model._pi_mean_head.parameters())
-            + list(self.model._pi_log_std_head.parameters()),
+            self.model._pi.parameters(),
             self.grad_clip_norm
         )
         self.pi_optim.step()
         self.model.track_critic_grad(True)
 
         return pi_loss.item()
-
-    # ------------------------------------------------------------------
-    # TD target (mirror SSMRL._td_target)
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def _td_target(self, next_z, next_obs, reward):
-        """
-        Compute TD target: r + gamma * V_target(next_obs).
-
-        Args:
-            next_z:     ignored; kept for compatibility with older call sites
-            next_obs:   [T, batch, state_dim]
-            reward:     [T, batch, 1]
-        Returns:
-            td_target: [T, batch, 1]
-        """
-        T, B, _ = next_obs.shape
-        obs_flat = next_obs.reshape(T * B, -1)
-        # Sample next action from target policy for Q(obs, a)
-        a_next = self.model.pi(obs_flat, target=True, deterministic=True)
-        next_val = self.model.Q_value(obs_flat, a_next, target=True, return_type='min')
-        next_val = next_val.view(T, B, 1)
-        return reward + self.discount * next_val
 
     # ------------------------------------------------------------------
     # Main update (mirror SSMRL.update)
@@ -811,10 +745,10 @@ class SSMAgent:
         action = action.to(self.device)
         reward = reward.to(self.device)
         sample_weight = sample_weight.to(self.device).view(-1)
-        if not (torch.isfinite(obs).all() and torch.isfinite(action).all()
-                and torch.isfinite(reward).all()
-                and torch.isfinite(sample_weight).all()):
-            return self._skipped_update_stats(nonfinite_batch=True)
+        # if not (torch.isfinite(obs).all() and torch.isfinite(action).all()
+        #         and torch.isfinite(reward).all()
+        #         and torch.isfinite(sample_weight).all()):
+        #     return self._skipped_update_stats(nonfinite_batch=True)
 
         H = self.horizon  # horizon
 
@@ -822,13 +756,6 @@ class SSMAgent:
         # sides of the prediction target.
 
         next_mean = self.model.encode(obs[1:])  # [H, B, D]
-        #     # Build encoder_in for target computation using history
-        #     ctx_state_tgt = obs[:self.history_horizon].permute(1, 0, 2)
-        #     ctx_action_tgt = action[:self.history_horizon].permute(1, 0, 2)
-        #     _, _, _, _, _, _, _, encoder_in = self.model.encode_context(
-        #         ctx_state_tgt, ctx_action_tgt, obs[self.history_horizon]
-        #     )
-        #     td_targets = self._td_target(next_mean, reward, encoder_in)
 
         # ---- Prepare for update ----
         self.model_optim.zero_grad(set_to_none=True)
@@ -883,59 +810,45 @@ class SSMAgent:
                 reward_step, sample_weight
             ) * (self.rho ** t)
 
-        # ---- Value loss (scalar Q ensemble + softplus arrival Q-function) ----
-        obs_for_q = obs[0]
-        obs_target = obs[1]
-        # Sample target action from raw obs; evaluate it with raw target obs
-        with torch.no_grad():
-            a_target = self.model.pi(obs_target, target=True, deterministic=True)
+        # ---- Value loss (arrival Q is the only Q-function) ----
+        q_loss = torch.tensor(0.0, device=self.device)
+        arrival_q_loss = torch.tensor(0.0, device=self.device)
+        encoder_in_target = encoder_in.detach()
+        encoded_zs = self.model.encode(obs)
+        for t in range(H+self.history_horizon):
+            z_for_q = encoded_zs[t]
+            a_for_q = action[t]
+            with torch.no_grad():
+                z_next = encoded_zs[t + 1].detach()
+                a_next = self.model.pi(z_next, deterministic=True)
+                q_next = self.model.arrival_Q_value(
+                    z_next, a_next, encoder_in_target,
+                    target=True, return_type='min')
+                q_target = reward[t] + self.discount * q_next
 
-        q_target_val = reward[0] + self.discount * self.model.Q_value(
-            obs_target, a_target, target=True
-        )
-        # Replay action for Q(obs, a)
-        a_for_q = action[0]
-        q_pred_all = self.model.Q_value(obs_for_q, a_for_q, target=False, return_type='all')
-        q_target = q_target_val.detach().expand_as(q_pred_all)
-        q_loss_per_sample = F.mse_loss(
-            q_pred_all, q_target, reduction='none'
-        ).mean(dim=(0, 2))
-        q_loss = self._weighted_mean(q_loss_per_sample, sample_weight)
-
-
-        z_for_q = zs[-2]
-        a_for_q = action[self.history_horizon+ H-1]
-
-        obs_target = obs[self.history_horizon + H-1]
-        # Sample target action from raw obs; evaluate it with raw target obs
-        # with torch.no_grad():
-        #     a_target = self.model.pi(obs_target, target=True, deterministic=True)
-        a_target = action[self.history_horizon + H-1]
-        q_target_val = self.model.Q_value(
-            obs_target, a_target, target=True
-        )
-        arrival_q_pred = self.model.arrival_Q_value(
-            z_for_q, a_for_q, encoder_in, target=False, return_type='all')
-        arrival_q_target = q_target_val.detach().expand_as(arrival_q_pred)
-        arrival_q_loss_per_sample = F.smooth_l1_loss(
-            arrival_q_pred, arrival_q_target, reduction='none'
-        ).mean(dim=-1)
-        arrival_q_loss = self._weighted_mean(
-            arrival_q_loss_per_sample, sample_weight
-        )
+            arrival_q_pred = self.model.arrival_Q_value(
+                z_for_q, a_for_q, encoder_in, target=False, return_type='all')
+            arrival_q_step = F.smooth_l1_loss(
+                arrival_q_pred, q_target.unsqueeze(0).expand_as(arrival_q_pred),
+                reduction='none'
+            ).mean(dim=(0, 2))
+            arrival_q_loss += self._weighted_mean(
+                arrival_q_step, sample_weight
+            ) * (self.rho ** t)
         # Normalise
         consistency_loss = consistency_loss / H
         reward_loss = reward_loss / H
-        value_loss = q_loss + arrival_q_loss
+        arrival_q_loss = arrival_q_loss / (H+self.history_horizon)
+        value_loss = arrival_q_loss
 
         total_loss = (
             self.consistency_coef * consistency_loss
             + self.reward_coef * reward_loss
             + self.value_coef * value_loss
         )
-        if not torch.isfinite(total_loss):
-            self.model_optim.zero_grad(set_to_none=True)
-            return self._skipped_update_stats(nonfinite_loss=True)
+        # if not torch.isfinite(total_loss):
+        #     self.model_optim.zero_grad(set_to_none=True)
+        #     return self._skipped_update_stats(nonfinite_loss=True)
 
         # ---- Backward & step (world model) ----
         total_loss.backward()
@@ -944,8 +857,9 @@ class SSMAgent:
         )
         self.model_optim.step()
 
-        # ---- Update policy from raw observations; critic also uses raw observations ----
-        pi_loss = self.update_pi(obs[self.history_horizon], sample_weight)
+        # ---- Update policy from detached latent states; critic still uses raw observations ----
+        pi_loss = self.update_pi(
+            encoded_zs, sample_weight)
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()

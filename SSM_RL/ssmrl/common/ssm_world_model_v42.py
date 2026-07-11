@@ -6,9 +6,8 @@ Implements a state-space model with:
   - Dense per-step linear dynamics: z' = A*z + B*u
   - One-hidden-layer softplus reward:
       r = W1 softplus(W2 z + W3 u + b1) + b2
-  - Ensemble Q-function conditioned on latent state and action
-  - Two-hidden-layer softplus arrival Q-function for MPC arrival cost
-  - Raw-observation policy network (tanh-squashed)
+  - Two-hidden-layer softplus arrival Q-function ensemble for MPC arrival cost
+  - Latent-state policy network (tanh-squashed)
 
 Follows the architecture of WorldModel in ssmrl/common/world_model.py.
 """
@@ -18,7 +17,7 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from ssmrl.common import math
 from ssmrl.common import layers
 
 
@@ -101,10 +100,9 @@ class SSMWorldModel(nn.Module):
     * Dynamics are linear: z' = A*z + B*u  (dense A and B are mixed from
       learned basis matrices).
     * Reward is a learned softplus network over latent state and action.
-    * Critic is a TD-MPC2-style ensemble over (raw observation, action).
-    * Arrival-cost critic is a learned softplus network over latent state
+    * Arrival critic is a learned softplus network ensemble over latent state
       and action.
-    * The policy consumes raw observations directly.
+    * The policy consumes latent states from the encoder.
     """
 
     def __init__(self, cfg):
@@ -116,10 +114,6 @@ class SSMWorldModel(nn.Module):
         act_dim = cfg.action_dim
         latent_dim = cfg.latent_dim
         history_horizon = getattr(cfg, 'history_horizon', 10)
-        num_ensembles = getattr(cfg, 'num_ensembles', 3)
-        num_q = int(getattr(cfg, 'num_q', num_ensembles))
-        encoder_hidden = getattr(cfg, 'encoder_struct', [256, 256])
-        policy_hidden = getattr(cfg, 'policy_struct', [256, 256])
         transformer_d_model = getattr(cfg, 'transformer_d_model', 128)
         transformer_num_heads = getattr(cfg, 'transformer_num_heads', 4)
         transformer_dff = getattr(cfg, 'transformer_dff', 512)
@@ -132,16 +126,10 @@ class SSMWorldModel(nn.Module):
         self.act_dim = act_dim
         self.state_dim = state_dim
         self.history_horizon = history_horizon
-        self.num_ensembles = num_ensembles
-        self.num_q = num_q
         self.prediction_horizon = prediction_horizon
 
         # ---- Deterministic encoder: obs → latent (for world model) ----
-        # self._encoder_mean = _mlp(state_dim, encoder_hidden, latent_dim)
         self._encoder_mean = layers.enc(cfg)
-        self._encoder_mean_target = deepcopy(self._encoder_mean)
-        for p in self._encoder_mean_target.parameters():
-            p.requires_grad_(False)
 
         # ---- Transformer context encoder ----
         self._transformer = TransformerContextEncoder(
@@ -158,24 +146,20 @@ class SSMWorldModel(nn.Module):
         ctx_dim = transformer_d_model + state_dim
         self._A_num_bases = int(getattr(cfg, 'dynamics_a_num_bases', 16))
         self._A_identity_scale = float(getattr(cfg, 'dynamics_a_identity_scale', 1.0))
-        self._A_scale = float(getattr(cfg, 'dynamics_a_scale', 0.05))
         a_basis_init = float(getattr(cfg, 'dynamics_a_basis_init', 0.01))
         self._B_num_bases = int(getattr(cfg, 'dynamics_b_num_bases', self._A_num_bases))
-        self._B_scale = float(getattr(cfg, 'dynamics_b_scale', 0.1))
         b_basis_init = float(getattr(cfg, 'dynamics_b_basis_init', a_basis_init))
-        # Each dynamics head predicts all ensemble heads in one output tensor.
-        # encode_context reduces that ensemble to a mean for training/eval, or
-        # mean plus scaled ensemble std for exploration.
+        # Each dynamics head predicts one coefficient sequence directly.
         self._A_net = layers.mlp(
             ctx_dim,
             2 * [cfg.mlp_dim],
-            num_ensembles * self._A_num_bases * prediction_horizon,
+            self._A_num_bases * prediction_horizon,
         )
         self._A_basis = nn.Parameter(torch.randn(self._A_num_bases, latent_dim, latent_dim) * a_basis_init)
         self._B_net = layers.mlp(
             ctx_dim,
             2 * [cfg.mlp_dim],
-            num_ensembles * self._B_num_bases * prediction_horizon,
+            self._B_num_bases * prediction_horizon,
         )
         self._B_basis = nn.Parameter(torch.randn(self._B_num_bases, latent_dim, act_dim) * b_basis_init)
 
@@ -189,73 +173,31 @@ class SSMWorldModel(nn.Module):
         self.reward_softplus_beta = float(getattr(cfg, 'reward_softplus_beta', 1.0))
         reward_init = float(getattr(
             cfg, 'reward_softplus_weight_init',
-            getattr(cfg, 'reward_relu_weight_init', 0.01)))
-        reward_w1_init = float(getattr(cfg, 'reward_w1_init', -0.126928011))
+            getattr(cfg, 'reward_relu_weight_init', 0.0)))
+        reward_w1_init = float(getattr(cfg, 'reward_w1_init', 0))
         self._reward_w1_raw = nn.Parameter(torch.full((self.reward_hidden_dim,), reward_w1_init))
         self._reward_w2 = nn.Parameter(torch.randn(self.reward_hidden_dim, latent_dim) * reward_init)
         self._reward_w3 = nn.Parameter(torch.randn(self.reward_hidden_dim, act_dim) * reward_init)
         self._reward_b1 = nn.Parameter(torch.zeros(self.reward_hidden_dim))
         self._reward_b2 = nn.Parameter(torch.zeros(1))
         # ---- Policy (SAC-style stochastic: outputs mean + log_std) ----
-        log_std_min = getattr(cfg, 'log_std_min', -5)
-        log_std_max = getattr(cfg, 'log_std_max', 2)
-        self._log_std_min = log_std_min
-        self._log_std_max = log_std_max
+        log_std_min = torch.tensor(getattr(cfg, 'log_std_min', -5), dtype=torch.float32)
+        log_std_max = torch.tensor(getattr(cfg, 'log_std_max', 2), dtype=torch.float32)
+        self.register_buffer('log_std_min', log_std_min, persistent=False)
+        self.register_buffer('log_std_dif', log_std_max - log_std_min, persistent=False)
 
-        # Raw-observation policy trunk -> mean head and log_std head
-        # self._pi_trunk = _mlp(state_dim, policy_hidden, policy_hidden[-1])
-        self._pi_trunk = layers.mlp(
-            state_dim,
+        self._pi = layers.mlp(
+            latent_dim,
             2 * [cfg.mlp_dim],
-            policy_hidden[-1],
+            2 * act_dim,
         )
-        self._pi_mean_head = nn.Linear(policy_hidden[-1], act_dim)
-        self._pi_log_std_head = nn.Linear(policy_hidden[-1], act_dim)
 
-        # Bundle into a single module list for easy deepcopy / param access
-        self._pi = nn.ModuleList([self._pi_trunk, self._pi_mean_head, self._pi_log_std_head])
-
-        # Target copies (used by pi_target for Bellman backup)
-        self._pi_target_trunk = deepcopy(self._pi_trunk).requires_grad_(False)
-        self._pi_target_mean_head = deepcopy(self._pi_mean_head).requires_grad_(False)
-        self._pi_target_log_std_head = deepcopy(self._pi_log_std_head).requires_grad_(False)
-        self._pi_target = nn.ModuleList([
-            self._pi_target_trunk, self._pi_target_mean_head, self._pi_target_log_std_head
-        ])
-
-        # ---- Scalar Q-function ensemble ----
-        # Each head takes (raw obs, a) and outputs a scalar Q-value.
-        q_func_input_dim = state_dim + act_dim
-        q_func_output_dim = 1
-        critic_hidden = getattr(cfg, 'critic_struct', encoder_hidden)
-
-        # self._q_func = layers.Ensemble([
-        #     _mlp(
-        #         q_func_input_dim,
-        #         critic_hidden,
-        #         q_func_output_dim,
-        #     )
-        #     for _ in range(num_q)
-        # ])
-        self._q_func = layers.Ensemble(
-            [
-                layers.mlp(
-                    q_func_input_dim,
-                    2 * [cfg.mlp_dim],
-                    q_func_output_dim,
-                    dropout=cfg.dropout,
-                )
-                for _ in range(cfg.num_q)
-            ]
-        )
-        self._q_func_target = deepcopy(self._q_func)
-        for p in self._q_func_target.parameters():
-            p.requires_grad_(False)
-
-        # ---- Two-layer softplus arrival Q-function for MPC arrival cost ----
+        # ---- Two-layer softplus arrival Q-function ensemble for MPC arrival cost ----
         # h1 = softplus(W2 z + W3 u + b1)
         # h2 = softplus(W4 h1 + b3)
         # Q_arr(z, u) = W1 h2 + b2.
+        self.num_arrival_q = max(1, int(getattr(
+            cfg, 'arrival_num_q', getattr(cfg, 'num_q', 2))))
         self.arrival_hidden_dim = self.reward_hidden_dim
         self.arrival_second_hidden_dim = int(getattr(
             cfg, 'arrival_second_hidden_dim', self.arrival_hidden_dim))
@@ -264,14 +206,40 @@ class SSMWorldModel(nn.Module):
             cfg, 'arrival_softplus_weight_init',
             getattr(cfg, 'arrival_relu_weight_init', reward_init)))
         arrival_w1_init = float(getattr(cfg, 'arrival_w1_init', reward_w1_init))
-        self._arrival_w1_raw = nn.Parameter(torch.full((self.arrival_second_hidden_dim,), arrival_w1_init))
-        self._arrival_w2 = nn.Parameter(torch.randn(self.arrival_hidden_dim, latent_dim) * arrival_init)
-        self._arrival_w3 = nn.Parameter(torch.randn(self.arrival_hidden_dim, act_dim) * arrival_init)
+        self._arrival_w1_raw = nn.Parameter(torch.full(
+            (self.num_arrival_q, self.arrival_second_hidden_dim),
+            arrival_w1_init))
+        self._arrival_w2 = nn.Parameter(
+            torch.randn(self.num_arrival_q, self.arrival_hidden_dim, latent_dim)
+            * arrival_init)
+        self._arrival_w3 = nn.Parameter(
+            torch.randn(self.num_arrival_q, self.arrival_hidden_dim, act_dim)
+            * arrival_init)
         self._arrival_w4 = nn.Parameter(
-            torch.randn(self.arrival_second_hidden_dim, self.arrival_hidden_dim) * arrival_init)
-        self._arrival_b1 = nn.Parameter(torch.zeros(self.arrival_hidden_dim))
-        self._arrival_b3 = nn.Parameter(torch.zeros(self.arrival_second_hidden_dim))
-        self._arrival_b2 = nn.Parameter(torch.zeros(1))
+            torch.randn(
+                self.num_arrival_q,
+                self.arrival_second_hidden_dim,
+                self.arrival_hidden_dim,
+            ) * arrival_init)
+        self._arrival_b1 = nn.Parameter(
+            torch.zeros(self.num_arrival_q, self.arrival_hidden_dim))
+        self._arrival_b3 = nn.Parameter(
+            torch.zeros(self.num_arrival_q, self.arrival_second_hidden_dim))
+        self._arrival_b2 = nn.Parameter(torch.zeros(self.num_arrival_q, 1))
+        self._arrival_w1_raw_target = nn.Parameter(
+            self._arrival_w1_raw.detach().clone(), requires_grad=False)
+        self._arrival_w2_target = nn.Parameter(
+            self._arrival_w2.detach().clone(), requires_grad=False)
+        self._arrival_w3_target = nn.Parameter(
+            self._arrival_w3.detach().clone(), requires_grad=False)
+        self._arrival_w4_target = nn.Parameter(
+            self._arrival_w4.detach().clone(), requires_grad=False)
+        self._arrival_b1_target = nn.Parameter(
+            self._arrival_b1.detach().clone(), requires_grad=False)
+        self._arrival_b3_target = nn.Parameter(
+            self._arrival_b3.detach().clone(), requires_grad=False)
+        self._arrival_b2_target = nn.Parameter(
+            self._arrival_b2.detach().clone(), requires_grad=False)
 
 
     # ------------------------------------------------------------------
@@ -286,9 +254,6 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     def train(self, mode=True):
         super().train(mode)
-        for m in self._pi_target:
-            m.train(False)
-        self._q_func_target.train(False)
         return self
 
     # ------------------------------------------------------------------
@@ -304,7 +269,7 @@ class SSMWorldModel(nn.Module):
         Returns:
             z   (same leading shape as obs, last dim = latent_dim)
         """
-        encoder = self._encoder_mean_target if target else self._encoder_mean
+        encoder = self._encoder_mean
         return encoder[self.cfg.obs](obs)
 
     def encode_context(
@@ -312,9 +277,6 @@ class SSMWorldModel(nn.Module):
         state_history,
         action_history,
         current_obs,
-        sample_dynamics=False,
-        dynamics_noise_scale=1.0,
-        return_dynamics_ensemble=False,
     ):
         """
         Run transformer on history and produce dynamics plus softplus
@@ -324,16 +286,9 @@ class SSMWorldModel(nn.Module):
             state_history:  [batch, history_horizon, state_dim]
             action_history: [batch, history_horizon, act_dim]
             current_obs:    [batch, state_dim]
-            sample_dynamics: if True, sample A/B basis weights as
-                             ensemble_mean + noise * ensemble_std
-            dynamics_noise_scale: multiplier on the ensemble std exploration noise
-            return_dynamics_ensemble: if True, return every A/B ensemble head
-                                      without mean/sample reduction
         Returns:
             A_seq:      [batch, prediction_horizon, latent_dim, latent_dim]
-                        or [batch, num_ensembles, prediction_horizon, latent_dim, latent_dim]
             B_seq:      [batch, prediction_horizon, latent_dim, act_dim]
-                        or [batch, num_ensembles, prediction_horizon, latent_dim, act_dim]
             reward_w1:  [batch, prediction_horizon, reward_hidden_dim] signed output weights
             reward_w2:  [batch, prediction_horizon, reward_hidden_dim, latent_dim]
             reward_w3:  [batch, prediction_horizon, reward_hidden_dim, act_dim]
@@ -346,30 +301,12 @@ class SSMWorldModel(nn.Module):
         encoder_in = torch.cat([transformer_out, current_obs], dim=-1)
 
         H = self.prediction_horizon
-        A_weights = self._dynamics_ensemble_weights(
-            self._A_net,
-            encoder_in,
-            self.num_ensembles,
-            H,
-            self._A_num_bases,
-            sample_dynamics,
-            dynamics_noise_scale,
-            return_dynamics_ensemble,
-        )
+        A_weights = self._dynamics_weights(self._A_net, encoder_in, H, self._A_num_bases)
         A_seq = self._basis_dynamics_matrix(
-            A_weights, self._A_basis, self._A_identity_scale, self._A_scale)
+            A_weights, self._A_basis)
 
-        B_weights = self._dynamics_ensemble_weights(
-            self._B_net,
-            encoder_in,
-            self.num_ensembles,
-            H,
-            self._B_num_bases,
-            sample_dynamics,
-            dynamics_noise_scale,
-            return_dynamics_ensemble,
-        )
-        B_seq = self._basis_matrix(B_weights, self._B_basis, self._B_scale)
+        B_weights = self._dynamics_weights(self._B_net, encoder_in, H, self._B_num_bases)
+        B_seq = self._basis_matrix(B_weights, self._B_basis)
 
         reward_params = self.reward_params(
             batch_size=encoder_in.shape[0],
@@ -381,54 +318,31 @@ class SSMWorldModel(nn.Module):
         return A_seq, B_seq, *reward_params, encoder_in
 
     @staticmethod
-    def _dynamics_ensemble_weights(
-        net,
-        encoder_in,
-        num_ensembles,
-        horizon,
-        num_bases,
-        sample_dynamics=False,
-        dynamics_noise_scale=1.0,
-        return_ensemble=False,
-    ):
-        """
-        Return basis weights from a multi-head predictor.
-
-        By default, the ensemble dimension is reduced before basis mixing so
-        eval uses the mean predicted weights and exploration can sample from
-        the empirical ensemble spread. Training can request all heads and apply
-        losses independently.
-        """
+    def _dynamics_weights(net, encoder_in, horizon, num_bases):
+        """Return single-head basis weights from a context predictor."""
         weight_flat = net(encoder_in)
-        weights = weight_flat.view(-1, num_ensembles, horizon, num_bases)
-        if return_ensemble:
-            return weights
-        mean = weights.mean(dim=1)
-        if sample_dynamics and num_ensembles > 1 and dynamics_noise_scale != 0.0:
-            std = weights.std(dim=1, unbiased=False)
-            return mean + float(dynamics_noise_scale) * torch.randn_like(mean) * std
-        return mean
+        return weight_flat.view(-1, horizon, num_bases)
 
     @staticmethod
-    def _basis_matrix(weights, basis, matrix_scale=1.0):
+    def _basis_matrix(weights, basis):
         """
         Mix learned dense basis matrices using bounded context coefficients.
 
         Args:
             weights: [..., horizon, num_bases] context-dependent coefficients
             basis: [num_bases, rows, cols] learned dense basis matrices
-            matrix_scale: non-negative scale applied to the mixed matrix
         Returns:
             [..., horizon, rows, cols] dense matrix sequence
         """
         num_bases = basis.shape[0]
         coeffs = torch.tanh(weights)
+        coeffs = nn.Softmax(dim=-1)(weights)
         bounded_basis = torch.tanh(basis)
-        mixed = torch.einsum('...k,kij->...ij', coeffs, bounded_basis) / (num_bases ** 0.5)
-        return matrix_scale * mixed
+        mixed = torch.einsum('...k,kij->...ij', coeffs, basis) #/ (num_bases ** 0.5)
+        return mixed
 
     @staticmethod
-    def _basis_dynamics_matrix(weights, basis, identity_scale=1.0, dynamics_scale=0.05):
+    def _basis_dynamics_matrix(weights, basis):
         """
         Mix learned dense basis matrices into bounded near-identity dynamics.
 
@@ -440,11 +354,8 @@ class SSMWorldModel(nn.Module):
         Returns:
             [..., horizon, dim, dim] dense dynamics matrices
         """
-        dim = basis.shape[-1]
-        eye = torch.eye(dim, device=weights.device, dtype=weights.dtype)
-        eye = eye.expand(*weights.shape[:-1], dim, dim)
         residual = SSMWorldModel._basis_matrix(weights, basis)
-        return identity_scale * eye + dynamics_scale * residual
+        return residual
 
     @staticmethod
     def _psd_from_raw_factor(raw):
@@ -557,106 +468,40 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     # Policy
     # ------------------------------------------------------------------
-    def pi(self, obs, target=False, deterministic=False, return_log_prob=False):
+    def pi(self, z, deterministic=False, return_log_prob=False):
         """
-        SAC-style stochastic policy over raw observations.
+        SAC-style stochastic policy over latent states.
 
         Samples action via reparameterisation: a = tanh(mean + std * eps).
         Log-probability accounts for the tanh squashing:
-            log pi(a|obs) = sum(log N(u; mean, std) - log(1 - tanh(u)^2))
+            log pi(a|z) = sum(log N(u; mean, std) - log(1 - tanh(u)^2))
 
         Args:
-            obs:             [..., state_dim]
-            target:          use target network weights
+            z:               [..., latent_dim]
             deterministic:   if True, return tanh(mean) (eval / MPC use)
-            return_log_prob: if True, also return log pi(a|obs)
+            return_log_prob: if True, also return log pi(a|z)
         Returns:
             action              [..., act_dim]           (always)
             log_prob (optional) [..., 1]
         """
-        trunk       = self._pi_target[0] if target else self._pi_trunk
-        mean_head   = self._pi_target[1] if target else self._pi_mean_head
-        log_std_head = self._pi_target[2] if target else self._pi_log_std_head
+        mean, log_std = self._pi(z).chunk(2, dim=-1)
+        log_std = math.log_std(log_std, self.log_std_min, self.log_std_dif)
+        eps = torch.zeros_like(mean) if deterministic else torch.randn_like(mean)
 
-        h = trunk(obs)
-        mean = mean_head(h)
-        log_std = log_std_head(h).clamp(self._log_std_min, self._log_std_max)
-        std = log_std.exp()
-
+        log_prob = math.gaussian_logprob(eps, log_std)
+        action = mean + eps * log_std.exp()
+        mean, action, log_prob = math.squash(mean, action, log_prob)
         if deterministic:
-            action = torch.tanh(mean)
-            if return_log_prob:
-                # log-prob at the deterministic point
-                log_prob = self._gaussian_log_prob(mean, mean, std)
-                return action, log_prob
-            return action
-
-        # Reparameterised sample
-        eps = torch.randn_like(std)
-        u = mean + std * eps                  # pre-squash
-        action = torch.tanh(u)
-
+            action = mean
         if return_log_prob:
-            log_prob = self._gaussian_log_prob(u, mean, std)
             return action, log_prob
         return action
 
-    def get_pi_std(self, obs, target=False):
+    def get_pi_std(self, z):
         """Helper to get policy std (for exploration diagnostics)."""
-        trunk       = self._pi_target[0] if target else self._pi_trunk
-        log_std_head = self._pi_target[2] if target else self._pi_log_std_head
-        h = trunk(obs)
-        log_std = log_std_head(h).clamp(self._log_std_min, self._log_std_max)
+        _, log_std = self._pi(z).chunk(2, dim=-1)
+        log_std = math.log_std(log_std, self.log_std_min, self.log_std_dif)
         return log_std.exp()
-
-    @staticmethod
-    def _gaussian_log_prob(u, mean, std):
-        """
-        Log prob of Gaussian with tanh squashing correction.
-            log pi(a|obs) = sum(log N(u; mu, sigma) - log(1 - tanh(u)^2))
-        Returns: [..., 1]
-        """
-        log_prob_gaussian = (
-            -0.5 * ((u - mean) / std).pow(2)
-            - std.log()
-            - 0.5 * torch.tensor(2 * torch.pi).log().to(u.device)
-        )
-        # Tanh squashing correction (numerically stable)
-        log_det_jacobian = 2.0 * (torch.log(torch.tensor(2.0, device=u.device))
-                                  - u - F.softplus(-2.0 * u))
-        return (log_prob_gaussian - log_det_jacobian).sum(dim=-1, keepdim=True)
-
-    # ------------------------------------------------------------------
-    # Q-Function ensemble
-    # ------------------------------------------------------------------
-    def Q_value(self, obs, a, encoder_in=None, target=False, return_type='min'):
-        """
-        Predict state-action value with a scalar Q ensemble.
-
-        Args:
-            obs:        [batch, state_dim]
-            a:          [batch, act_dim]
-            encoder_in: ignored; kept for compatibility with older call sites
-            target:     whether to use target network
-            return_type: 'min', 'avg', or 'all'
-        Returns:
-            If 'min'/'avg': scalar Q value [batch, 1]
-            If 'all':       scalar Q values [num_q, batch, 1]
-        """
-        if return_type is None:
-            return_type = 'min'
-        assert return_type in {'min', 'avg', 'all'}
-
-        q_func = self._q_func_target if target else self._q_func
-        x = torch.cat([obs, a], dim=-1)  # [batch, state_dim + act_dim]
-        out = q_func(x)  # [num_q, batch, 1]
-
-        if return_type == 'all':
-            return out
-
-        if return_type == 'min':
-            return out.min(dim=0).values
-        return out.mean(dim=0)
 
     # ------------------------------------------------------------------
     # Softplus Q-Function for MPC arrival cost
@@ -673,7 +518,19 @@ class SSMWorldModel(nn.Module):
             self._arrival_b2,
         ]
 
-    def arrival_Q_params(self, encoder_in, target=False):
+    def arrival_target_head_parameters(self):
+        """Return target-network parameters of the two-layer softplus arrival Q head."""
+        return [
+            self._arrival_w1_raw_target,
+            self._arrival_w2_target,
+            self._arrival_w3_target,
+            self._arrival_w4_target,
+            self._arrival_b1_target,
+            self._arrival_b3_target,
+            self._arrival_b2_target,
+        ]
+
+    def arrival_Q_params(self, encoder_in, target=False, return_type='first'):
         """
         Return two-layer softplus arrival Q parameters.
 
@@ -684,24 +541,41 @@ class SSMWorldModel(nn.Module):
 
         Args:
             encoder_in: [batch, ctx_dim], used for batch/device/dtype only
-            target:     kept for API compatibility
+            target:     whether to use target parameters
+            return_type: 'first' returns one head for MPC parameter extraction;
+                         'all' returns every ensemble head.
         Returns:
-            w1: [batch, arrival_second_hidden_dim], signed output weights
-            w2: [batch, arrival_hidden_dim, latent_dim]
-            w3: [batch, arrival_hidden_dim, act_dim]
-            w4: [batch, arrival_second_hidden_dim, arrival_hidden_dim]
-            b1: [batch, arrival_hidden_dim]
-            b3: [batch, arrival_second_hidden_dim]
-            b2: [batch, 1]
+            If return_type == 'first':
+                w1: [batch, arrival_second_hidden_dim], signed output weights
+                w2: [batch, arrival_hidden_dim, latent_dim]
+                w3: [batch, arrival_hidden_dim, act_dim]
+                w4: [batch, arrival_second_hidden_dim, arrival_hidden_dim]
+                b1: [batch, arrival_hidden_dim]
+                b3: [batch, arrival_second_hidden_dim]
+                b2: [batch, 1]
+            If return_type == 'all':
+                same tensors with leading [num_arrival_q, batch, ...].
         """
+        if return_type is None:
+            return_type = 'first'
+        assert return_type in {'first', 'all'}
         batch_size = encoder_in.shape[0]
-        w1 = self._arrival_w1_raw
-        w2 = self._arrival_w2
-        w3 = self._arrival_w3
-        w4 = self._arrival_w4
-        b1 = self._arrival_b1
-        b3 = self._arrival_b3
-        b2 = self._arrival_b2
+        if target:
+            w1 = self._arrival_w1_raw_target
+            w2 = self._arrival_w2_target
+            w3 = self._arrival_w3_target
+            w4 = self._arrival_w4_target
+            b1 = self._arrival_b1_target
+            b3 = self._arrival_b3_target
+            b2 = self._arrival_b2_target
+        else:
+            w1 = self._arrival_w1_raw
+            w2 = self._arrival_w2
+            w3 = self._arrival_w3
+            w4 = self._arrival_w4
+            b1 = self._arrival_b1
+            b3 = self._arrival_b3
+            b2 = self._arrival_b2
         w1 = w1.to(device=encoder_in.device, dtype=encoder_in.dtype)
         w2 = w2.to(device=encoder_in.device, dtype=encoder_in.dtype)
         w3 = w3.to(device=encoder_in.device, dtype=encoder_in.dtype)
@@ -709,13 +583,29 @@ class SSMWorldModel(nn.Module):
         b1 = b1.to(device=encoder_in.device, dtype=encoder_in.dtype)
         b3 = b3.to(device=encoder_in.device, dtype=encoder_in.dtype)
         b2 = b2.to(device=encoder_in.device, dtype=encoder_in.dtype)
-        w1 = w1.view(1, -1).expand(batch_size, -1)
-        w2 = w2.view(1, self.arrival_hidden_dim, self.latent_dim).expand(batch_size, -1, -1)
-        w3 = w3.view(1, self.arrival_hidden_dim, self.act_dim).expand(batch_size, -1, -1)
-        w4 = w4.view(1, self.arrival_second_hidden_dim, self.arrival_hidden_dim).expand(batch_size, -1, -1)
-        b1 = b1.view(1, -1).expand(batch_size, -1)
-        b3 = b3.view(1, -1).expand(batch_size, -1)
-        b2 = b2.view(1, 1).expand(batch_size, -1)
+        if return_type == 'first':
+            w1 = w1[0].view(1, -1).expand(batch_size, -1)
+            w2 = w2[0].view(1, self.arrival_hidden_dim, self.latent_dim).expand(batch_size, -1, -1)
+            w3 = w3[0].view(1, self.arrival_hidden_dim, self.act_dim).expand(batch_size, -1, -1)
+            w4 = w4[0].view(1, self.arrival_second_hidden_dim, self.arrival_hidden_dim).expand(batch_size, -1, -1)
+            b1 = b1[0].view(1, -1).expand(batch_size, -1)
+            b3 = b3[0].view(1, -1).expand(batch_size, -1)
+            b2 = b2[0].view(1, 1).expand(batch_size, -1)
+            return w1, w2, w3, w4, b1, b3, b2
+        w1 = w1.view(self.num_arrival_q, 1, -1).expand(-1, batch_size, -1)
+        w2 = w2.view(
+            self.num_arrival_q, 1, self.arrival_hidden_dim, self.latent_dim
+        ).expand(-1, batch_size, -1, -1)
+        w3 = w3.view(
+            self.num_arrival_q, 1, self.arrival_hidden_dim, self.act_dim
+        ).expand(-1, batch_size, -1, -1)
+        w4 = w4.view(
+            self.num_arrival_q, 1, self.arrival_second_hidden_dim,
+            self.arrival_hidden_dim,
+        ).expand(-1, batch_size, -1, -1)
+        b1 = b1.view(self.num_arrival_q, 1, -1).expand(-1, batch_size, -1)
+        b3 = b3.view(self.num_arrival_q, 1, -1).expand(-1, batch_size, -1)
+        b2 = b2.view(self.num_arrival_q, 1, 1).expand(-1, batch_size, -1)
         return w1, w2, w3, w4, b1, b3, b2
 
     def arrival_Q_value(self, z, a, encoder_in, target=False, return_type='min'):
@@ -727,32 +617,39 @@ class SSMWorldModel(nn.Module):
             a:          [batch, act_dim]
             encoder_in: [batch, ctx_dim]
             target:     whether to use the target network
-            return_type: kept for compatibility; all modes return the single Q
+            return_type: 'min', 'avg', or 'all' over ensemble heads.
         Returns:
-            Arrival Q value [batch, 1]
+            If 'min'/'avg': arrival Q value [batch, 1].
+            If 'all':       arrival Q values [num_arrival_q, batch, 1].
         """
-        w1, w2, w3, w4, b1, b3, b2 = self.arrival_Q_params(encoder_in, target=target)
+        if return_type is None:
+            return_type = 'min'
+        assert return_type in {'min', 'avg', 'all'}
+        w1, w2, w3, w4, b1, b3, b2 = self.arrival_Q_params(
+            encoder_in, target=target, return_type='all')
         preact1 = (
-            torch.bmm(w2, z.unsqueeze(-1)).squeeze(-1)
-            + torch.bmm(w3, a.unsqueeze(-1)).squeeze(-1)
+            torch.einsum('ebkd,bd->ebk', w2, z)
+            + torch.einsum('ebka,ba->ebk', w3, a)
             + b1
         )
         hidden1 = F.softplus(preact1, beta=self.arrival_softplus_beta)
-        preact2 = torch.bmm(w4, hidden1.unsqueeze(-1)).squeeze(-1) + b3
+        preact2 = torch.einsum('eblk,ebk->ebl', w4, hidden1) + b3
         hidden2 = F.softplus(preact2, beta=self.arrival_softplus_beta)
         value = (
             w1 * hidden2
         ).sum(dim=-1, keepdim=True) + b2
-        return value
+        if return_type == 'all':
+            return value
+        if return_type == 'avg':
+            return value.mean(dim=0)
+        return value.min(dim=0).values
 
 
     # ------------------------------------------------------------------
     # Gradient control helpers
     # ------------------------------------------------------------------
     def track_critic_grad(self, mode=True):
-        """Enable / disable gradients for Q-function parameters."""
-        for p in self._q_func.parameters():
-            p.requires_grad_(mode)
+        """Enable / disable gradients for arrival-Q parameters."""
         for p in self.arrival_head_parameters():
             p.requires_grad_(mode)
 
@@ -760,23 +657,12 @@ class SSMWorldModel(nn.Module):
     # Soft target updates
     # ------------------------------------------------------------------
     def soft_update_targets(self, tau=None):
-        """Polyak-average update of target encoder, Q-functions and target policy."""
+        """Polyak-average update of target encoder and arrival critic."""
         if tau is None:
             tau = self.cfg.tau
         with torch.no_grad():
-            # World model encoder target
-            for p_tgt, p in zip(self._encoder_mean_target.parameters(),
-                                 self._encoder_mean.parameters()):
+            # Arrival Q target
+            for p_tgt, p in zip(
+                    self.arrival_target_head_parameters(),
+                    self.arrival_head_parameters()):
                 p_tgt.data.lerp_(p.data, tau)
-            # Q-function target
-            for p_tgt, p in zip(self._q_func_target.parameters(), self._q_func.parameters()):
-                p_tgt.data.lerp_(p.data, tau)
-            # Update all three policy heads
-            pi_pairs = [
-                (self._pi_target_trunk,        self._pi_trunk),
-                (self._pi_target_mean_head,    self._pi_mean_head),
-                (self._pi_target_log_std_head, self._pi_log_std_head),
-            ]
-            for tgt_mod, src_mod in pi_pairs:
-                for p_tgt, p in zip(tgt_mod.parameters(), src_mod.parameters()):
-                    p_tgt.data.lerp_(p.data, tau)

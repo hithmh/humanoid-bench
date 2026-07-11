@@ -895,7 +895,7 @@ class SSMAgent:
         ).mean(dim=(0, 2))
         q_loss = self._weighted_mean(q_loss_per_sample, sample_weight)
 
-        z_for_q = zs[-1]
+        z_for_q = zs[-1].detach()
         obs_for_arrival_q = obs[self.history_horizon]
         obs_target = obs[self.history_horizon + H-1]
         a_for_q = action[self.history_horizon+ H-1]
