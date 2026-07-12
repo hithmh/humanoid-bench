@@ -1,36 +1,32 @@
 """
-SSM Agent v42- transformer-conditioned SSM-RL with JAX smooth MPC.
+SSM Agent v43- transformer-conditioned SSM-RL with JAX/qpax MPC.
 
 This agent wraps ``SSMWorldModel`` and provides both model learning and
 inference-time control. During inference, recent state/action history is used
-by ``encode_context`` to produce local linear SSM parameters, softplus
-reward parameters, and critic context. Until enough history is available, or
-if the MPC solver fails, actions come from the learned policy.
+by ``encode_context`` to produce local linear SSM parameters, reward
+parameters, and critic context. Until enough history is available, or if the
+QP solver fails, actions come from the learned policy.
 
 MPC controller:
-  * The finite-horizon control objective is assembled once as a JAX function
-    and JIT-compiled.
-  * A projected first-order optimizer solves over the stacked action sequence
-    directly with box projection.
-  * The optimizer is initialized from a policy rollout through the local
-    predictive latent dynamics; stochastic policy actions are used during
-    training control and deterministic actions during evaluation.
+  * The finite-horizon control problem is assembled in JAX and JIT-compiled.
+  * ``qpax`` solves the dense QP over the stacked action sequence and ReLU
+    epigraph variables.
   * Dense latent dynamics are analytically unrolled, eliminating equality
     dynamics constraints:
       z_{t+1} = A_t ... A_0 z_0 + T_u[t] @ U_flat
-  * Per-step action bounds are encoded as box constraints.
-  * The stage reward and terminal arrival Q are softplus networks. With signed
-    output weights, minimizing their negation is generally nonconvex; the JAX
-    projected Adam optimizer is a local smooth box-constrained solver.
-  * Training-time exploration uses stochastic policy rollout initialization
-    and adds policy-standard-deviation action noise after planning.
+  * Per-step action bounds and reward epigraph constraints are encoded as
+    inequalities ``G x <= h``.
+  * The stage reward and terminal arrival Q use the convex ReLU epigraph
+    parameterization from v40.
+  * Training-time exploration adds policy-standard-deviation action noise
+    after planning.
   * PyTorch tensors are passed to JAX through DLPack when the backends share a
     device, avoiding per-step NumPy conversion.
 
-MPC objective:
-  min_U -sum_t gamma^t w1_t^T softplus(W2_t z_t(U) + W3_t u_t + b1_t)
-        -gamma^H w1_H^T softplus(W4_H softplus(W2_H z_H(U) + W3_H u_H + b1_H) + b3_H)
-  s.t.  a_low <= u_t <= a_high
+QP form passed to ``qpax``:
+  min   0.5 * x^T Q_qp x + c_qp^T x
+  s.t.  G x <= h
+  where x = [U_flat, reward_relu_epigraphs, arrival_q_relu_epigraphs]
 
 Training loop:
   sample replay buffer -> encode context -> latent rollout -> optimize
@@ -46,6 +42,7 @@ import torch.nn.functional as F
 
 import jax
 import jax.numpy as jnp
+import qpax  # pip install qpax
 
 
 from ssmrl.common.ssm_world_model_v43 import SSMWorldModel
@@ -136,7 +133,7 @@ class SSMAgent:
         self._action_history_tensors = []
         self._reset_convex_diagnostics()
 
-        # Build JAX smooth MPC controller
+        # Build JAX + qpax MPC controller
         self._build_convex_controller()
 
     def _resolve_device(self, requested):
@@ -202,7 +199,7 @@ class SSMAgent:
             # Not enough history for transformer - use policy net on latent state
             u_norm = self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy()
         else:
-            # Attempt JAX smooth convex planning
+            # Attempt JAX/qpax convex planning
             u_norm = self._plan_convex(z, obs_t, eval_mode)
         # u_norm = self._sanitize_action(u_norm)
         # Update history
@@ -289,7 +286,7 @@ class SSMAgent:
 
     def _plan_convex(self, z: torch.Tensor, obs_t: torch.Tensor, eval_mode: bool):
         """
-        Solve the JAX smooth MPC problem. Falls back to the policy net on
+        Solve the JAX/qpax MPC problem. Falls back to the policy net on
         numerical failure or solver non-convergence.
 
         Returns:
@@ -315,61 +312,47 @@ class SSMAgent:
         # Extract single-sample tensors
         A_seq_t = A_seq[0]                         # (H, D, D)
         B_seq_t = B_seq[0]                         # (H, D, nU)
-        reward_w1_t = reward_w1_seq[0]             # (H, K), signed output weight
+        reward_alpha_t = -reward_w1_seq[0]         # (H, K), positive cost weight
         reward_w2_t = reward_w2_seq[0]             # (H, K, D)
         reward_w3_t = reward_w3_seq[0]             # (H, K, nU)
         reward_b1_t = reward_b1_seq[0]             # (H, K)
         reward_b2_t = reward_b2_seq[0]             # (H, 1), constant for MPC
         z_t = z[0]                                 # (D,)
 
-        (arrival_w1, arrival_w2, arrival_w3, arrival_w4,
-         arrival_b1, arrival_b3, arrival_b2) = self.model.arrival_Q_params(
+        (arrival_w1, arrival_w2, arrival_w3,
+         arrival_b1, arrival_b2) = self.model.arrival_Q_params(
             encoder_in, target=False, return_type='all')
         if eval_mode:
             arrival_head_idx = slice(None)
         else:
             idx = torch.randint(arrival_w1.shape[0], (1,), device=arrival_w1.device).item()
             arrival_head_idx = slice(idx, idx + 1)
-        arrival_w1_t = arrival_w1[arrival_head_idx, 0]  # (E_arr, K2_arr)
-        arrival_w2_t = arrival_w2[arrival_head_idx, 0]  # (E_arr, K1_arr, D)
-        arrival_w3_t = arrival_w3[arrival_head_idx, 0]  # (E_arr, K1_arr, nU)
-        arrival_w4_t = arrival_w4[arrival_head_idx, 0]  # (E_arr, K2_arr, K1_arr)
-        arrival_b1_t = arrival_b1[arrival_head_idx, 0]  # (E_arr, K1_arr)
-        arrival_b3_t = arrival_b3[arrival_head_idx, 0]  # (E_arr, K2_arr)
+        arrival_w1_t = arrival_w1[arrival_head_idx, 0]  # (E_arr, K_arr)
+        arrival_w2_t = arrival_w2[arrival_head_idx, 0]  # (E_arr, K_arr, D)
+        arrival_w3_t = arrival_w3[arrival_head_idx, 0]  # (E_arr, K_arr, nU)
+        arrival_b1_t = arrival_b1[arrival_head_idx, 0]  # (E_arr, K_arr)
         arrival_b2_t = arrival_b2[arrival_head_idx, 0]  # (E_arr, 1), constant for MPC
+        arrival_alpha_t = -arrival_w1_t.reshape(-1)
+        arrival_w2_t = arrival_w2_t.reshape(-1, self.latent_dim)
+        arrival_w3_t = arrival_w3_t.reshape(-1, self.act_dim)
+        arrival_b1_t = arrival_b1_t.reshape(-1)
 
         self.convex_solver_attempts += 1
         input_tensors = {
             'z': z_t,
             'A': A_seq_t,
             'B': B_seq_t,
-            'reward_w1': reward_w1_t,
+            'reward_alpha': reward_alpha_t,
             'reward_w2': reward_w2_t,
             'reward_w3': reward_w3_t,
             'reward_b1': reward_b1_t,
             'reward_b2': reward_b2_t,
-            'arrival_w1': arrival_w1_t,
+            'arrival_alpha': arrival_alpha_t,
             'arrival_w2': arrival_w2_t,
             'arrival_w3': arrival_w3_t,
-            'arrival_w4': arrival_w4_t,
             'arrival_b1': arrival_b1_t,
-            'arrival_b3': arrival_b3_t,
             'arrival_b2': arrival_b2_t,
         }
-        # bad_inputs = [name for name, tensor in input_tensors.items()
-        #               if not torch.isfinite(tensor).all().item()]
-        # if bad_inputs:
-        #     self._record_convex_failure('input_nonfinite', ','.join(bad_inputs))
-        #     for name in bad_inputs:
-        #         self.convex_nonfinite_inputs[name] += 1
-        #     return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
-
-        U_init_t = self._policy_rollout_mpc_init(
-            z_t, A_seq_t, B_seq_t, eval_mode)
-        if not torch.isfinite(U_init_t).all().item():
-            self._record_convex_failure('input_nonfinite', 'U_init')
-            self.convex_nonfinite_inputs['U_init'] += 1
-            return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
 
         def to_jax_cpu(t: torch.Tensor):
             return jax.device_put(t.detach().cpu().numpy(), self._jax_cpu_device)
@@ -396,25 +379,20 @@ class SSMAgent:
 
         try:
             z_jax = to_jax(z_t)
-            A_jax = to_jax(A_seq_t)
-            U_init = jax.device_put(to_jax(U_init_t), z_jax.device).astype(z_jax.dtype)
             a_low_jax = jax.device_put(self._a_low_np, z_jax.device).astype(z_jax.dtype)
             a_high_jax = jax.device_put(self._a_high_np, z_jax.device).astype(z_jax.dtype)
             U_sol, converged = self._jax_solve_mpc(
                 z_jax,
-                A_jax,
+                to_jax(A_seq_t),
                 to_jax(B_seq_t),
-                to_jax(reward_w1_t),
+                to_jax(reward_alpha_t),
                 to_jax(reward_w2_t),
                 to_jax(reward_w3_t),
                 to_jax(reward_b1_t),
-                to_jax(arrival_w1_t),
+                to_jax(arrival_alpha_t),
                 to_jax(arrival_w2_t),
                 to_jax(arrival_w3_t),
-                to_jax(arrival_w4_t),
                 to_jax(arrival_b1_t),
-                to_jax(arrival_b3_t),
-                U_init,
                 a_low_jax,
                 a_high_jax,
             )
@@ -440,128 +418,144 @@ class SSMAgent:
         return self._sanitize_action(u)
 
     # ------------------------------------------------------------------
-    # JAX smooth MPC controller
+    # JAX + qpax MPC controller
     # ------------------------------------------------------------------
     def _build_convex_controller(self):
         """
-        Build and JIT-compile the projected optimizer for smooth MPC.
+        Build and JIT-compile the JAX/qpax MPC solve function.
 
-        Dynamics are unrolled inside the objective. Signed W1 removes the
-        concavity guarantee, so this is generally a nonconvex smooth
-        box-constrained problem optimized locally with projected Adam.
+        Dynamics constraints are analytically eliminated by expressing the full
+        state trajectory as a linear map of the stacked control vector U_flat.
+        ReLU reward and arrival-Q terms are represented with epigraph
+        variables, matching the v40 convex QP parameterization.
         """
+        D   = self.latent_dim
         nU  = self.act_dim
-        self._control_horizon = max(
-            1, min(int(getattr(self.cfg, 'control_horizon', self.horizon)), self.horizon))
-        self._softplus_beta_reward = float(getattr(
-            self.cfg, 'reward_softplus_beta', 1.0))
-        self._softplus_beta_arrival = float(getattr(
-            self.cfg, 'arrival_softplus_beta', self._softplus_beta_reward))
-        self._convex_action_l2 = float(getattr(
-            self.cfg, 'mpc_convex_action_l2', 0.0))
-        self._convex_num_iters = int(getattr(self.cfg, 'mpc_convex_num_iters', 64))
-        self._convex_step_size = float(getattr(self.cfg, 'mpc_convex_step_size', 0.03))
-        self._convex_adam_beta1 = float(getattr(self.cfg, 'mpc_convex_adam_beta1', 0.9))
-        self._convex_adam_beta2 = float(getattr(self.cfg, 'mpc_convex_adam_beta2', 0.999))
-        self._convex_adam_eps = float(getattr(self.cfg, 'mpc_convex_adam_eps', 1e-8))
-        self._mpc_objective_convex = False
+        H   = self.horizon
+        CH  = H
+        discount = self.discount
 
+
+        self._control_horizon = CH
         a_high = np.asarray(
             getattr(self.cfg, 'a_bound_high', np.ones(nU)), dtype=np.float32)
         a_low = np.asarray(
             getattr(self.cfg, 'a_bound_low', -np.ones(nU)), dtype=np.float32)
         self._a_high_np = a_high
         self._a_low_np = a_low
+        self._mpc_objective_convex = True
 
-        H = self.horizon
-        CH = self._control_horizon
-        discount = 1
-        beta_reward = self._softplus_beta_reward
-        beta_arrival = self._softplus_beta_arrival
-        action_l2 = self._convex_action_l2
-        num_iters = self._convex_num_iters
-        step_size = self._convex_step_size
-        adam_beta1 = self._convex_adam_beta1
-        adam_beta2 = self._convex_adam_beta2
-        adam_eps = self._convex_adam_eps
+        def _build_and_solve(z0, A_seq, B_seq,
+                             reward_alpha, reward_w2, reward_w3, reward_b1,
+                             arrival_alpha, arrival_w2, arrival_w3, arrival_b1,
+                             a_low, a_high):
+            K = reward_alpha.shape[1]
+            K_arr = arrival_alpha.shape[0]
+            n_u = CH * nU
+            n_reward_y = H * K
+            n_y = n_reward_y + K_arr
+            n = n_u + n_y
 
-        def _softplus(x, beta):
-            return jax.nn.softplus(beta * x) / beta
+            f_list = []
+            T_u_list = []
+            for t in range(H):
+                A_cum = jnp.eye(D)
+                for s in range(t + 1):
+                    A_cum = A_seq[s] @ A_cum
+                f_list.append(A_cum @ z0)
 
-        def _objective(U, z0, A_seq, B_seq,
-                       reward_w1, reward_w2, reward_w3, reward_b1,
-                       arrival_w1, arrival_w2, arrival_w3, arrival_w4,
-                       arrival_b1, arrival_b3):
-            z = z0
-            cost = jnp.array(0.0, dtype=U.dtype)
+                T_u_t = jnp.zeros((D, n_u))
+                for k in range(CH):
+                    s_k = k * nU
+                    e_k = (k + 1) * nU
+                    if k < CH - 1:
+                        if k <= t:
+                            A_prod = jnp.eye(D)
+                            for s in range(k + 1, t + 1):
+                                A_prod = A_seq[s] @ A_prod
+                            T_u_t = T_u_t.at[:, s_k:e_k].set(A_prod @ B_seq[k])
+                    else:
+                        accum = jnp.zeros((D, nU))
+                        for j in range(CH - 1, t + 1):
+                            A_prod = jnp.eye(D)
+                            for s in range(j + 1, t + 1):
+                                A_prod = A_seq[s] @ A_prod
+                            accum = accum + A_prod @ B_seq[j]
+                        T_u_t = T_u_t.at[:, s_k:e_k].set(accum)
+                T_u_list.append(T_u_t)
+
+            Q_qp = jnp.zeros((n, n))
+            c_qp = jnp.zeros(n)
+            for t in range(H):
+                s_y = n_u + t * K
+                e_y = s_y + K
+                c_qp = c_qp.at[s_y:e_y].add((discount ** t) * reward_alpha[t])
+
+            s_arr_y = n_u + n_reward_y
+            e_arr_y = s_arr_y + K_arr
+            c_qp = c_qp.at[s_arr_y:e_arr_y].add(
+                (discount ** H) * arrival_alpha)
+
+            a_high_t = jnp.tile(a_high, CH)
+            a_low_t = jnp.tile(a_low, CH)
+            zeros_action_y = jnp.zeros((n_u, n_y))
+            G_parts = [
+                jnp.concatenate([jnp.eye(n_u), zeros_action_y], axis=1),
+                jnp.concatenate([-jnp.eye(n_u), zeros_action_y], axis=1),
+            ]
+            h_parts = [a_high_t, -a_low_t]
+
             for t in range(H):
                 k_u = min(t, CH - 1)
-                u = U[k_u]
-                z = A_seq[t] @ z + B_seq[t] @ u
-                preact = reward_w2[t] @ z + reward_w3[t] @ u + reward_b1[t]
-                cost = cost - (discount ** t) * jnp.sum(
-                    reward_w1[t] * _softplus(preact, beta_reward))
+                s_u = k_u * nU
+                e_u = (k_u + 1) * nU
+                s_y = n_u + t * K
+                e_y = s_y + K
+                Tu = T_u_list[t]
+                f = f_list[t]
 
-            u_terminal = U[CH - 1]
-            arrival_preact1 = (
-                jnp.einsum('ekd,d->ek', arrival_w2, z)
-                + jnp.einsum('eka,a->ek', arrival_w3, u_terminal)
-                + arrival_b1
-            )
-            arrival_hidden1 = _softplus(arrival_preact1, beta_arrival)
-            arrival_preact2 = (
-                jnp.einsum('elk,ek->el', arrival_w4, arrival_hidden1)
-                + arrival_b3
-            )
-            arrival_value = jnp.sum(
-                arrival_w1 * _softplus(arrival_preact2, beta_arrival),
-                axis=-1,
-            )
-            cost = cost - (discount ** H) * jnp.mean(arrival_value)
-            # if action_l2 > 0.0:
-            #     cost = cost + action_l2 * jnp.sum(U * U)
-            return cost
+                relu_u = reward_w2[t] @ Tu
+                relu_u = relu_u.at[:, s_u:e_u].add(reward_w3[t])
+                relu_row = jnp.zeros((K, n))
+                relu_row = relu_row.at[:, :n_u].set(relu_u)
+                relu_row = relu_row.at[:, s_y:e_y].set(-jnp.eye(K))
+                relu_rhs = -(reward_w2[t] @ f + reward_b1[t])
 
-        value_and_grad = jax.value_and_grad(_objective)
+                nonneg_row = jnp.zeros((K, n))
+                nonneg_row = nonneg_row.at[:, s_y:e_y].set(-jnp.eye(K))
 
-        def _solve(z0, A_seq, B_seq,
-                   reward_w1, reward_w2, reward_w3, reward_b1,
-                   arrival_w1, arrival_w2, arrival_w3, arrival_w4,
-                   arrival_b1, arrival_b3,
-                   U_init, a_low, a_high):
-            U = jnp.clip(U_init, a_low, a_high)
-            m = jnp.zeros_like(U)
-            v = jnp.zeros_like(U)
+                G_parts.extend([relu_row, nonneg_row])
+                h_parts.extend([relu_rhs, jnp.zeros(K)])
 
-            def body(i, state):
-                U, m, v = state
-                _value, grad = value_and_grad(
-                    U, z0, A_seq, B_seq,
-                    reward_w1, reward_w2, reward_w3, reward_b1,
-                    arrival_w1, arrival_w2, arrival_w3, arrival_w4,
-                    arrival_b1, arrival_b3,
-                )
-                grad = jnp.nan_to_num(grad, nan=0.0, posinf=1e6, neginf=-1e6)
-                m = adam_beta1 * m + (1.0 - adam_beta1) * grad
-                v = adam_beta2 * v + (1.0 - adam_beta2) * (grad * grad)
-                step = i + 1
-                m_hat = m / (1.0 - adam_beta1 ** step)
-                v_hat = v / (1.0 - adam_beta2 ** step)
-                U = jnp.clip(U - step_size * m_hat / (jnp.sqrt(v_hat) + adam_eps),
-                             a_low, a_high)
-                return U, m, v
+            Tu_H = T_u_list[H - 1]
+            f_H = f_list[H - 1]
+            s_u_H = (CH - 1) * nU
+            e_u_H = CH * nU
 
-            U, _m, _v = jax.lax.fori_loop(0, num_iters, body, (U, m, v))
-            final_value = _objective(
-                U, z0, A_seq, B_seq,
-                reward_w1, reward_w2, reward_w3, reward_b1,
-                arrival_w1, arrival_w2, arrival_w3, arrival_w4,
-                arrival_b1, arrival_b3,
-            )
-            converged = jnp.isfinite(final_value) & jnp.all(jnp.isfinite(U))
-            return U, converged
+            arrival_u = arrival_w2 @ Tu_H
+            arrival_u = arrival_u.at[:, s_u_H:e_u_H].add(arrival_w3)
+            arrival_row = jnp.zeros((K_arr, n))
+            arrival_row = arrival_row.at[:, :n_u].set(arrival_u)
+            arrival_row = arrival_row.at[:, s_arr_y:e_arr_y].set(-jnp.eye(K_arr))
+            arrival_rhs = -(arrival_w2 @ f_H + arrival_b1)
 
-        self._jax_solve_mpc = jax.jit(_solve)
+            arrival_nonneg_row = jnp.zeros((K_arr, n))
+            arrival_nonneg_row = arrival_nonneg_row.at[:, s_arr_y:e_arr_y].set(
+                -jnp.eye(K_arr))
+
+            G_parts.extend([arrival_row, arrival_nonneg_row])
+            h_parts.extend([arrival_rhs, jnp.zeros(K_arr)])
+
+            G = jnp.concatenate(G_parts, axis=0)
+            h = jnp.concatenate(h_parts, axis=0)
+            A_eq = jnp.zeros((0, n))
+            b_eq = jnp.zeros((0,))
+
+            x, _s, _z, _y, converged, _iters = qpax.solve_qp(
+                Q_qp, c_qp, A_eq, b_eq, G, h)
+            return x[:n_u].reshape(CH, nU), converged
+
+        self._jax_solve_mpc = jax.jit(_build_and_solve)
 
     # ------------------------------------------------------------------
     # Episode reset
@@ -575,11 +569,10 @@ class SSMAgent:
         self.convex_solver_solution_nonfinite = 0
         self.convex_nonfinite_inputs = {
             name: 0 for name in (
-                'z', 'A', 'B', 'reward_w1', 'reward_w2',
+                'z', 'A', 'B', 'reward_alpha', 'reward_w2',
                 'reward_w3', 'reward_b1', 'reward_b2',
-                'arrival_w1', 'arrival_w2', 'arrival_w3',
-                'arrival_w4', 'arrival_b1', 'arrival_b3',
-                'arrival_b2', 'U_init',
+                'arrival_alpha', 'arrival_w2', 'arrival_w3',
+                'arrival_b1', 'arrival_b2',
             )
         }
         self.convex_last_failure_reason = 'none'
@@ -813,7 +806,7 @@ class SSMAgent:
         reward_loss = torch.tensor(0.0, device=self.device)
         for t in range(H):
             r_pred = self.model.reward(
-                zs[t+1], action[t+self.history_horizon],
+                zs[t], action[t+self.history_horizon],
                 reward_w1_seq[:, t], reward_w2_seq[:, t],
                 reward_w3_seq[:, t], reward_b1_seq[:, t],
                 reward_b2_seq[:, t],
@@ -826,7 +819,6 @@ class SSMAgent:
             ) * (self.rho ** t)
 
         # ---- Value loss (arrival Q is the only Q-function) ----
-        q_loss = torch.tensor(0.0, device=self.device)
         arrival_q_loss = torch.tensor(0.0, device=self.device)
         encoder_in_target = encoder_in.detach()
         encoded_zs = self.model.encode(obs)
@@ -885,7 +877,6 @@ class SSMAgent:
             'consistency_loss': float(consistency_loss.item()),
             'reward_loss': float(reward_loss.item()),
             'value_loss': float(value_loss.item()),
-            'q_loss': float(q_loss.item()),
             'arrival_q_loss': float(arrival_q_loss.item()),
             'pi_loss': pi_loss,
             'total_loss': float(total_loss.item()),

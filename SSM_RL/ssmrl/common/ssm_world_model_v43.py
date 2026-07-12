@@ -4,9 +4,9 @@ Implements a state-space model with:
   - Variational encoder (mean + log_sigma)
   - Transformer-based temporal context encoder
   - Dense per-step linear dynamics: z' = A*z + B*u
-  - One-hidden-layer softplus reward:
-      r = W1 softplus(W2 z + W3 u + b1) + b2
-  - Two-hidden-layer softplus arrival Q-function ensemble for MPC arrival cost
+  - One-hidden-layer concave ReLU reward:
+      r = W1 ReLU(W2 z + W3 u + b1) + b2, with W1 <= 0
+  - One-hidden-layer concave ReLU arrival Q-function ensemble
   - Latent-state policy network (tanh-squashed)
 
 Follows the architecture of WorldModel in ssmrl/common/world_model.py.
@@ -99,9 +99,9 @@ class SSMWorldModel(nn.Module):
     Key differences from the vanilla TD-MPC2 WorldModel:
     * Dynamics are linear: z' = A*z + B*u  (dense A and B are mixed from
       learned basis matrices).
-    * Reward is a learned softplus network over latent state and action.
-    * Arrival critic is a learned softplus network ensemble over latent state
-      and action.
+    * Reward is a learned concave ReLU network over latent state and action.
+    * Arrival critic is a learned concave ReLU network ensemble over latent
+      state and action.
     * The policy consumes latent states from the encoder.
     """
 
@@ -163,19 +163,18 @@ class SSMWorldModel(nn.Module):
         )
         self._B_basis = nn.Parameter(torch.randn(self._B_num_bases, latent_dim, act_dim) * b_basis_init)
 
-        # ---- Softplus reward head ----
-        # r(z, u) = W1 softplus(W2 z + W3 u + b1) + b2.
-        # W1 is unconstrained; the "_raw" suffix is kept for checkpoint
-        # compatibility with earlier concave versions.
+        # ---- Concave ReLU reward head ----
+        # r(z, u) = W1 ReLU(W2 z + W3 u + b1) + b2.
+        # W1 is parameterized as -softplus(raw), so the reward is concave in
+        # the affine hidden activations used by MPC.
         self.reward_hidden_dim = int(getattr(
-            cfg, 'reward_softplus_hidden_dim',
-            getattr(cfg, 'reward_relu_hidden_dim', latent_dim)))
-        self.reward_softplus_beta = float(getattr(cfg, 'reward_softplus_beta', 1.0))
+            cfg, 'reward_relu_hidden_dim',
+            getattr(cfg, 'reward_softplus_hidden_dim', latent_dim)))
         reward_init = float(getattr(
-            cfg, 'reward_softplus_weight_init',
-            getattr(cfg, 'reward_relu_weight_init', 0.0)))
-        reward_w1_init = float(getattr(cfg, 'reward_w1_init', 0))
-        self._reward_w1_raw = nn.Parameter(torch.full((self.reward_hidden_dim,), reward_w1_init))
+            cfg, 'reward_relu_weight_init',
+            getattr(cfg, 'reward_softplus_weight_init', 0.1)))
+        reward_w1_init = float(getattr(cfg, 'reward_w1_init', 0.1))
+        self._reward_w1_raw = nn.Parameter(torch.randn(self.reward_hidden_dim) * reward_w1_init)
         self._reward_w2 = nn.Parameter(torch.randn(self.reward_hidden_dim, latent_dim) * reward_init)
         self._reward_w3 = nn.Parameter(torch.randn(self.reward_hidden_dim, act_dim) * reward_init)
         self._reward_b1 = nn.Parameter(torch.zeros(self.reward_hidden_dim))
@@ -192,39 +191,25 @@ class SSMWorldModel(nn.Module):
             2 * act_dim,
         )
 
-        # ---- Two-layer softplus arrival Q-function ensemble for MPC arrival cost ----
-        # h1 = softplus(W2 z + W3 u + b1)
-        # h2 = softplus(W4 h1 + b3)
-        # Q_arr(z, u) = W1 h2 + b2.
+        # ---- Concave ReLU arrival Q-function ensemble for MPC arrival cost ----
+        # Q_arr(z, u) = W1 ReLU(W2 z + W3 u + b1) + b2, with W1 <= 0.
         self.num_arrival_q = max(1, int(getattr(
             cfg, 'arrival_num_q', getattr(cfg, 'num_q', 2))))
         self.arrival_hidden_dim = self.reward_hidden_dim
-        self.arrival_second_hidden_dim = int(getattr(
-            cfg, 'arrival_second_hidden_dim', self.arrival_hidden_dim))
-        self.arrival_softplus_beta = self.reward_softplus_beta
         arrival_init = float(getattr(
-            cfg, 'arrival_softplus_weight_init',
-            getattr(cfg, 'arrival_relu_weight_init', reward_init)))
+            cfg, 'arrival_relu_weight_init',
+            getattr(cfg, 'arrival_softplus_weight_init', reward_init)))
         arrival_w1_init = float(getattr(cfg, 'arrival_w1_init', reward_w1_init))
-        self._arrival_w1_raw = nn.Parameter(torch.full(
-            (self.num_arrival_q, self.arrival_second_hidden_dim),
-            arrival_w1_init))
+        self._arrival_w1_raw = nn.Parameter(torch.randn(
+            self.num_arrival_q, self.arrival_hidden_dim) * arrival_w1_init)
         self._arrival_w2 = nn.Parameter(
             torch.randn(self.num_arrival_q, self.arrival_hidden_dim, latent_dim)
             * arrival_init)
         self._arrival_w3 = nn.Parameter(
             torch.randn(self.num_arrival_q, self.arrival_hidden_dim, act_dim)
             * arrival_init)
-        self._arrival_w4 = nn.Parameter(
-            torch.randn(
-                self.num_arrival_q,
-                self.arrival_second_hidden_dim,
-                self.arrival_hidden_dim,
-            ) * arrival_init)
         self._arrival_b1 = nn.Parameter(
             torch.zeros(self.num_arrival_q, self.arrival_hidden_dim))
-        self._arrival_b3 = nn.Parameter(
-            torch.zeros(self.num_arrival_q, self.arrival_second_hidden_dim))
         self._arrival_b2 = nn.Parameter(torch.zeros(self.num_arrival_q, 1))
         self._arrival_w1_raw_target = nn.Parameter(
             self._arrival_w1_raw.detach().clone(), requires_grad=False)
@@ -232,12 +217,8 @@ class SSMWorldModel(nn.Module):
             self._arrival_w2.detach().clone(), requires_grad=False)
         self._arrival_w3_target = nn.Parameter(
             self._arrival_w3.detach().clone(), requires_grad=False)
-        self._arrival_w4_target = nn.Parameter(
-            self._arrival_w4.detach().clone(), requires_grad=False)
         self._arrival_b1_target = nn.Parameter(
             self._arrival_b1.detach().clone(), requires_grad=False)
-        self._arrival_b3_target = nn.Parameter(
-            self._arrival_b3.detach().clone(), requires_grad=False)
         self._arrival_b2_target = nn.Parameter(
             self._arrival_b2.detach().clone(), requires_grad=False)
 
@@ -279,7 +260,7 @@ class SSMWorldModel(nn.Module):
         current_obs,
     ):
         """
-        Run transformer on history and produce dynamics plus softplus
+        Run transformer on history and produce dynamics plus concave ReLU
         reward parameters for the current step.
 
         Args:
@@ -393,10 +374,10 @@ class SSMWorldModel(nn.Module):
         return Az + Bu
 
     # ------------------------------------------------------------------
-    # Reward (softplus in z and action)
+    # Reward (concave ReLU in z and action)
     # ------------------------------------------------------------------
     def reward_head_parameters(self):
-        """Return the trainable parameters of the softplus reward head."""
+        """Return the trainable parameters of the concave ReLU reward head."""
         return [
             self._reward_w1_raw,
             self._reward_w2,
@@ -409,9 +390,9 @@ class SSMWorldModel(nn.Module):
         """
         Return reward parameters, optionally expanded over batch and horizon.
 
-        W1 is unconstrained, so the reward is not required to be concave.
+        W1 is always non-positive, making the reward concave in (z, a).
         """
-        w1 = self._reward_w1_raw
+        w1 = -F.softplus(self._reward_w1_raw)
         w2 = self._reward_w2
         w3 = self._reward_w3
         b1 = self._reward_b1
@@ -435,12 +416,12 @@ class SSMWorldModel(nn.Module):
 
     def reward(self, z, a, w1=None, w2=None, w3=None, b1=None, b2=None):
         """
-        Compute r(z, a) = W1 softplus(W2 z + W3 a + b1) + b2.
+        Compute r(z, a) = W1 ReLU(W2 z + W3 a + b1) + b2.
 
         Args:
             z:      [batch, latent_dim]
             a:      [batch, act_dim]
-            w1:     [batch, reward_hidden_dim] signed output weights
+            w1:     [batch, reward_hidden_dim] non-positive output weights
             w2:     [batch, reward_hidden_dim, latent_dim]
             w3:     [batch, reward_hidden_dim, act_dim]
             b1:     [batch, reward_hidden_dim]
@@ -462,7 +443,7 @@ class SSMWorldModel(nn.Module):
             + torch.bmm(w3, a.unsqueeze(-1)).squeeze(-1)
             + b1
         )
-        hidden = F.softplus(preact, beta=self.reward_softplus_beta)
+        hidden = F.relu(preact)
         return (w1 * hidden).sum(dim=-1, keepdim=True) + b2
 
     # ------------------------------------------------------------------
@@ -504,40 +485,34 @@ class SSMWorldModel(nn.Module):
         return log_std.exp()
 
     # ------------------------------------------------------------------
-    # Softplus Q-Function for MPC arrival cost
+    # ReLU Q-Function for MPC arrival cost
     # ------------------------------------------------------------------
     def arrival_head_parameters(self):
-        """Return the trainable parameters of the two-layer softplus arrival Q head."""
+        """Return the trainable parameters of the concave ReLU arrival Q head."""
         return [
             self._arrival_w1_raw,
             self._arrival_w2,
             self._arrival_w3,
-            self._arrival_w4,
             self._arrival_b1,
-            self._arrival_b3,
             self._arrival_b2,
         ]
 
     def arrival_target_head_parameters(self):
-        """Return target-network parameters of the two-layer softplus arrival Q head."""
+        """Return target-network parameters of the concave ReLU arrival Q head."""
         return [
             self._arrival_w1_raw_target,
             self._arrival_w2_target,
             self._arrival_w3_target,
-            self._arrival_w4_target,
             self._arrival_b1_target,
-            self._arrival_b3_target,
             self._arrival_b2_target,
         ]
 
     def arrival_Q_params(self, encoder_in, target=False, return_type='first'):
         """
-        Return two-layer softplus arrival Q parameters.
+        Return one-hidden-layer concave ReLU arrival Q parameters.
 
         The arrival Q-function represents:
-            h1 = softplus(W2 z + W3 a + b1)
-            h2 = softplus(W4 h1 + b3)
-            Q(z, a) = W1 h2 + b2
+            Q(z, a) = W1 ReLU(W2 z + W3 a + b1) + b2
 
         Args:
             encoder_in: [batch, ctx_dim], used for batch/device/dtype only
@@ -546,12 +521,10 @@ class SSMWorldModel(nn.Module):
                          'all' returns every ensemble head.
         Returns:
             If return_type == 'first':
-                w1: [batch, arrival_second_hidden_dim], signed output weights
+                w1: [batch, arrival_hidden_dim], non-positive output weights
                 w2: [batch, arrival_hidden_dim, latent_dim]
                 w3: [batch, arrival_hidden_dim, act_dim]
-                w4: [batch, arrival_second_hidden_dim, arrival_hidden_dim]
                 b1: [batch, arrival_hidden_dim]
-                b3: [batch, arrival_second_hidden_dim]
                 b2: [batch, 1]
             If return_type == 'all':
                 same tensors with leading [num_arrival_q, batch, ...].
@@ -561,37 +534,29 @@ class SSMWorldModel(nn.Module):
         assert return_type in {'first', 'all'}
         batch_size = encoder_in.shape[0]
         if target:
-            w1 = self._arrival_w1_raw_target
+            w1 = -F.softplus(self._arrival_w1_raw_target)
             w2 = self._arrival_w2_target
             w3 = self._arrival_w3_target
-            w4 = self._arrival_w4_target
             b1 = self._arrival_b1_target
-            b3 = self._arrival_b3_target
             b2 = self._arrival_b2_target
         else:
-            w1 = self._arrival_w1_raw
+            w1 = -F.softplus(self._arrival_w1_raw)
             w2 = self._arrival_w2
             w3 = self._arrival_w3
-            w4 = self._arrival_w4
             b1 = self._arrival_b1
-            b3 = self._arrival_b3
             b2 = self._arrival_b2
         w1 = w1.to(device=encoder_in.device, dtype=encoder_in.dtype)
         w2 = w2.to(device=encoder_in.device, dtype=encoder_in.dtype)
         w3 = w3.to(device=encoder_in.device, dtype=encoder_in.dtype)
-        w4 = w4.to(device=encoder_in.device, dtype=encoder_in.dtype)
         b1 = b1.to(device=encoder_in.device, dtype=encoder_in.dtype)
-        b3 = b3.to(device=encoder_in.device, dtype=encoder_in.dtype)
         b2 = b2.to(device=encoder_in.device, dtype=encoder_in.dtype)
         if return_type == 'first':
             w1 = w1[0].view(1, -1).expand(batch_size, -1)
             w2 = w2[0].view(1, self.arrival_hidden_dim, self.latent_dim).expand(batch_size, -1, -1)
             w3 = w3[0].view(1, self.arrival_hidden_dim, self.act_dim).expand(batch_size, -1, -1)
-            w4 = w4[0].view(1, self.arrival_second_hidden_dim, self.arrival_hidden_dim).expand(batch_size, -1, -1)
             b1 = b1[0].view(1, -1).expand(batch_size, -1)
-            b3 = b3[0].view(1, -1).expand(batch_size, -1)
             b2 = b2[0].view(1, 1).expand(batch_size, -1)
-            return w1, w2, w3, w4, b1, b3, b2
+            return w1, w2, w3, b1, b2
         w1 = w1.view(self.num_arrival_q, 1, -1).expand(-1, batch_size, -1)
         w2 = w2.view(
             self.num_arrival_q, 1, self.arrival_hidden_dim, self.latent_dim
@@ -599,18 +564,13 @@ class SSMWorldModel(nn.Module):
         w3 = w3.view(
             self.num_arrival_q, 1, self.arrival_hidden_dim, self.act_dim
         ).expand(-1, batch_size, -1, -1)
-        w4 = w4.view(
-            self.num_arrival_q, 1, self.arrival_second_hidden_dim,
-            self.arrival_hidden_dim,
-        ).expand(-1, batch_size, -1, -1)
         b1 = b1.view(self.num_arrival_q, 1, -1).expand(-1, batch_size, -1)
-        b3 = b3.view(self.num_arrival_q, 1, -1).expand(-1, batch_size, -1)
         b2 = b2.view(self.num_arrival_q, 1, 1).expand(-1, batch_size, -1)
-        return w1, w2, w3, w4, b1, b3, b2
+        return w1, w2, w3, b1, b2
 
     def arrival_Q_value(self, z, a, encoder_in, target=False, return_type='min'):
         """
-        Evaluate the two-layer softplus arrival Q-function.
+        Evaluate the one-hidden-layer concave ReLU arrival Q-function.
 
         Args:
             z:          [batch, latent_dim]
@@ -625,19 +585,14 @@ class SSMWorldModel(nn.Module):
         if return_type is None:
             return_type = 'min'
         assert return_type in {'min', 'avg', 'all'}
-        w1, w2, w3, w4, b1, b3, b2 = self.arrival_Q_params(
+        w1, w2, w3, b1, b2 = self.arrival_Q_params(
             encoder_in, target=target, return_type='all')
-        preact1 = (
+        preact = (
             torch.einsum('ebkd,bd->ebk', w2, z)
             + torch.einsum('ebka,ba->ebk', w3, a)
             + b1
         )
-        hidden1 = F.softplus(preact1, beta=self.arrival_softplus_beta)
-        preact2 = torch.einsum('eblk,ebk->ebl', w4, hidden1) + b3
-        hidden2 = F.softplus(preact2, beta=self.arrival_softplus_beta)
-        value = (
-            w1 * hidden2
-        ).sum(dim=-1, keepdim=True) + b2
+        value = (w1 * F.relu(preact)).sum(dim=-1, keepdim=True) + b2
         if return_type == 'all':
             return value
         if return_type == 'avg':

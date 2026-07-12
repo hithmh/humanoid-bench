@@ -324,14 +324,19 @@ class SSMAgent:
 
         (arrival_w1, arrival_w2, arrival_w3, arrival_w4,
          arrival_b1, arrival_b3, arrival_b2) = self.model.arrival_Q_params(
-            encoder_in, target=False, return_type='first')
-        arrival_w1_t = arrival_w1[0]      # (K2_arr,), signed output weight
-        arrival_w2_t = arrival_w2[0]      # (K1_arr, D)
-        arrival_w3_t = arrival_w3[0]      # (K1_arr, nU)
-        arrival_w4_t = arrival_w4[0]      # (K2_arr, K1_arr)
-        arrival_b1_t = arrival_b1[0]      # (K1_arr,)
-        arrival_b3_t = arrival_b3[0]      # (K2_arr,)
-        arrival_b2_t = arrival_b2[0]      # (1,), constant for MPC
+            encoder_in, target=False, return_type='all')
+        if eval_mode:
+            arrival_head_idx = slice(None)
+        else:
+            idx = torch.randint(arrival_w1.shape[0], (1,), device=arrival_w1.device).item()
+            arrival_head_idx = slice(idx, idx + 1)
+        arrival_w1_t = arrival_w1[arrival_head_idx, 0]  # (E_arr, K2_arr)
+        arrival_w2_t = arrival_w2[arrival_head_idx, 0]  # (E_arr, K1_arr, D)
+        arrival_w3_t = arrival_w3[arrival_head_idx, 0]  # (E_arr, K1_arr, nU)
+        arrival_w4_t = arrival_w4[arrival_head_idx, 0]  # (E_arr, K2_arr, K1_arr)
+        arrival_b1_t = arrival_b1[arrival_head_idx, 0]  # (E_arr, K1_arr)
+        arrival_b3_t = arrival_b3[arrival_head_idx, 0]  # (E_arr, K2_arr)
+        arrival_b2_t = arrival_b2[arrival_head_idx, 0]  # (E_arr, 1), constant for MPC
 
         self.convex_solver_attempts += 1
         input_tensors = {
@@ -351,13 +356,13 @@ class SSMAgent:
             'arrival_b3': arrival_b3_t,
             'arrival_b2': arrival_b2_t,
         }
-        bad_inputs = [name for name, tensor in input_tensors.items()
-                      if not torch.isfinite(tensor).all().item()]
-        if bad_inputs:
-            self._record_convex_failure('input_nonfinite', ','.join(bad_inputs))
-            for name in bad_inputs:
-                self.convex_nonfinite_inputs[name] += 1
-            return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
+        # bad_inputs = [name for name, tensor in input_tensors.items()
+        #               if not torch.isfinite(tensor).all().item()]
+        # if bad_inputs:
+        #     self._record_convex_failure('input_nonfinite', ','.join(bad_inputs))
+        #     for name in bad_inputs:
+        #         self.convex_nonfinite_inputs[name] += 1
+        #     return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
 
         U_init_t = self._policy_rollout_mpc_init(
             z_t, A_seq_t, B_seq_t, eval_mode)
@@ -498,11 +503,21 @@ class SSMAgent:
                     reward_w1[t] * _softplus(preact, beta_reward))
 
             u_terminal = U[CH - 1]
-            arrival_preact1 = arrival_w2 @ z + arrival_w3 @ u_terminal + arrival_b1
+            arrival_preact1 = (
+                jnp.einsum('ekd,d->ek', arrival_w2, z)
+                + jnp.einsum('eka,a->ek', arrival_w3, u_terminal)
+                + arrival_b1
+            )
             arrival_hidden1 = _softplus(arrival_preact1, beta_arrival)
-            arrival_preact2 = arrival_w4 @ arrival_hidden1 + arrival_b3
-            cost = cost - (discount ** H) * jnp.sum(
-                arrival_w1 * _softplus(arrival_preact2, beta_arrival))
+            arrival_preact2 = (
+                jnp.einsum('elk,ek->el', arrival_w4, arrival_hidden1)
+                + arrival_b3
+            )
+            arrival_value = jnp.sum(
+                arrival_w1 * _softplus(arrival_preact2, beta_arrival),
+                axis=-1,
+            )
+            cost = cost - (discount ** H) * jnp.mean(arrival_value)
             # if action_l2 > 0.0:
             #     cost = cost + action_l2 * jnp.sum(U * U)
             return cost

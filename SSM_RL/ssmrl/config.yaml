@@ -6,9 +6,9 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: -coef_r1e3_c0-update_pi_zs_11071841
+exp_name: -coef_r2e1_v5e-2_c1e-4-non_zero_init-latent256
 #agent_name: SSM_agent_v15_const
-agent_name: SSM_agent_v42
+agent_name: SSM_agent_v43
 
 # evaluation
 checkpoint: ???
@@ -20,9 +20,9 @@ steps: 10_000_000
 device: cuda
 replay_device: cpu
 batch_size: 256
-reward_coef: 1e3
-value_coef: 1e0
-consistency_coef: 1e-3
+reward_coef: 2e1
+value_coef: 5e-2
+consistency_coef: 1e-4
 rho: 1.0
 lr: 3e-4
 num_updates: 1
@@ -59,7 +59,7 @@ history_horizon: 6
 
 # ssm controller
 apply_action_constraints: true
-jax_mpc_platform: cpu
+jax_mpc_platform: gpu
 jax_mpc_preallocate: false
 jax_mpc_mem_fraction: 0.20
 jax_mpc_disable_cuda_after_error: true
@@ -97,7 +97,7 @@ enc_dim: 256
 num_channels: 32
 
 mlp_dim: 512
-latent_dim: 32
+latent_dim: 256
 task_dim: 96
 num_q: 5
 dropout: 0.01
