@@ -61,7 +61,6 @@ class SSMAgent:
     def __init__(self, cfg):
         self.cfg = cfg
         self.device = self._resolve_device(getattr(cfg, "device", "auto"))
-        self._jax_cpu_device = jax.devices("cpu")[0]
         jax_platform = str(getattr(cfg, "jax_mpc_platform", "cpu")).lower()
         self._jax_mpc_cuda_requested = jax_platform in {"cuda", "gpu"}
         self._jax_has_cuda = (
@@ -354,28 +353,29 @@ class SSMAgent:
             'arrival_b2': arrival_b2_t,
         }
 
-        def to_jax_cpu(t: torch.Tensor):
-            return jax.device_put(t.detach().cpu().numpy(), self._jax_cpu_device)
+        def to_jax_via_numpy(t: torch.Tensor):
+            return jnp.asarray(t.detach().cpu().numpy())
 
         def to_jax(t: torch.Tensor):
             t = t.detach().contiguous()
             if t.is_cuda and not self._jax_has_cuda:
-                return to_jax_cpu(t)
-            try:
-                return jax.dlpack.from_dlpack(t)
-            except TypeError:
-                try:
-                    return jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(t))
-                except RuntimeError as exc:
-                    if t.is_cuda and self._is_jax_cuda_error(exc):
-                        self._disable_jax_cuda_mpc(exc)
-                        return to_jax_cpu(t)
-                    raise
-            except RuntimeError as exc:
-                if t.is_cuda and self._is_jax_cuda_error(exc):
-                    self._disable_jax_cuda_mpc(exc)
-                    return to_jax_cpu(t)
-                raise
+                return to_jax_via_numpy(t)
+            return jax.dlpack.from_dlpack(t)
+            # try:
+            #     return jax.dlpack.from_dlpack(t)
+            # except TypeError:
+            #     try:
+            #         return jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(t))
+            #     except RuntimeError as exc:
+            #         if t.is_cuda and self._is_jax_cuda_error(exc):
+            #             self._disable_jax_cuda_mpc(exc)
+            #             return to_jax_via_numpy(t)
+            #         raise
+            # except RuntimeError as exc:
+            #     if t.is_cuda and self._is_jax_cuda_error(exc):
+            #         self._disable_jax_cuda_mpc(exc)
+            #         return to_jax_via_numpy(t)
+            #     raise
 
         try:
             z_jax = to_jax(z_t)
