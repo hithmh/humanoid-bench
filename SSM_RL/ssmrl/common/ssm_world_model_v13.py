@@ -280,6 +280,9 @@ class SSMWorldModel(nn.Module):
             2 * [cfg.mlp_dim],
             arrival_q_out_dim,
         )
+        self._arrival_q_target = deepcopy(self._arrival_q)
+        for p in self._arrival_q_target.parameters():
+            p.requires_grad_(False)
 
     # ------------------------------------------------------------------
     # Properties
@@ -567,7 +570,7 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     # Quadratic Q-Function for MPC arrival cost
     # ------------------------------------------------------------------
-    def arrival_Q_params(self, encoder_in):
+    def arrival_Q_params(self, encoder_in, target=False):
         """
         Return context-conditioned quadratic Q coefficients.
 
@@ -585,7 +588,7 @@ class SSMWorldModel(nn.Module):
             Rc_diag: [batch, act_dim]
             rc_vec:  [batch, act_dim]
         """
-        net = self._arrival_q
+        net = self._arrival_q if not target else self._arrival_q_target
         D = self.latent_dim
         nU = self.act_dim
 
@@ -598,7 +601,7 @@ class SSMWorldModel(nn.Module):
 
         return P_diag, p_vec, pb, Rc_diag, rc_vec
 
-    def arrival_Q_value(self, z, a, encoder_in):
+    def arrival_Q_value(self, z, a, encoder_in, target=False):
         """
         Evaluate the quadratic arrival Q-function.
 
@@ -611,7 +614,7 @@ class SSMWorldModel(nn.Module):
         Returns:
             Arrival Q value [batch, 1]
         """
-        P_diag, p_vec, pb, Rc_diag, rc_vec = self.arrival_Q_params(encoder_in)
+        P_diag, p_vec, pb, Rc_diag, rc_vec = self.arrival_Q_params(encoder_in, target=target)
 
         quad_z = (P_diag * z * z).sum(dim=-1, keepdim=True)
         lin_z = (p_vec * z).sum(dim=-1, keepdim=True)
@@ -641,6 +644,9 @@ class SSMWorldModel(nn.Module):
         with torch.no_grad():
             # Q-function target
             for p_tgt, p in zip(self._q_func_target.parameters(), self._q_func.parameters()):
+                p_tgt.data.lerp_(p.data, tau)
+
+            for p_tgt, p in zip(self._arrival_q_target.parameters(), self._arrival_q.parameters()):
                 p_tgt.data.lerp_(p.data, tau)
             # Update all three policy heads
             pi_pairs = [

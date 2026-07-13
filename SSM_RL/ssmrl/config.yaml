@@ -6,9 +6,9 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: -coef_r2e1_v5e-2_c1e-4-non_zero_init-latent256H24
+exp_name: -coef_r2e1_v5e-2_c1e-4-latent256H4-num_q10
 #agent_name: SSM_agent_v15_const
-agent_name: SSM_agent_v43
+agent_name: SSM_agent_v44
 
 # evaluation
 checkpoint: ???
@@ -72,12 +72,12 @@ solver: jax_projected_adam
 mpc: true
 iterations: 6
 num_samples: 512
-horizon: 24
-control_horizon: 24
+horizon: 4
+control_horizon: 4
 min_std: 0.05
 max_std: 2
 temperature: 0.5
-u_penalty: 1e-2
+u_penalty: 0
 
 # actor
 log_std_min: -10
@@ -99,7 +99,7 @@ num_channels: 32
 mlp_dim: 512
 latent_dim: 256
 task_dim: 96
-num_q: 5
+num_q: 10
 dropout: 0.01
 simnorm_dim: 8
 policy_struct: [256, 256]

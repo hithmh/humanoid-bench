@@ -225,12 +225,6 @@ class SSMAgent:
     def _sanitize_action(self, action):
         """Return a finite clipped action so MuJoCo never receives NaN controls."""
         action = np.asarray(action, dtype=np.float32).reshape(-1)
-        if action.shape[0] != self.act_dim:
-            safe = np.zeros(self.act_dim, dtype=np.float32)
-            safe[:min(action.shape[0], self.act_dim)] = action[:min(action.shape[0], self.act_dim)]
-            action = safe
-        if not np.isfinite(action).all():
-            action = np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
         return np.clip(action, -1.0, 1.0).astype(np.float32)
 
     @torch.no_grad()
@@ -372,7 +366,7 @@ class SSMAgent:
                        ).detach().cpu().numpy()
             u = u + epsilon
 
-        return self._sanitize_action(u)
+        return u
 
     # ------------------------------------------------------------------
     # JAX + qpax MPC controller builder
@@ -666,7 +660,7 @@ class SSMAgent:
     # ------------------------------------------------------------------
     # Policy update (mirror SSMRL.update_pi)
     # ------------------------------------------------------------------
-    def update_pi(self, obs0):
+    def update_pi(self, obs0,z0, encoder_in):
         """
         Update policy using raw observations for both actor and critic.
 
@@ -687,17 +681,13 @@ class SSMAgent:
         action, log_prob = self.model.pi(obs0, return_log_prob=True)  # [B, act_dim], [B, 1]
 
         # Q value at (obs0, action) - critic grad frozen, actor grad flows via action
-        val = self.model.Q_value(obs0, action, target=False, return_type='avg')  # [B, 1]
+        val = self.model.arrival_Q_value(z0, action, encoder_in, target=False)  # [B, 1]
 
         self.scale.update(val)
         val = self.scale(val)
 
         # SAC loss: maximise (Q - alpha * log_pi)
         pi_loss = (self.entropy_coef * log_prob- val).mean()
-        if not torch.isfinite(pi_loss):
-            self.pi_optim.zero_grad(set_to_none=True)
-            self.model.track_critic_grad(True)
-            return 0.0
 
         pi_loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -828,39 +818,40 @@ class SSMAgent:
             reward_loss += F.mse_loss(r_pred, reward[t+self.history_horizon]) * (self.rho ** t)
 
         # ---- Value loss (scalar Q ensemble + quadratic arrival Q-function) ----
-        obs_for_q = obs[0]
-        obs_target = obs[1]
-        a_for_q = action[0]
+        obs_for_q = z
+        z_target = next_mean[self.history_horizon]
+        obs_target = obs[self.history_horizon+1]
+        a_for_q = action[self.history_horizon]
         # Sample target action from raw obs; evaluate it with raw target obs
         with torch.no_grad():
             a_target = self.model.pi(obs_target, target=True, deterministic=True)
 
-        q_target_val = reward[0] + self.discount * self.model.Q_value(
-            obs_target, a_target, target=True
+        q_target_val = reward[self.history_horizon] + self.discount * self.model.arrival_Q_value(
+            z_target, a_target, encoder_in, target=True
         )
         # Replay action for Q(obs, a)
-        q_pred_all = self.model.Q_value(obs_for_q, a_for_q, target=False, return_type='all')
+        q_pred_all = self.model.arrival_Q_value(obs_for_q, a_for_q, encoder_in, target=False)
         q_target = q_target_val.detach().expand_as(q_pred_all)
         q_loss = F.mse_loss(q_pred_all, q_target)
 
-        z_for_q = self.model.encode(obs[self.history_horizon + H-1])
-        obs_target = obs[self.history_horizon + H]
-        a_for_q = action[self.history_horizon+ H-1]
-        # Sample target action from raw obs; evaluate it with raw target obs
-        with torch.no_grad():
-            a_target = self.model.pi(obs_target, target=True, deterministic=True)
-
-        q_target_val = self.model.Q_value(
-            obs_target, a_target, target=False, return_type='avg'
-        )
-        arrival_q_pred = self.model.arrival_Q_value(
-            z_for_q, a_for_q, encoder_in)
-        arrival_q_target = q_target_val.detach().expand_as(arrival_q_pred)
-        arrival_q_loss = F.smooth_l1_loss(arrival_q_pred, arrival_q_target)
+        # z_for_q = self.model.encode(obs[self.history_horizon + H-1])
+        # obs_target = obs[self.history_horizon + H]
+        # a_for_q = action[self.history_horizon+ H-1]
+        # # Sample target action from raw obs; evaluate it with raw target obs
+        # with torch.no_grad():
+        #     a_target = self.model.pi(obs_target, target=True, deterministic=True)
+        #
+        # q_target_val = self.model.Q_value(
+        #     obs_target, a_target, target=False, return_type='avg'
+        # )
+        # arrival_q_pred = self.model.arrival_Q_value(
+        #     z_for_q, a_for_q, encoder_in)
+        # arrival_q_target = q_target_val.detach().expand_as(arrival_q_pred)
+        # arrival_q_loss = F.smooth_l1_loss(arrival_q_pred, arrival_q_target)
         # Normalise
         consistency_loss = consistency_loss / H
         reward_loss = reward_loss / H
-        value_loss = q_loss + arrival_q_loss
+        value_loss = q_loss #+ arrival_q_loss
 
         total_loss = (
             self.consistency_coef * consistency_loss
@@ -879,7 +870,7 @@ class SSMAgent:
         self.model_optim.step()
 
         # ---- Update policy from raw observations; critic also uses raw observations ----
-        pi_loss = self.update_pi(obs[0])
+        pi_loss = self.update_pi(obs[self.history_horizon], z.detach(), encoder_in.detach())
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()
@@ -891,7 +882,7 @@ class SSMAgent:
             'reward_loss': float(reward_loss.item()),
             'value_loss': float(value_loss.item()),
             'q_loss': float(q_loss.item()),
-            'arrival_q_loss': float(arrival_q_loss.item()),
+            # 'arrival_q_loss': float(arrival_q_loss.item()),
             'pi_loss': pi_loss,
             'total_loss': float(total_loss.item()),
             'grad_norm': float(grad_norm),

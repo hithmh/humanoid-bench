@@ -414,9 +414,9 @@ class SSMAgent:
             std = self.model.get_pi_std(z)[0]
             epsilon = (std * torch.randn(self.act_dim, device=std.device)
                        ).detach().cpu().numpy()
-            # u = u + epsilon
+            u = u + epsilon
 
-        return self._sanitize_action(u)
+        return u
 
     # ------------------------------------------------------------------
     # JAX + qpax MPC controller

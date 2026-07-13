@@ -99,7 +99,7 @@ class OnlineTrainer(Trainer):
         return td
 
     def train(self):
-        """Train a TD-MPC2 agent."""
+        """Train a SSMRL agent."""
         train_metrics, done, eval_next = {}, True, True
 
         # Get reward visualization frequency from config

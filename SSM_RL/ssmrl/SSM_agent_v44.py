@@ -3,21 +3,19 @@ SSM Agent v44- transformer-conditioned SSM-RL with JAX/qpax MPC.
 
 This agent wraps ``SSMWorldModel`` and provides both model learning and
 inference-time control. During inference, recent state/action history is used
-by ``encode_context`` to produce local linear SSM parameters, reward
+by ``encode_context`` to produce local linear SSM parameters, quadratic reward
 parameters, and critic context. Until enough history is available, or if the
 QP solver fails, actions come from the learned policy.
 
 MPC controller:
   * The finite-horizon control problem is assembled in JAX and JIT-compiled.
-  * ``qpax`` solves the dense QP over the stacked action sequence and ReLU
-    epigraph variables.
+  * ``qpax`` solves the dense QP over the stacked action sequence.
   * Dense latent dynamics are analytically unrolled, eliminating equality
     dynamics constraints:
       z_{t+1} = A_t ... A_0 z_0 + T_u[t] @ U_flat
-  * Per-step action bounds and reward epigraph constraints are encoded as
-    inequalities ``G x <= h``.
-  * The stage reward and terminal arrival Q use the convex ReLU epigraph
-    parameterization from v40.
+  * Per-step action bounds are encoded as inequalities ``G x <= h``.
+  * The stage reward and terminal arrival Q use quadratic prediction modules
+    over X = [z, u].
   * Training-time exploration adds policy-standard-deviation action noise
     after planning.
   * PyTorch tensors are passed to JAX through DLPack when the backends share a
@@ -26,7 +24,7 @@ MPC controller:
 QP form passed to ``qpax``:
   min   0.5 * x^T Q_qp x + c_qp^T x
   s.t.  G x <= h
-  where x = [U_flat, reward_relu_epigraphs, arrival_q_relu_epigraphs]
+  where x = U_flat
 
 Training loop:
   sample replay buffer -> encode context -> latent rollout -> optimize
@@ -200,7 +198,7 @@ class SSMAgent:
         else:
             # Attempt JAX/qpax convex planning
             u_norm = self._plan_convex(z, obs_t, eval_mode)
-        # u_norm = self._sanitize_action(u_norm)
+        u_norm = self._sanitize_action(u_norm)
         # Update history
         self._append_history(obs_np, obs_t, u_norm)
 
@@ -211,12 +209,6 @@ class SSMAgent:
     def _sanitize_action(self, action):
         """Return a finite clipped action so MuJoCo never receives NaN controls."""
         action = np.asarray(action, dtype=np.float32).reshape(-1)
-        if action.shape[0] != self.act_dim:
-            safe = np.zeros(self.act_dim, dtype=np.float32)
-            safe[:min(action.shape[0], self.act_dim)] = action[:min(action.shape[0], self.act_dim)]
-            action = safe
-        if not np.isfinite(action).all():
-            action = np.nan_to_num(action, nan=0.0, posinf=1.0, neginf=-1.0)
         return np.clip(action, -1.0, 1.0).astype(np.float32)
 
     @staticmethod
@@ -300,8 +292,7 @@ class SSMAgent:
             self._action_history_tensors[-self.history_horizon:], dim=0).unsqueeze(0)
 
         (A_seq, B_seq,
-         reward_w1_seq, reward_w2_seq, reward_w3_seq,
-         reward_b1_seq, reward_b2_seq,
+         reward_Q_seq, reward_q_seq, reward_b_seq,
          encoder_in) = self.model.encode_context(
             state_t,
             action_t,
@@ -311,55 +302,43 @@ class SSMAgent:
         # Extract single-sample tensors
         A_seq_t = A_seq[0]                         # (H, D, D)
         B_seq_t = B_seq[0]                         # (H, D, nU)
-        reward_alpha_t = -reward_w1_seq[0]         # (H, K), positive cost weight
-        reward_w2_t = reward_w2_seq[0]             # (H, K, D)
-        reward_w3_t = reward_w3_seq[0]             # (H, K, nU)
-        reward_b1_t = reward_b1_seq[0]             # (H, K)
-        reward_b2_t = reward_b2_seq[0]             # (H, 1), constant for MPC
+        reward_Q_t = reward_Q_seq[0]               # (H, D+nU, D+nU)
+        reward_q_t = reward_q_seq[0]               # (H, D+nU)
+        reward_b_t = reward_b_seq[0]               # (H, 1), constant for MPC
         z_t = z[0]                                 # (D,)
 
-        (arrival_w1, arrival_w2, arrival_w3,
-         arrival_b1, arrival_b2) = self.model.arrival_Q_params(
+        arrival_Q, arrival_q, arrival_b = self.model.arrival_Q_params(
             encoder_in, target=False, return_type='all')
         if eval_mode:
             arrival_head_idx = slice(None)
         else:
-            idx = torch.randint(arrival_w1.shape[0], (1,), device=arrival_w1.device).item()
+            idx = torch.randint(arrival_Q.shape[0], (1,), device=arrival_Q.device).item()
             arrival_head_idx = slice(idx, idx + 1)
-        arrival_w1_t = arrival_w1[arrival_head_idx, 0]  # (E_arr, K_arr)
-        arrival_w2_t = arrival_w2[arrival_head_idx, 0]  # (E_arr, K_arr, D)
-        arrival_w3_t = arrival_w3[arrival_head_idx, 0]  # (E_arr, K_arr, nU)
-        arrival_b1_t = arrival_b1[arrival_head_idx, 0]  # (E_arr, K_arr)
-        arrival_b2_t = arrival_b2[arrival_head_idx, 0]  # (E_arr, 1), constant for MPC
-        arrival_alpha_t = -arrival_w1_t.reshape(-1)
-        arrival_w2_t = arrival_w2_t.reshape(-1, self.latent_dim)
-        arrival_w3_t = arrival_w3_t.reshape(-1, self.act_dim)
-        arrival_b1_t = arrival_b1_t.reshape(-1)
+        arrival_Q_t = arrival_Q[arrival_head_idx, 0]  # (E_arr, D+nU, D+nU)
+        arrival_q_t = arrival_q[arrival_head_idx, 0]  # (E_arr, D+nU)
+        arrival_b_t = arrival_b[arrival_head_idx, 0]  # (E_arr, 1), constant for MPC
 
         self.convex_solver_attempts += 1
         input_tensors = {
             'z': z_t,
             'A': A_seq_t,
             'B': B_seq_t,
-            'reward_alpha': reward_alpha_t,
-            'reward_w2': reward_w2_t,
-            'reward_w3': reward_w3_t,
-            'reward_b1': reward_b1_t,
-            'reward_b2': reward_b2_t,
-            'arrival_alpha': arrival_alpha_t,
-            'arrival_w2': arrival_w2_t,
-            'arrival_w3': arrival_w3_t,
-            'arrival_b1': arrival_b1_t,
-            'arrival_b2': arrival_b2_t,
+            'reward_Q': reward_Q_t,
+            'reward_q': reward_q_t,
+            'reward_b': reward_b_t,
+            'arrival_Q': arrival_Q_t,
+            'arrival_q': arrival_q_t,
+            'arrival_b': arrival_b_t,
         }
 
         def to_jax_via_numpy(t: torch.Tensor):
             return jnp.asarray(t.detach().cpu().numpy())
 
         def to_jax(t: torch.Tensor):
+            return jnp.asarray(t.detach().cpu().numpy())
             t = t.detach().contiguous()
             if t.is_cuda and not self._jax_has_cuda:
-                return to_jax_via_numpy(t)
+                return jnp.asarray(t.detach().cpu().numpy())
             return jax.dlpack.from_dlpack(t)
 
         def jax_array_device(x):
@@ -395,14 +374,10 @@ class SSMAgent:
             z_jax,
             to_jax(A_seq_t),
             to_jax(B_seq_t),
-            to_jax(reward_alpha_t),
-            to_jax(reward_w2_t),
-            to_jax(reward_w3_t),
-            to_jax(reward_b1_t),
-            to_jax(arrival_alpha_t),
-            to_jax(arrival_w2_t),
-            to_jax(arrival_w3_t),
-            to_jax(arrival_b1_t),
+            to_jax(reward_Q_t),
+            to_jax(reward_q_t),
+            to_jax(arrival_Q_t),
+            to_jax(arrival_q_t),
             a_low_jax,
             a_high_jax,
         )
@@ -414,9 +389,9 @@ class SSMAgent:
             std = self.model.get_pi_std(z)[0]
             epsilon = (std * torch.randn(self.act_dim, device=std.device)
                        ).detach().cpu().numpy()
-            # u = u + epsilon
+            u = u + epsilon
 
-        return self._sanitize_action(u)
+        return u
 
     # ------------------------------------------------------------------
     # JAX + qpax MPC controller
@@ -427,8 +402,7 @@ class SSMAgent:
 
         Dynamics constraints are analytically eliminated by expressing the full
         state trajectory as a linear map of the stacked control vector U_flat.
-        ReLU reward and arrival-Q terms are represented with epigraph
-        variables, matching the v40 convex QP parameterization.
+        Quadratic reward and arrival-Q terms are expanded directly in U_flat.
         """
         D   = self.latent_dim
         nU  = self.act_dim
@@ -444,26 +418,25 @@ class SSMAgent:
             getattr(self.cfg, 'a_bound_low', -np.ones(nU)), dtype=np.float32)
         self._a_high_np = a_high
         self._a_low_np = a_low
-        self._mpc_objective_convex = True
+        self._mpc_objective_convex = False
 
         def _build_and_solve(z0, A_seq, B_seq,
-                             reward_alpha, reward_w2, reward_w3, reward_b1,
-                             arrival_alpha, arrival_w2, arrival_w3, arrival_b1,
+                             reward_Q, reward_q,
+                             arrival_Q, arrival_q,
                              a_low, a_high):
-            K = reward_alpha.shape[1]
-            K_arr = arrival_alpha.shape[0]
             n_u = CH * nU
-            n_reward_y = H * K
-            n_y = n_reward_y + K_arr
-            n = n_u + n_y
+            n = n_u
 
-            f_list = []
-            T_u_list = []
+            f_next_list = []
+            T_u_next_list = []
+            f_state_list = [z0]
+            T_u_state_list = [jnp.zeros((D, n_u))]
             for t in range(H):
                 A_cum = jnp.eye(D)
                 for s in range(t + 1):
                     A_cum = A_seq[s] @ A_cum
-                f_list.append(A_cum @ z0)
+                f_next = A_cum @ z0
+                f_next_list.append(f_next)
 
                 T_u_t = jnp.zeros((D, n_u))
                 for k in range(CH):
@@ -483,69 +456,59 @@ class SSMAgent:
                                 A_prod = A_seq[s] @ A_prod
                             accum = accum + A_prod @ B_seq[j]
                         T_u_t = T_u_t.at[:, s_k:e_k].set(accum)
-                T_u_list.append(T_u_t)
+                T_u_next_list.append(T_u_t)
+                f_state_list.append(f_next)
+                T_u_state_list.append(T_u_t)
 
             Q_qp = jnp.zeros((n, n))
             c_qp = jnp.zeros(n)
-            for t in range(H):
-                s_y = n_u + t * K
-                e_y = s_y + K
-                c_qp = c_qp.at[s_y:e_y].add((discount ** t) * reward_alpha[t])
 
-            s_arr_y = n_u + n_reward_y
-            e_arr_y = s_arr_y + K_arr
-            c_qp = c_qp.at[s_arr_y:e_arr_y].add(
-                (discount ** H) * arrival_alpha)
-
-            a_high_t = jnp.tile(a_high, CH)
-            a_low_t = jnp.tile(a_low, CH)
-            zeros_action_y = jnp.zeros((n_u, n_y))
-            G_parts = [
-                jnp.concatenate([jnp.eye(n_u), zeros_action_y], axis=1),
-                jnp.concatenate([-jnp.eye(n_u), zeros_action_y], axis=1),
-            ]
-            h_parts = [a_high_t, -a_low_t]
+            def add_negative_quadratic(Q_acc, c_acc, weight, Q_x, q_x,
+                                       x_const, X_u):
+                # qpax minimizes. Negate the learned reward/Q because MPC
+                # maximizes those predicted values.
+                Q_acc = Q_acc - weight * 2.0 * (X_u.T @ Q_x @ X_u)
+                c_acc = c_acc - weight * (X_u.T @ (2.0 * (Q_x @ x_const) + q_x))
+                return Q_acc, c_acc
 
             for t in range(H):
                 k_u = min(t, CH - 1)
                 s_u = k_u * nU
                 e_u = (k_u + 1) * nU
-                s_y = n_u + t * K
-                e_y = s_y + K
-                Tu = T_u_list[t]
-                f = f_list[t]
+                z_const = f_state_list[t]
+                Z_u = T_u_state_list[t]
+                U_select = jnp.zeros((nU, n_u))
+                U_select = U_select.at[:, s_u:e_u].set(jnp.eye(nU))
+                x_const = jnp.concatenate([z_const, jnp.zeros(nU)], axis=0)
+                X_u = jnp.concatenate([Z_u, U_select], axis=0)
+                Q_qp, c_qp = add_negative_quadratic(
+                    Q_qp, c_qp, discount ** t,
+                    reward_Q[t], reward_q[t], x_const, X_u)
 
-                relu_u = reward_w2[t] @ Tu
-                relu_u = relu_u.at[:, s_u:e_u].add(reward_w3[t])
-                relu_row = jnp.zeros((K, n))
-                relu_row = relu_row.at[:, :n_u].set(relu_u)
-                relu_row = relu_row.at[:, s_y:e_y].set(-jnp.eye(K))
-                relu_rhs = -(reward_w2[t] @ f + reward_b1[t])
-
-                nonneg_row = jnp.zeros((K, n))
-                nonneg_row = nonneg_row.at[:, s_y:e_y].set(-jnp.eye(K))
-
-                G_parts.extend([relu_row, nonneg_row])
-                h_parts.extend([relu_rhs, jnp.zeros(K)])
-
-            Tu_H = T_u_list[H - 1]
-            f_H = f_list[H - 1]
+            Tu_H = T_u_next_list[H - 1]
+            f_H = f_next_list[H - 1]
             s_u_H = (CH - 1) * nU
             e_u_H = CH * nU
+            U_last = jnp.zeros((nU, n_u))
+            U_last = U_last.at[:, s_u_H:e_u_H].set(jnp.eye(nU))
+            x_H_const = jnp.concatenate([f_H, jnp.zeros(nU)], axis=0)
+            X_H_u = jnp.concatenate([Tu_H, U_last], axis=0)
+            arrival_Q_avg = jnp.mean(arrival_Q, axis=0)
+            arrival_q_avg = jnp.mean(arrival_q, axis=0)
+            Q_qp, c_qp = add_negative_quadratic(
+                Q_qp, c_qp, discount ** H,
+                arrival_Q_avg, arrival_q_avg, x_H_const, X_H_u)
 
-            arrival_u = arrival_w2 @ Tu_H
-            arrival_u = arrival_u.at[:, s_u_H:e_u_H].add(arrival_w3)
-            arrival_row = jnp.zeros((K_arr, n))
-            arrival_row = arrival_row.at[:, :n_u].set(arrival_u)
-            arrival_row = arrival_row.at[:, s_arr_y:e_arr_y].set(-jnp.eye(K_arr))
-            arrival_rhs = -(arrival_w2 @ f_H + arrival_b1)
+            Q_qp = 0.5 * (Q_qp + Q_qp.T)
+            Q_qp = Q_qp + 1e-6 * jnp.eye(n)
 
-            arrival_nonneg_row = jnp.zeros((K_arr, n))
-            arrival_nonneg_row = arrival_nonneg_row.at[:, s_arr_y:e_arr_y].set(
-                -jnp.eye(K_arr))
-
-            G_parts.extend([arrival_row, arrival_nonneg_row])
-            h_parts.extend([arrival_rhs, jnp.zeros(K_arr)])
+            a_high_t = jnp.tile(a_high, CH)
+            a_low_t = jnp.tile(a_low, CH)
+            G_parts = [
+                jnp.eye(n_u),
+                -jnp.eye(n_u),
+            ]
+            h_parts = [a_high_t, -a_low_t]
 
             G = jnp.concatenate(G_parts, axis=0)
             h = jnp.concatenate(h_parts, axis=0)
@@ -553,7 +516,7 @@ class SSMAgent:
             b_eq = jnp.zeros((0,))
 
             x, _s, _z, _y, converged, _iters = qpax.solve_qp(
-                Q_qp, c_qp, A_eq, b_eq, G, h)
+                Q_qp, c_qp, A_eq, b_eq, G, h, max_iter=30)
             return x[:n_u].reshape(CH, nU), converged
 
         self._jax_solve_mpc = jax.jit(_build_and_solve)
@@ -570,10 +533,8 @@ class SSMAgent:
         self.convex_solver_solution_nonfinite = 0
         self.convex_nonfinite_inputs = {
             name: 0 for name in (
-                'z', 'A', 'B', 'reward_alpha', 'reward_w2',
-                'reward_w3', 'reward_b1', 'reward_b2',
-                'arrival_alpha', 'arrival_w2', 'arrival_w3',
-                'arrival_b1', 'arrival_b2',
+                'z', 'A', 'B', 'reward_Q', 'reward_q', 'reward_b',
+                'arrival_Q', 'arrival_q', 'arrival_b',
             )
         }
         self.convex_last_failure_reason = 'none'
@@ -783,8 +744,7 @@ class SSMAgent:
         ctx_state = ctx_state.permute(1, 0, 2)
         ctx_action = ctx_action.permute(1, 0, 2)
         (A_seq, B_seq,
-         reward_w1_seq, reward_w2_seq, reward_w3_seq,
-         reward_b1_seq, reward_b2_seq,
+         reward_Q_seq, reward_q_seq, reward_b_seq,
          encoder_in) = self.model.encode_context(
             ctx_state, ctx_action, obs[self.history_horizon]
         )
@@ -808,9 +768,7 @@ class SSMAgent:
         for t in range(H):
             r_pred = self.model.reward(
                 zs[t], action[t+self.history_horizon],
-                reward_w1_seq[:, t], reward_w2_seq[:, t],
-                reward_w3_seq[:, t], reward_b1_seq[:, t],
-                reward_b2_seq[:, t],
+                reward_Q_seq[:, t], reward_q_seq[:, t], reward_b_seq[:, t],
             )
             reward_step = F.smooth_l1_loss(
                 r_pred, reward[t+self.history_horizon], reduction='none'
@@ -926,8 +884,7 @@ class SSMAgent:
             ctx_state = obs[:self.history_horizon].permute(1, 0, 2)
             ctx_action = action[:self.history_horizon].permute(1, 0, 2)
             (A_seq, B_seq,
-             reward_w1_seq, reward_w2_seq, reward_w3_seq,
-             reward_b1_seq, reward_b2_seq,
+             reward_Q_seq, reward_q_seq, reward_b_seq,
              encoder_in) = self.model.encode_context(
                 ctx_state, ctx_action, obs[self.history_horizon]
             )
@@ -941,9 +898,7 @@ class SSMAgent:
                 z = self.model.next(z, action[t+self.history_horizon], A_seq[:, t], B_seq[:, t])
                 r_pred = self.model.reward(
                     z, action[t+self.history_horizon],
-                    reward_w1_seq[:, t], reward_w2_seq[:, t],
-                    reward_w3_seq[:, t], reward_b1_seq[:, t],
-                    reward_b2_seq[:, t],
+                    reward_Q_seq[:, t], reward_q_seq[:, t], reward_b_seq[:, t],
                 )
                 predicted_rewards.append(r_pred.detach().cpu().numpy())
 
