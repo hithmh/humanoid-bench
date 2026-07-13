@@ -361,53 +361,54 @@ class SSMAgent:
             if t.is_cuda and not self._jax_has_cuda:
                 return to_jax_via_numpy(t)
             return jax.dlpack.from_dlpack(t)
-            # try:
-            #     return jax.dlpack.from_dlpack(t)
-            # except TypeError:
-            #     try:
-            #         return jax.dlpack.from_dlpack(torch.utils.dlpack.to_dlpack(t))
-            #     except RuntimeError as exc:
-            #         if t.is_cuda and self._is_jax_cuda_error(exc):
-            #             self._disable_jax_cuda_mpc(exc)
-            #             return to_jax_via_numpy(t)
-            #         raise
-            # except RuntimeError as exc:
-            #     if t.is_cuda and self._is_jax_cuda_error(exc):
-            #         self._disable_jax_cuda_mpc(exc)
-            #         return to_jax_via_numpy(t)
-            #     raise
 
-        try:
-            z_jax = to_jax(z_t)
-            a_low_jax = jax.device_put(self._a_low_np, z_jax.device).astype(z_jax.dtype)
-            a_high_jax = jax.device_put(self._a_high_np, z_jax.device).astype(z_jax.dtype)
-            U_sol, converged = self._jax_solve_mpc(
-                z_jax,
-                to_jax(A_seq_t),
-                to_jax(B_seq_t),
-                to_jax(reward_alpha_t),
-                to_jax(reward_w2_t),
-                to_jax(reward_w3_t),
-                to_jax(reward_b1_t),
-                to_jax(arrival_alpha_t),
-                to_jax(arrival_w2_t),
-                to_jax(arrival_w3_t),
-                to_jax(arrival_b1_t),
-                a_low_jax,
-                a_high_jax,
-            )
-            if not bool(converged):
-                self._record_convex_failure('nonconverged')
-                return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
-            u = np.asarray(U_sol[0], dtype=np.float32)   # first control step
-            if not np.isfinite(u).all():
-                self._record_convex_failure('solution_nonfinite')
-                return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
-        except Exception as exc:
-            if self._is_jax_cuda_error(exc):
-                self._disable_jax_cuda_mpc(exc)
-            self._record_convex_failure('exception', exc)
-            return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
+        def jax_array_device(x):
+            device = getattr(x, "device", None)
+            if callable(device):
+                return device()
+            if device is not None:
+                return device
+
+            devices = getattr(x, "devices", None)
+            if callable(devices):
+                return next(iter(devices()))
+
+            device_buffer = getattr(x, "device_buffer", None)
+            if device_buffer is not None:
+                buffer_device = getattr(device_buffer, "device", None)
+                if callable(buffer_device):
+                    return buffer_device()
+                if buffer_device is not None:
+                    return buffer_device
+
+            return None
+
+
+        z_jax = to_jax(z_t)
+        z_device = jax_array_device(z_jax)
+        a_low_jax = jnp.asarray(self._a_low_np, dtype=z_jax.dtype)
+        a_high_jax = jnp.asarray(self._a_high_np, dtype=z_jax.dtype)
+        if z_device is not None:
+            a_low_jax = jax.device_put(a_low_jax, z_device)
+            a_high_jax = jax.device_put(a_high_jax, z_device)
+        U_sol, converged = self._jax_solve_mpc(
+            z_jax,
+            to_jax(A_seq_t),
+            to_jax(B_seq_t),
+            to_jax(reward_alpha_t),
+            to_jax(reward_w2_t),
+            to_jax(reward_w3_t),
+            to_jax(reward_b1_t),
+            to_jax(arrival_alpha_t),
+            to_jax(arrival_w2_t),
+            to_jax(arrival_w3_t),
+            to_jax(arrival_b1_t),
+            a_low_jax,
+            a_high_jax,
+        )
+        if not bool(converged):
+            self._record_convex_failure('nonconverged')
+        u = np.asarray(U_sol[0], dtype=np.float32)   # first control step
 
         if not eval_mode:
             std = self.model.get_pi_std(z)[0]

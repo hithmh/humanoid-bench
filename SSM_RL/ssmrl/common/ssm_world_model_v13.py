@@ -139,9 +139,6 @@ class SSMWorldModel(nn.Module):
         # ---- Deterministic encoder: obs → latent (for world model) ----
         # self._encoder_mean = _mlp(state_dim, encoder_hidden, latent_dim)
         self._encoder_mean = layers.enc(cfg)
-        self._encoder_mean_target = deepcopy(self._encoder_mean)
-        for p in self._encoder_mean_target.parameters():
-            p.requires_grad_(False)
 
         # ---- Transformer context encoder ----
         self._transformer = TransformerContextEncoder(
@@ -283,9 +280,6 @@ class SSMWorldModel(nn.Module):
             2 * [cfg.mlp_dim],
             arrival_q_out_dim,
         )
-        self._arrival_q_target = deepcopy(self._arrival_q)
-        for p in self._arrival_q_target.parameters():
-            p.requires_grad_(False)
 
     # ------------------------------------------------------------------
     # Properties
@@ -302,13 +296,12 @@ class SSMWorldModel(nn.Module):
         for m in self._pi_target:
             m.train(False)
         self._q_func_target.train(False)
-        self._arrival_q_target.train(False)
         return self
 
     # ------------------------------------------------------------------
     # Encoding
     # ------------------------------------------------------------------
-    def encode(self, obs, target=False):
+    def encode(self, obs):
         """
         Encode observations → latent (deterministic).
 
@@ -318,7 +311,7 @@ class SSMWorldModel(nn.Module):
         Returns:
             z   (same leading shape as obs, last dim = latent_dim)
         """
-        encoder = self._encoder_mean_target if target else self._encoder_mean
+        encoder = self._encoder_mean
         return encoder[self.cfg.obs](obs)
 
     def encode_context(self, state_history, action_history, current_obs):
@@ -574,7 +567,7 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     # Quadratic Q-Function for MPC arrival cost
     # ------------------------------------------------------------------
-    def arrival_Q_params(self, encoder_in, target=False):
+    def arrival_Q_params(self, encoder_in):
         """
         Return context-conditioned quadratic Q coefficients.
 
@@ -592,7 +585,7 @@ class SSMWorldModel(nn.Module):
             Rc_diag: [batch, act_dim]
             rc_vec:  [batch, act_dim]
         """
-        net = self._arrival_q_target if target else self._arrival_q
+        net = self._arrival_q
         D = self.latent_dim
         nU = self.act_dim
 
@@ -605,7 +598,7 @@ class SSMWorldModel(nn.Module):
 
         return P_diag, p_vec, pb, Rc_diag, rc_vec
 
-    def arrival_Q_value(self, z, a, encoder_in, target=False, return_type='min'):
+    def arrival_Q_value(self, z, a, encoder_in):
         """
         Evaluate the quadratic arrival Q-function.
 
@@ -618,18 +611,15 @@ class SSMWorldModel(nn.Module):
         Returns:
             Arrival Q value [batch, 1]
         """
-        P_diag, p_vec, pb, Rc_diag, rc_vec = self.arrival_Q_params(encoder_in, target=target)
+        P_diag, p_vec, pb, Rc_diag, rc_vec = self.arrival_Q_params(encoder_in)
 
         quad_z = (P_diag * z * z).sum(dim=-1, keepdim=True)
         lin_z = (p_vec * z).sum(dim=-1, keepdim=True)
         quad_a = (Rc_diag * a * a).sum(dim=-1, keepdim=True)
         lin_a = (rc_vec * a).sum(dim=-1, keepdim=True)
         value = -(quad_z + lin_z + pb.unsqueeze(-1) + quad_a + lin_a)
+        return value
 
-        if return_type in {'all', 'max', 'min', 'avg', None}:
-            return value
-        else:
-            raise ValueError(f"Unknown return_type: {return_type}")
 
     # ------------------------------------------------------------------
     # Gradient control helpers
@@ -649,15 +639,8 @@ class SSMWorldModel(nn.Module):
         if tau is None:
             tau = self.cfg.tau
         with torch.no_grad():
-            # World model encoder target
-            for p_tgt, p in zip(self._encoder_mean_target.parameters(),
-                                 self._encoder_mean.parameters()):
-                p_tgt.data.lerp_(p.data, tau)
             # Q-function target
             for p_tgt, p in zip(self._q_func_target.parameters(), self._q_func.parameters()):
-                p_tgt.data.lerp_(p.data, tau)
-            # Arrival Q-function target
-            for p_tgt, p in zip(self._arrival_q_target.parameters(), self._arrival_q.parameters()):
                 p_tgt.data.lerp_(p.data, tau)
             # Update all three policy heads
             pi_pairs = [

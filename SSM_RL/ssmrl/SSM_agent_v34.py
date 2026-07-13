@@ -301,7 +301,7 @@ class SSMAgent:
         z_t          = z[0]              # (D,)
 
         P_diag, p_vec, pb_vec, Rc_diag, rc_vec = self.model.arrival_Q_params(
-            encoder_in, target=False)
+            encoder_in)
         P_diag_t  = P_diag[0]            # (D,)
         p_vec_t   = p_vec[0]             # (D,)
         pb_vec_t  = pb_vec[0]            # ()
@@ -323,13 +323,7 @@ class SSMAgent:
             'Rc_arrival': Rc_diag_t,
             'rc_arrival': rc_vec_t,
         }
-        bad_inputs = [name for name, tensor in input_tensors.items()
-                      if not torch.isfinite(tensor).all().item()]
-        if bad_inputs:
-            self._record_qpax_failure('input_nonfinite', ','.join(bad_inputs))
-            for name in bad_inputs:
-                self.qpax_nonfinite_inputs[name] += 1
-            return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
+
 
         # ---- PyTorch -> JAX. Use DLPack when both libraries share a backend;
         # otherwise copy through CPU so CUDA Torch + CPU-only JAX still works.
@@ -351,33 +345,26 @@ class SSMAgent:
                     return jnp.asarray(t.cpu().numpy())
                 raise
 
-        try:
-            U_sol, converged = self._jax_solve_mpc(
-                to_jax(z_t),
-                to_jax(A_seq_t),
-                to_jax(B_seq_t),
-                to_jax(Q_seq_t),
-                to_jax(q_seq_t),
-                to_jax(R_seq_t),
-                to_jax(r_seq_t),
-                to_jax(P_diag_t),
-                to_jax(p_vec_t),
-                to_jax(pb_vec_t),
-                to_jax(Rc_diag_t),
-                to_jax(rc_vec_t),
-                self._a_low_jax,
-                self._a_high_jax,
-            )
-            if not bool(converged):
-                self._record_qpax_failure('nonconverged')
-                return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
-            u = np.asarray(U_sol[0], dtype=np.float32)   # first control step
-            if not np.isfinite(u).all():
-                self._record_qpax_failure('solution_nonfinite')
-                return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
-        except Exception as exc:
-            self._record_qpax_failure('exception', exc)
-            return self._sanitize_action(self.model.pi(obs_t, deterministic=eval_mode)[0].cpu().numpy())
+
+        U_sol, converged = self._jax_solve_mpc(
+            to_jax(z_t),
+            to_jax(A_seq_t),
+            to_jax(B_seq_t),
+            to_jax(Q_seq_t),
+            to_jax(q_seq_t),
+            to_jax(R_seq_t),
+            to_jax(r_seq_t),
+            to_jax(P_diag_t),
+            to_jax(p_vec_t),
+            to_jax(pb_vec_t),
+            to_jax(Rc_diag_t),
+            to_jax(rc_vec_t),
+            self._a_low_jax,
+            self._a_high_jax,
+        )
+        if not bool(converged):
+            self._record_qpax_failure('nonconverged')
+        u = np.asarray(U_sol[0], dtype=np.float32)   # first control step
 
         if not eval_mode:
             std = self.model.get_pi_std(obs_t)[0]
@@ -843,6 +830,7 @@ class SSMAgent:
         # ---- Value loss (scalar Q ensemble + quadratic arrival Q-function) ----
         obs_for_q = obs[0]
         obs_target = obs[1]
+        a_for_q = action[0]
         # Sample target action from raw obs; evaluate it with raw target obs
         with torch.no_grad():
             a_target = self.model.pi(obs_target, target=True, deterministic=True)
@@ -851,7 +839,6 @@ class SSMAgent:
             obs_target, a_target, target=True
         )
         # Replay action for Q(obs, a)
-        a_for_q = action[0]
         q_pred_all = self.model.Q_value(obs_for_q, a_for_q, target=False, return_type='all')
         q_target = q_target_val.detach().expand_as(q_pred_all)
         q_loss = F.mse_loss(q_pred_all, q_target)
@@ -863,11 +850,11 @@ class SSMAgent:
         with torch.no_grad():
             a_target = self.model.pi(obs_target, target=True, deterministic=True)
 
-        q_target_val = reward[self.history_horizon + H-1] + self.discount * self.model.Q_value(
-            obs_target, a_target, target=False
+        q_target_val = self.model.Q_value(
+            obs_target, a_target, target=False, return_type='avg'
         )
         arrival_q_pred = self.model.arrival_Q_value(
-            z_for_q, a_for_q, encoder_in, target=False, return_type='all')
+            z_for_q, a_for_q, encoder_in)
         arrival_q_target = q_target_val.detach().expand_as(arrival_q_pred)
         arrival_q_loss = F.smooth_l1_loss(arrival_q_pred, arrival_q_target)
         # Normalise
@@ -892,7 +879,7 @@ class SSMAgent:
         self.model_optim.step()
 
         # ---- Update policy from raw observations; critic also uses raw observations ----
-        pi_loss = self.update_pi(obs[self.history_horizon])
+        pi_loss = self.update_pi(obs[0])
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()
