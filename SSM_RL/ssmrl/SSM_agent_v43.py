@@ -9,11 +9,10 @@ QP solver fails, actions come from the learned policy.
 
 MPC controller:
   * The finite-horizon control problem is assembled in JAX and JIT-compiled.
-  * ``qpax`` solves the dense QP over the stacked action sequence and ReLU
-    epigraph variables.
-  * Dense latent dynamics are analytically unrolled, eliminating equality
-    dynamics constraints:
-      z_{t+1} = A_t ... A_0 z_0 + T_u[t] @ U_flat
+  * ``qpax`` solves a sparse-form QP over the stacked predicted latents,
+    action sequence, and ReLU epigraph variables.
+  * Latent dynamics remain explicit equality constraints:
+      z_{t+1} = A_t z_t + B_t u_t
   * Per-step action bounds and reward epigraph constraints are encoded as
     inequalities ``G x <= h``.
   * The stage reward and terminal arrival Q use the convex ReLU epigraph
@@ -25,8 +24,9 @@ MPC controller:
 
 QP form passed to ``qpax``:
   min   0.5 * x^T Q_qp x + c_qp^T x
-  s.t.  G x <= h
-  where x = [U_flat, reward_relu_epigraphs, arrival_q_relu_epigraphs]
+  s.t.  A_eq x = b_eq, G x <= h
+  where x = [Z_flat, U_flat, reward_relu_epigraphs,
+             arrival_q_relu_epigraphs]
 
 Training loop:
   sample replay buffer -> encode context -> latent rollout -> optimize
@@ -409,7 +409,9 @@ class SSMAgent:
         if not bool(converged):
             self._record_convex_failure('nonconverged')
         u = np.asarray(U_sol[0], dtype=np.float32)   # first control step
-
+        if not np.isfinite(u).all():
+            self._record_convex_failure('solution_nonfinite')
+            return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
         if not eval_mode:
             std = self.model.get_pi_std(z)[0]
             epsilon = (std * torch.randn(self.act_dim, device=std.device)
@@ -425,10 +427,15 @@ class SSMAgent:
         """
         Build and JIT-compile the JAX/qpax MPC solve function.
 
-        Dynamics constraints are analytically eliminated by expressing the full
-        state trajectory as a linear map of the stacked control vector U_flat.
-        ReLU reward and arrival-Q terms are represented with epigraph
-        variables, matching the v40 convex QP parameterization.
+        The QP uses a sparse MPC transcription with predicted latent states,
+        controls, and ReLU epigraph variables all present in the decision
+        vector:
+
+            x = [z_1, ..., z_H, u_0, ..., u_{H-1}, y_reward, y_arrival]
+
+        The initial latent z_0 is fixed input data, so only z_1...z_H are
+        optimized. Dynamics are enforced by equality constraints, while action
+        bounds and epigraph inequalities remain in G x <= h.
         """
         D   = self.latent_dim
         nU  = self.act_dim
@@ -452,75 +459,85 @@ class SSMAgent:
                              a_low, a_high):
             K = reward_alpha.shape[1]
             K_arr = arrival_alpha.shape[0]
+            n_z = H * D
             n_u = CH * nU
             n_reward_y = H * K
             n_y = n_reward_y + K_arr
-            n = n_u + n_y
+            n = n_z + n_u + n_y
 
-            f_list = []
-            T_u_list = []
+            s_z0 = 0
+            s_u0 = n_z
+            s_y0 = n_z + n_u
+
+            def z_start(t):
+                return s_z0 + t * D
+
+            def u_start(t):
+                return s_u0 + min(t, CH - 1) * nU
+
+            def y_reward_start(t):
+                return s_y0 + t * K
+
+            s_arr_y = s_y0 + n_reward_y
+            e_arr_y = s_arr_y + K_arr
+
+            Aeq_parts = []
+            beq_parts = []
             for t in range(H):
-                A_cum = jnp.eye(D)
-                for s in range(t + 1):
-                    A_cum = A_seq[s] @ A_cum
-                f_list.append(A_cum @ z0)
+                s_z_next = z_start(t)
+                e_z_next = s_z_next + D
+                s_u = u_start(t)
+                e_u = s_u + nU
 
-                T_u_t = jnp.zeros((D, n_u))
-                for k in range(CH):
-                    s_k = k * nU
-                    e_k = (k + 1) * nU
-                    if k < CH - 1:
-                        if k <= t:
-                            A_prod = jnp.eye(D)
-                            for s in range(k + 1, t + 1):
-                                A_prod = A_seq[s] @ A_prod
-                            T_u_t = T_u_t.at[:, s_k:e_k].set(A_prod @ B_seq[k])
-                    else:
-                        accum = jnp.zeros((D, nU))
-                        for j in range(CH - 1, t + 1):
-                            A_prod = jnp.eye(D)
-                            for s in range(j + 1, t + 1):
-                                A_prod = A_seq[s] @ A_prod
-                            accum = accum + A_prod @ B_seq[j]
-                        T_u_t = T_u_t.at[:, s_k:e_k].set(accum)
-                T_u_list.append(T_u_t)
+                dyn_row = jnp.zeros((D, n))
+                dyn_row = dyn_row.at[:, s_z_next:e_z_next].set(jnp.eye(D))
+                dyn_row = dyn_row.at[:, s_u:e_u].set(-B_seq[t])
+                if t == 0:
+                    dyn_rhs = A_seq[t] @ z0
+                else:
+                    s_z_prev = z_start(t - 1)
+                    e_z_prev = s_z_prev + D
+                    dyn_row = dyn_row.at[:, s_z_prev:e_z_prev].set(-A_seq[t])
+                    dyn_rhs = jnp.zeros(D)
+
+                Aeq_parts.append(dyn_row)
+                beq_parts.append(dyn_rhs)
 
             Q_qp = jnp.zeros((n, n))
             c_qp = jnp.zeros(n)
             for t in range(H):
-                s_y = n_u + t * K
+                s_y = y_reward_start(t)
                 e_y = s_y + K
                 c_qp = c_qp.at[s_y:e_y].add((discount ** t) * reward_alpha[t])
 
-            s_arr_y = n_u + n_reward_y
-            e_arr_y = s_arr_y + K_arr
             c_qp = c_qp.at[s_arr_y:e_arr_y].add(
                 (discount ** H) * arrival_alpha)
 
             a_high_t = jnp.tile(a_high, CH)
             a_low_t = jnp.tile(a_low, CH)
-            zeros_action_y = jnp.zeros((n_u, n_y))
+            action_upper = jnp.zeros((n_u, n))
+            action_upper = action_upper.at[:, s_u0:s_u0 + n_u].set(jnp.eye(n_u))
+            action_lower = jnp.zeros((n_u, n))
+            action_lower = action_lower.at[:, s_u0:s_u0 + n_u].set(-jnp.eye(n_u))
             G_parts = [
-                jnp.concatenate([jnp.eye(n_u), zeros_action_y], axis=1),
-                jnp.concatenate([-jnp.eye(n_u), zeros_action_y], axis=1),
+                action_upper,
+                action_lower,
             ]
             h_parts = [a_high_t, -a_low_t]
 
             for t in range(H):
-                k_u = min(t, CH - 1)
-                s_u = k_u * nU
-                e_u = (k_u + 1) * nU
-                s_y = n_u + t * K
+                s_z = z_start(t)
+                e_z = s_z + D
+                s_u = u_start(t)
+                e_u = s_u + nU
+                s_y = y_reward_start(t)
                 e_y = s_y + K
-                Tu = T_u_list[t]
-                f = f_list[t]
 
-                relu_u = reward_w2[t] @ Tu
-                relu_u = relu_u.at[:, s_u:e_u].add(reward_w3[t])
                 relu_row = jnp.zeros((K, n))
-                relu_row = relu_row.at[:, :n_u].set(relu_u)
+                relu_row = relu_row.at[:, s_z:e_z].set(reward_w2[t])
+                relu_row = relu_row.at[:, s_u:e_u].set(reward_w3[t])
                 relu_row = relu_row.at[:, s_y:e_y].set(-jnp.eye(K))
-                relu_rhs = -(reward_w2[t] @ f + reward_b1[t])
+                relu_rhs = -reward_b1[t]
 
                 nonneg_row = jnp.zeros((K, n))
                 nonneg_row = nonneg_row.at[:, s_y:e_y].set(-jnp.eye(K))
@@ -528,17 +545,16 @@ class SSMAgent:
                 G_parts.extend([relu_row, nonneg_row])
                 h_parts.extend([relu_rhs, jnp.zeros(K)])
 
-            Tu_H = T_u_list[H - 1]
-            f_H = f_list[H - 1]
-            s_u_H = (CH - 1) * nU
-            e_u_H = CH * nU
+            s_z_H = z_start(H - 1)
+            e_z_H = s_z_H + D
+            s_u_H = u_start(H - 1)
+            e_u_H = s_u_H + nU
 
-            arrival_u = arrival_w2 @ Tu_H
-            arrival_u = arrival_u.at[:, s_u_H:e_u_H].add(arrival_w3)
             arrival_row = jnp.zeros((K_arr, n))
-            arrival_row = arrival_row.at[:, :n_u].set(arrival_u)
+            arrival_row = arrival_row.at[:, s_z_H:e_z_H].set(arrival_w2)
+            arrival_row = arrival_row.at[:, s_u_H:e_u_H].set(arrival_w3)
             arrival_row = arrival_row.at[:, s_arr_y:e_arr_y].set(-jnp.eye(K_arr))
-            arrival_rhs = -(arrival_w2 @ f_H + arrival_b1)
+            arrival_rhs = -arrival_b1
 
             arrival_nonneg_row = jnp.zeros((K_arr, n))
             arrival_nonneg_row = arrival_nonneg_row.at[:, s_arr_y:e_arr_y].set(
@@ -549,12 +565,12 @@ class SSMAgent:
 
             G = jnp.concatenate(G_parts, axis=0)
             h = jnp.concatenate(h_parts, axis=0)
-            A_eq = jnp.zeros((0, n))
-            b_eq = jnp.zeros((0,))
+            A_eq = jnp.concatenate(Aeq_parts, axis=0)
+            b_eq = jnp.concatenate(beq_parts, axis=0)
 
             x, _s, _z, _y, converged, _iters = qpax.solve_qp(
                 Q_qp, c_qp, A_eq, b_eq, G, h)
-            return x[:n_u].reshape(CH, nU), converged
+            return x[s_u0:s_u0 + n_u].reshape(CH, nU), converged
 
         self._jax_solve_mpc = jax.jit(_build_and_solve)
 

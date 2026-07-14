@@ -423,7 +423,7 @@ class SSMWorldModel(nn.Module):
         x = torch.cat([z, a], dim=-1)
         quad = torch.bmm(x.unsqueeze(1), torch.bmm(Q, x.unsqueeze(-1)))
         lin = (q * x).sum(dim=-1, keepdim=True)
-        return quad.squeeze(-1) + lin + b
+        return -quad.squeeze(-1) + lin + b
 
     # ------------------------------------------------------------------
     # Policy
@@ -555,7 +555,7 @@ class SSMWorldModel(nn.Module):
         x = torch.cat([z, a], dim=-1)
         quad = torch.einsum('bd,ebdf,bf->eb', x, Q, x).unsqueeze(-1)
         lin = torch.einsum('ebd,bd->eb', q, x).unsqueeze(-1)
-        value = quad + lin + b
+        value = -quad + lin + b
         if return_type == 'all':
             return value
         if return_type == 'avg':

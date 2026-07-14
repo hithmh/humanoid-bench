@@ -1,5 +1,5 @@
 """
-SSM Agent v44- transformer-conditioned SSM-RL with JAX/qpax MPC.
+SSM Agent v44- transformer-conditioned SSM-RL with JAXopt MPC.
 
 This agent wraps ``SSMWorldModel`` and provides both model learning and
 inference-time control. During inference, recent state/action history is used
@@ -9,7 +9,8 @@ QP solver fails, actions come from the learned policy.
 
 MPC controller:
   * The finite-horizon control problem is assembled in JAX and JIT-compiled.
-  * ``qpax`` solves the dense QP over the stacked action sequence.
+  * ``jaxopt.OSQP`` solves the dense convex QP over the stacked action
+    sequence.
   * Dense latent dynamics are analytically unrolled, eliminating equality
     dynamics constraints:
       z_{t+1} = A_t ... A_0 z_0 + T_u[t] @ U_flat
@@ -21,7 +22,7 @@ MPC controller:
   * PyTorch tensors are passed to JAX through DLPack when the backends share a
     device, avoiding per-step NumPy conversion.
 
-QP form passed to ``qpax``:
+QP form passed to JAXopt OSQP:
   min   0.5 * x^T Q_qp x + c_qp^T x
   s.t.  G x <= h
   where x = U_flat
@@ -40,7 +41,7 @@ import torch.nn.functional as F
 
 import jax
 import jax.numpy as jnp
-import qpax  # pip install qpax
+import jaxopt
 
 
 from ssmrl.common.ssm_world_model_v44 import SSMWorldModel
@@ -130,7 +131,7 @@ class SSMAgent:
         self._action_history_tensors = []
         self._reset_convex_diagnostics()
 
-        # Build JAX + qpax MPC controller
+        # Build JAX + JAXopt MPC controller
         self._build_convex_controller()
 
     def _resolve_device(self, requested):
@@ -196,7 +197,7 @@ class SSMAgent:
             # Not enough history for transformer - use policy net on latent state
             u_norm = self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy()
         else:
-            # Attempt JAX/qpax convex planning
+            # Attempt JAX/JAXopt convex QP planning
             u_norm = self._plan_convex(z, obs_t, eval_mode)
         u_norm = self._sanitize_action(u_norm)
         # Update history
@@ -277,7 +278,7 @@ class SSMAgent:
 
     def _plan_convex(self, z: torch.Tensor, obs_t: torch.Tensor, eval_mode: bool):
         """
-        Solve the JAX/qpax MPC problem. Falls back to the policy net on
+        Solve the JAX/JAXopt MPC problem. Falls back to the policy net on
         numerical failure or solver non-convergence.
 
         Returns:
@@ -330,6 +331,16 @@ class SSMAgent:
             'arrival_q': arrival_q_t,
             'arrival_b': arrival_b_t,
         }
+        # bad_inputs = [
+        #     name for name, tensor in input_tensors.items()
+        #     if not torch.isfinite(tensor).all()
+        # ]
+        # if bad_inputs:
+        #     self._record_convex_failure('input_nonfinite', ','.join(bad_inputs))
+        #     for name in bad_inputs:
+        #         self.convex_nonfinite_inputs[name] += 1
+        #     return self._sanitize_action(
+        #         self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
 
         def to_jax_via_numpy(t: torch.Tensor):
             return jnp.asarray(t.detach().cpu().numpy())
@@ -362,7 +373,8 @@ class SSMAgent:
 
             return None
 
-
+        #
+        # try:
         z_jax = to_jax(z_t)
         z_device = jax_array_device(z_jax)
         a_low_jax = jnp.asarray(self._a_low_np, dtype=z_jax.dtype)
@@ -370,6 +382,12 @@ class SSMAgent:
         if z_device is not None:
             a_low_jax = jax.device_put(a_low_jax, z_device)
             a_high_jax = jax.device_put(a_high_jax, z_device)
+        U_init_t = self._policy_rollout_mpc_init(
+            z_t,
+            A_seq_t,
+            B_seq_t,
+            eval_mode,
+        )
         U_sol, converged = self._jax_solve_mpc(
             z_jax,
             to_jax(A_seq_t),
@@ -378,13 +396,23 @@ class SSMAgent:
             to_jax(reward_q_t),
             to_jax(arrival_Q_t),
             to_jax(arrival_q_t),
+            to_jax(U_init_t),
             a_low_jax,
             a_high_jax,
         )
+        # except Exception as exc:
+        #     if self._is_jax_cuda_error(exc):
+        #         self._disable_jax_cuda_mpc(exc)
+        #     self._record_convex_failure('exception', exc)
+        #     return self._sanitize_action(
+        #         self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
         if not bool(converged):
             self._record_convex_failure('nonconverged')
+            return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
         u = np.asarray(U_sol[0], dtype=np.float32)   # first control step
-
+        if not np.isfinite(u).all():
+            self._record_convex_failure('solution_nonfinite')
+            return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
         if not eval_mode:
             std = self.model.get_pi_std(z)[0]
             epsilon = (std * torch.randn(self.act_dim, device=std.device)
@@ -394,11 +422,11 @@ class SSMAgent:
         return u
 
     # ------------------------------------------------------------------
-    # JAX + qpax MPC controller
+    # JAX + JAXopt MPC controller
     # ------------------------------------------------------------------
     def _build_convex_controller(self):
         """
-        Build and JIT-compile the JAX/qpax MPC solve function.
+        Build and JIT-compile the JAX/JAXopt MPC solve function.
 
         Dynamics constraints are analytically eliminated by expressing the full
         state trajectory as a linear map of the stacked control vector U_flat.
@@ -418,11 +446,23 @@ class SSMAgent:
             getattr(self.cfg, 'a_bound_low', -np.ones(nU)), dtype=np.float32)
         self._a_high_np = a_high
         self._a_low_np = a_low
-        self._mpc_objective_convex = False
+        self._mpc_objective_convex = True
+        jaxopt_maxiter = int(getattr(self.cfg, 'jaxopt_mpc_maxiter', 200))
+        jaxopt_tol = float(getattr(self.cfg, 'jaxopt_mpc_tol', 1e-5))
+        jaxopt_eq_qp_solve = str(getattr(
+            self.cfg, 'jaxopt_mpc_eq_qp_solve', 'lu'))
+
+        mpc_solver = jaxopt.OSQP(
+            maxiter=jaxopt_maxiter,
+            tol=jaxopt_tol,
+            eq_qp_solve=jaxopt_eq_qp_solve,
+            jit=True,
+        )
 
         def _build_and_solve(z0, A_seq, B_seq,
                              reward_Q, reward_q,
                              arrival_Q, arrival_q,
+                             U_init,
                              a_low, a_high):
             n_u = CH * nU
             n = n_u
@@ -463,12 +503,12 @@ class SSMAgent:
             Q_qp = jnp.zeros((n, n))
             c_qp = jnp.zeros(n)
 
-            def add_negative_quadratic(Q_acc, c_acc, weight, Q_x, q_x,
-                                       x_const, X_u):
-                # qpax minimizes. Negate the learned reward/Q because MPC
-                # maximizes those predicted values.
-                Q_acc = Q_acc - weight * 2.0 * (X_u.T @ Q_x @ X_u)
-                c_acc = c_acc - weight * (X_u.T @ (2.0 * (Q_x @ x_const) + q_x))
+            def add_negated_concave_value(Q_acc, c_acc, weight, Q_x, q_x,
+                                          x_const, X_u):
+                # The model predicts value as -X.T @ Q_x @ X + q_x.T @ X + b.
+                # MPC maximizes value, so OSQP minimizes its negative.
+                Q_acc = Q_acc + weight * 2.0 * (X_u.T @ Q_x @ X_u)
+                c_acc = c_acc + weight * (X_u.T @ (2.0 * (Q_x @ x_const) - q_x))
                 return Q_acc, c_acc
 
             for t in range(H):
@@ -481,7 +521,7 @@ class SSMAgent:
                 U_select = U_select.at[:, s_u:e_u].set(jnp.eye(nU))
                 x_const = jnp.concatenate([z_const, jnp.zeros(nU)], axis=0)
                 X_u = jnp.concatenate([Z_u, U_select], axis=0)
-                Q_qp, c_qp = add_negative_quadratic(
+                Q_qp, c_qp = add_negated_concave_value(
                     Q_qp, c_qp, discount ** t,
                     reward_Q[t], reward_q[t], x_const, X_u)
 
@@ -495,7 +535,7 @@ class SSMAgent:
             X_H_u = jnp.concatenate([Tu_H, U_last], axis=0)
             arrival_Q_avg = jnp.mean(arrival_Q, axis=0)
             arrival_q_avg = jnp.mean(arrival_q, axis=0)
-            Q_qp, c_qp = add_negative_quadratic(
+            Q_qp, c_qp = add_negated_concave_value(
                 Q_qp, c_qp, discount ** H,
                 arrival_Q_avg, arrival_q_avg, x_H_const, X_H_u)
 
@@ -504,19 +544,28 @@ class SSMAgent:
 
             a_high_t = jnp.tile(a_high, CH)
             a_low_t = jnp.tile(a_low, CH)
-            G_parts = [
-                jnp.eye(n_u),
-                -jnp.eye(n_u),
-            ]
-            h_parts = [a_high_t, -a_low_t]
+            G = jnp.concatenate([jnp.eye(n_u), -jnp.eye(n_u)], axis=0)
+            h = jnp.concatenate([a_high_t, -a_low_t], axis=0)
 
-            G = jnp.concatenate(G_parts, axis=0)
-            h = jnp.concatenate(h_parts, axis=0)
-            A_eq = jnp.zeros((0, n))
-            b_eq = jnp.zeros((0,))
-
-            x, _s, _z, _y, converged, _iters = qpax.solve_qp(
-                Q_qp, c_qp, A_eq, b_eq, G, h, max_iter=30)
+            x0 = jnp.clip(jnp.ravel(U_init), a_low_t, a_high_t)
+            init_params = mpc_solver.init_params(
+                x0,
+                params_obj=(Q_qp, c_qp),
+                params_eq=None,
+                params_ineq=(G, h),
+            )
+            sol = mpc_solver.run(
+                init_params=init_params,
+                params_obj=(Q_qp, c_qp),
+                params_eq=None,
+                params_ineq=(G, h),
+            )
+            x = sol.params.primal
+            converged = (
+                jnp.isfinite(sol.state.error)
+                & (sol.state.error <= jaxopt_tol)
+                & (sol.state.status == jaxopt.BoxOSQP.SOLVED)
+            )
             return x[:n_u].reshape(CH, nU), converged
 
         self._jax_solve_mpc = jax.jit(_build_and_solve)
