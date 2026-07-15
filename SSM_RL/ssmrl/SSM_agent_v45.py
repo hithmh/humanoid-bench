@@ -400,12 +400,6 @@ class SSMAgent:
             a_low_jax,
             a_high_jax,
         )
-        # except Exception as exc:
-        #     if self._is_jax_cuda_error(exc):
-        #         self._disable_jax_cuda_mpc(exc)
-        #     self._record_convex_failure('exception', exc)
-        #     return self._sanitize_action(
-        #         self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
         if not bool(converged):
             self._record_convex_failure('nonconverged')
             return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
@@ -665,7 +659,7 @@ class SSMAgent:
             sample_weight = sample_weight.unsqueeze(-1)
         return (per_sample_loss * sample_weight).mean()
 
-    def update_pi(self, zs, sample_weight=None):
+    def update_pi(self, zs, encoder_in, sample_weight=None):
         """
         Update policy from detached encoded observations.
 
@@ -675,7 +669,8 @@ class SSMAgent:
         actor update does not backpropagate into the encoder.
 
         Args:
-            obs0:       [batch, state_dim]           raw observation for critic input
+            zs:         [time, batch, latent_dim] encoded latent states.
+            encoder_in: [batch, ctx_dim] transformer context for arrival Q.
         Returns:
             pi_loss (float)
         """
@@ -686,11 +681,13 @@ class SSMAgent:
         B = zs.size(1)
 
         z0 = zs.detach().view(-1, self.latent_dim)
+        critic_context = encoder_in.detach().unsqueeze(0).expand(
+            H, B, -1).reshape(-1, encoder_in.shape[-1])
         action, log_prob = self.model.pi(z0, return_log_prob=True)  # [B, act_dim], [B, 1]
 
         # Arrival Q at (z0, action) - critic grad frozen, actor grad flows via action.
         val = self.model.arrival_Q_value(
-            z0, action, z0, target=False, return_type='avg')  # [B, 1]
+            z0, action, critic_context, target=False, return_type='avg')  # [B, 1]
 
         self.scale.update(val.mean(0))
         val = self.scale(val)
@@ -874,7 +871,7 @@ class SSMAgent:
 
         # ---- Update policy from detached latent states; critic still uses raw observations ----
         pi_loss = self.update_pi(
-            encoded_zs, sample_weight)
+            encoded_zs, encoder_in, sample_weight)
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()

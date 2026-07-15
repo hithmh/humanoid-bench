@@ -163,16 +163,20 @@ class SSMWorldModel(nn.Module):
         )
         self._B_basis = nn.Parameter(torch.randn(self._B_num_bases, latent_dim, act_dim) * b_basis_init)
 
-        # ---- Quadratic reward head ----
-        # r(z, u) = X^T Q X + q^T X + b, where X = [z, u].
+        # ---- Context-conditioned quadratic reward head ----
+        # r(z, u | c) = X^T Q(c) X + q(c)^T X + b, where X = [z, u].
+        # The transformer context predicts Q and q; b remains a learned
+        # context-independent constant.
         self.quadratic_dim = latent_dim + act_dim
         self.quadratic_pd_eps = float(getattr(cfg, 'quadratic_pd_eps', 1e-6))
-        reward_quad_init = float(getattr(cfg, 'reward_quadratic_init', 0.01))
-        reward_linear_init = float(getattr(cfg, 'reward_linear_init', 0.01))
-        self._reward_Q_raw = nn.Parameter(
-            torch.randn(self.quadratic_dim, self.quadratic_dim) * reward_quad_init)
-        self._reward_q = nn.Parameter(
-            torch.randn(self.quadratic_dim) * reward_linear_init)
+
+        param_split = self.quadratic_dim * self.quadratic_dim
+        self._reward_param_split = param_split
+        self._reward_param_net = layers.mlp(
+            ctx_dim,
+            2 * [cfg.mlp_dim],
+            param_split + self.quadratic_dim,
+        )
         self._reward_b = nn.Parameter(torch.zeros(1))
         # ---- Policy (SAC-style stochastic: outputs mean + log_std) ----
         log_std_min = torch.tensor(getattr(cfg, 'log_std_min', -5), dtype=torch.float32)
@@ -186,24 +190,22 @@ class SSMWorldModel(nn.Module):
             2 * act_dim,
         )
 
-        # ---- Quadratic arrival Q-function ensemble for MPC arrival value ----
-        # Q_arr(z, u) = X^T Q X + q^T X + b, where X = [z, u].
+        # ---- Context-conditioned quadratic arrival Q-function ensemble ----
+        # Q_arr(z, u | c) = X^T Q(c) X + q(c)^T X + b.
+        # As with reward, Q and q are context-conditioned while b is constant.
         self.num_arrival_q = max(1, int(getattr(
             cfg, 'arrival_num_q', getattr(cfg, 'num_q', 2))))
-        arrival_quad_init = float(getattr(
-            cfg, 'arrival_quadratic_init', reward_quad_init))
-        arrival_linear_init = float(getattr(
-            cfg, 'arrival_linear_init', reward_linear_init))
-        self._arrival_Q_raw = nn.Parameter(torch.randn(
-            self.num_arrival_q, self.quadratic_dim, self.quadratic_dim)
-            * arrival_quad_init)
-        self._arrival_q = nn.Parameter(torch.randn(
-            self.num_arrival_q, self.quadratic_dim) * arrival_linear_init)
+        self._arrival_param_split = param_split
+        self._arrival_param_nets = nn.ModuleList([
+            layers.mlp(
+                ctx_dim,
+                2 * [cfg.mlp_dim],
+                param_split + self.quadratic_dim,
+            )
+            for _ in range(self.num_arrival_q)
+        ])
         self._arrival_b = nn.Parameter(torch.zeros(self.num_arrival_q, 1))
-        self._arrival_Q_raw_target = nn.Parameter(
-            self._arrival_Q_raw.detach().clone(), requires_grad=False)
-        self._arrival_q_target = nn.Parameter(
-            self._arrival_q.detach().clone(), requires_grad=False)
+        self._arrival_param_nets_target = deepcopy(self._arrival_param_nets).requires_grad_(False)
         self._arrival_b_target = nn.Parameter(
             self._arrival_b.detach().clone(), requires_grad=False)
 
@@ -272,12 +274,7 @@ class SSMWorldModel(nn.Module):
         B_weights = self._dynamics_weights(self._B_net, encoder_in, H, self._B_num_bases)
         B_seq = self._basis_matrix(B_weights, self._B_basis)
 
-        reward_params = self.reward_params(
-            batch_size=encoder_in.shape[0],
-            horizon=H,
-            device=encoder_in.device,
-            dtype=encoder_in.dtype,
-        )
+        reward_params = self.reward_params(encoder_in)
 
         return A_seq, B_seq, *reward_params, encoder_in
 
@@ -341,8 +338,7 @@ class SSMWorldModel(nn.Module):
     def _pd_from_raw_factor(raw, eps=1e-6):
         """Convert raw factors to positive definite matrices."""
         psd = SSMWorldModel._psd_from_raw_factor(raw)
-        eye = torch.eye(raw.shape[-1], device=raw.device, dtype=raw.dtype)
-        return psd + eps * eye
+        return psd
 
     # ------------------------------------------------------------------
     # Dynamics
@@ -368,33 +364,31 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     def reward_head_parameters(self):
         """Return the trainable parameters of the quadratic reward head."""
-        return [
-            self._reward_Q_raw,
-            self._reward_q,
-            self._reward_b,
-        ]
+        return (
+            list(self._reward_param_net.parameters())
+            + [self._reward_b]
+        )
 
-    def reward_params(self, batch_size=None, horizon=None, device=None, dtype=None):
+    def reward_params(self, encoder_in=None, batch_size=None, horizon=None,
+                      device=None, dtype=None):
         """
-        Return reward parameters, optionally expanded over batch and horizon.
+        Return context-conditioned reward parameters.
 
         The reward represents r = X^T Q X + q^T X + b for X = [z, a].
         """
-        Q = self._pd_from_raw_factor(
-            self._reward_Q_raw, eps=self.quadratic_pd_eps)
-        q = self._reward_q
-        b = self._reward_b
-        if device is not None or dtype is not None:
-            Q = Q.to(device=device, dtype=dtype)
-            q = q.to(device=device, dtype=dtype)
-            b = b.to(device=device, dtype=dtype)
-        if batch_size is None and horizon is None:
-            return Q, q, b
-        if batch_size is None or horizon is None:
-            raise ValueError("batch_size and horizon must be provided together")
-        Q = Q.view(1, 1, self.quadratic_dim, self.quadratic_dim).expand(
-            batch_size, horizon, -1, -1)
-        q = q.view(1, 1, self.quadratic_dim).expand(batch_size, horizon, -1)
+
+        batch_size = encoder_in.shape[0]
+        horizon = self.prediction_horizon
+        params = self._reward_param_net(encoder_in)
+        Q_raw, q = params.split(
+            [self._reward_param_split, self.quadratic_dim], dim=-1)
+        Q_raw = Q_raw.view(
+            batch_size, 1, self.quadratic_dim, self.quadratic_dim)
+        Q = self._pd_from_raw_factor(Q_raw, eps=self.quadratic_pd_eps)
+        Q = Q.expand(batch_size, horizon, -1, -1)
+        q = q.view(batch_size, 1, self.quadratic_dim)
+        q = q.expand(batch_size, horizon, -1)
+        b = self._reward_b.to(device=encoder_in.device, dtype=encoder_in.dtype)
         b = b.view(1, 1, 1).expand(batch_size, horizon, -1)
         return Q, q, b
 
@@ -413,6 +407,7 @@ class SSMWorldModel(nn.Module):
         """
         if Q is None:
             Q, q, b = self.reward_params(
+                encoder_in=None,
                 batch_size=z.shape[0],
                 horizon=1,
                 device=z.device,
@@ -468,19 +463,17 @@ class SSMWorldModel(nn.Module):
     # ------------------------------------------------------------------
     def arrival_head_parameters(self):
         """Return the trainable parameters of the quadratic arrival Q head."""
-        return [
-            self._arrival_Q_raw,
-            self._arrival_q,
-            self._arrival_b,
-        ]
+        return (
+            list(self._arrival_param_nets.parameters())
+            + [self._arrival_b]
+        )
 
     def arrival_target_head_parameters(self):
         """Return target-network parameters of the quadratic arrival Q head."""
-        return [
-            self._arrival_Q_raw_target,
-            self._arrival_q_target,
-            self._arrival_b_target,
-        ]
+        return (
+            list(self._arrival_param_nets_target.parameters())
+            + [self._arrival_b_target]
+        )
 
     def arrival_Q_params(self, encoder_in, target=False, return_type='first'):
         """
@@ -490,7 +483,7 @@ class SSMWorldModel(nn.Module):
             Q(z, a) = X^T Q X + q^T X + b, where X = [z, a].
 
         Args:
-            encoder_in: [batch, ctx_dim], used for batch/device/dtype only
+            encoder_in: [batch, ctx_dim]
             target:     whether to use target parameters
             return_type: 'first' returns one head for MPC parameter extraction;
                          'all' returns every ensemble head.
@@ -507,29 +500,28 @@ class SSMWorldModel(nn.Module):
         assert return_type in {'first', 'all'}
         batch_size = encoder_in.shape[0]
         if target:
-            Q_raw = self._arrival_Q_raw_target
-            q = self._arrival_q_target
+            param_nets = self._arrival_param_nets_target
             b = self._arrival_b_target
         else:
-            Q_raw = self._arrival_Q_raw
-            q = self._arrival_q
+            param_nets = self._arrival_param_nets
             b = self._arrival_b
+
+        params = torch.stack([net(encoder_in) for net in param_nets], dim=1)
+        Q_raw, q = params.split(
+            [self._arrival_param_split, self.quadratic_dim], dim=-1)
+        Q_raw = Q_raw.view(
+            batch_size, self.num_arrival_q,
+            self.quadratic_dim, self.quadratic_dim)
         Q = self._pd_from_raw_factor(Q_raw, eps=self.quadratic_pd_eps)
-        Q = Q.to(device=encoder_in.device, dtype=encoder_in.dtype)
-        q = q.to(device=encoder_in.device, dtype=encoder_in.dtype)
+        q = q.view(batch_size, self.num_arrival_q, self.quadratic_dim)
         b = b.to(device=encoder_in.device, dtype=encoder_in.dtype)
         if return_type == 'first':
-            Q = Q[0].view(
-                1, self.quadratic_dim, self.quadratic_dim).expand(
-                    batch_size, -1, -1)
-            q = q[0].view(1, self.quadratic_dim).expand(batch_size, -1)
+            Q = Q[:, 0]
+            q = q[:, 0]
             b = b[0].view(1, 1).expand(batch_size, -1)
             return Q, q, b
-        Q = Q.view(
-            self.num_arrival_q, 1, self.quadratic_dim, self.quadratic_dim
-        ).expand(-1, batch_size, -1, -1)
-        q = q.view(self.num_arrival_q, 1, self.quadratic_dim).expand(
-            -1, batch_size, -1)
+        Q = Q.permute(1, 0, 2, 3).contiguous()
+        q = q.permute(1, 0, 2).contiguous()
         b = b.view(self.num_arrival_q, 1, 1).expand(-1, batch_size, -1)
         return Q, q, b
 
@@ -579,8 +571,7 @@ class SSMWorldModel(nn.Module):
         if tau is None:
             tau = self.cfg.tau
         with torch.no_grad():
-            # Arrival Q target
-            for p_tgt, p in zip(
-                    self.arrival_target_head_parameters(),
-                    self.arrival_head_parameters()):
+            for p_tgt, p in zip(self._arrival_param_nets_target.parameters(),
+                                self._arrival_param_nets.parameters()):
                 p_tgt.data.lerp_(p.data, tau)
+            self._arrival_b_target.data.lerp_(self._arrival_b.data, tau)
