@@ -6,7 +6,7 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: -coef_r1_v1_c1-latent32H8-tf_nh8-fix2
+exp_name: -coef_r1_v1_c1-latent32H8-tf_nh8-tau0.1
 #agent_name: SSM_agent_v15_const
 agent_name: SSM_agent_v45
 
@@ -29,7 +29,7 @@ num_updates: 1
 l2_regularizer: 0
 enc_lr_scale: 0.3
 grad_clip_norm: 20
-tau: 0.01
+tau: 0.1
 discount_denom: 5
 param_noise_std: 2e-1
 discount_min: 0.95

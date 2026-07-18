@@ -44,7 +44,7 @@ import jax.numpy as jnp
 import jaxopt
 
 
-from ssmrl.common.ssm_world_model_v45 import SSMWorldModel
+from ssmrl.common.ssm_world_model_v46 import SSMWorldModel
 from ssmrl.common.scale import RunningScale
 
 
