@@ -66,8 +66,6 @@ class SSMAgent:
             self._jax_mpc_cuda_requested
             and any(d.platform in ('cuda', 'gpu') for d in jax.devices())
         )
-        self._jax_disable_cuda_after_error = bool(getattr(
-            cfg, 'jax_mpc_disable_cuda_after_error', True))
         self._jax_mpc_cuda_disabled = False
         self._jax_mpc_cuda_disable_reason = ''
 
@@ -212,23 +210,6 @@ class SSMAgent:
         action = np.asarray(action, dtype=np.float32).reshape(-1)
         return np.clip(action, -1.0, 1.0).astype(np.float32)
 
-    @staticmethod
-    def _is_jax_cuda_error(exc):
-        msg = str(exc).lower()
-        return any(token in msg for token in (
-            'cuda_error',
-            'cuda error',
-            'failed to allocate device memory',
-            'unknown backend cuda',
-            'gpu backend',
-        ))
-
-    def _disable_jax_cuda_mpc(self, reason):
-        if not self._jax_disable_cuda_after_error:
-            return
-        self._jax_has_cuda = False
-        self._jax_mpc_cuda_disabled = True
-        self._jax_mpc_cuda_disable_reason = str(reason)[:512]
 
     def _append_history(self, obs_np: np.ndarray, obs_t: torch.Tensor,
                         action_np: np.ndarray):
@@ -238,16 +219,6 @@ class SSMAgent:
         self._state_history_tensors.append(obs_t[0].detach().clone())
         self._action_history_tensors.append(
             torch.as_tensor(action_np, dtype=torch.float32, device=self.device).detach().clone())
-
-    # def _rebuild_tensor_histories(self):
-    #     self._state_history_tensors = [
-    #         torch.as_tensor(x, dtype=torch.float32, device=self.device)
-    #         for x in self.state_history
-    #     ]
-    #     self._action_history_tensors = [
-    #         torch.as_tensor(u, dtype=torch.float32, device=self.device)
-    #         for u in self.action_history
-    #     ]
 
     @torch.no_grad()
     def _policy_rollout_mpc_init(self, z0: torch.Tensor, A_seq: torch.Tensor,
@@ -447,9 +418,9 @@ class SSMAgent:
             self.cfg, 'jaxopt_mpc_eq_qp_solve', 'lu'))
 
         mpc_solver = jaxopt.OSQP(
-            maxiter=jaxopt_maxiter,
-            tol=jaxopt_tol,
-            eq_qp_solve=jaxopt_eq_qp_solve,
+            # maxiter=jaxopt_maxiter,
+            # tol=jaxopt_tol,
+            # eq_qp_solve=jaxopt_eq_qp_solve,
             jit=True,
         )
 
@@ -557,7 +528,7 @@ class SSMAgent:
             x = sol.params.primal
             converged = (
                 jnp.isfinite(sol.state.error)
-                & (sol.state.error <= jaxopt_tol)
+                # & (sol.state.error <= jaxopt_tol)
                 & (sol.state.status == jaxopt.BoxOSQP.SOLVED)
             )
             return x[:n_u].reshape(CH, nU), converged
@@ -826,17 +797,17 @@ class SSMAgent:
         # ---- Value loss (arrival Q is the only Q-function) ----
         arrival_q_loss = torch.tensor(0.0, device=self.device)
         encoder_in_target = encoder_in.detach()
-        encoded_zs = self.model.encode(obs)
-        for t in range(H+self.history_horizon):
+        encoded_zs = self.model.encode(obs[self.history_horizon:])
+        for t in range(H):
             z_for_q = encoded_zs[t]
-            a_for_q = action[t]
+            a_for_q = action[t+self.history_horizon]
             with torch.no_grad():
                 z_next = encoded_zs[t + 1].detach()
                 a_next = self.model.pi(z_next, deterministic=True)
                 q_next = self.model.arrival_Q_value(
                     z_next, a_next, encoder_in_target,
                     target=True, return_type='min')
-                q_target = reward[t] + self.discount * q_next
+                q_target = reward[t+self.history_horizon] + self.discount * q_next
 
             arrival_q_pred = self.model.arrival_Q_value(
                 z_for_q, a_for_q, encoder_in, target=False, return_type='all')
@@ -850,7 +821,7 @@ class SSMAgent:
         # Normalise
         consistency_loss = consistency_loss / H
         reward_loss = reward_loss / H
-        arrival_q_loss = arrival_q_loss / (H+self.history_horizon)
+        arrival_q_loss = arrival_q_loss / H
         value_loss = arrival_q_loss
 
         total_loss = (
@@ -941,11 +912,12 @@ class SSMAgent:
             # Rollout and predict rewards
             predicted_rewards = []
             for t in range(H):
-                z = self.model.next(z, action[t+self.history_horizon], A_seq[:, t], B_seq[:, t])
                 r_pred = self.model.reward(
                     z, action[t+self.history_horizon],
                     reward_Q_seq[:, t], reward_q_seq[:, t], reward_b_seq[:, t],
                 )
+                z = self.model.next(z, action[t+self.history_horizon], A_seq[:, t], B_seq[:, t])
+
                 predicted_rewards.append(r_pred.detach().cpu().numpy())
 
             # Stack predictions

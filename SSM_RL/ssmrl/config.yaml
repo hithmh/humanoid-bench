@@ -6,7 +6,7 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: -coef_r2e2_v5e-1_c1e1-latent32H4-tau0.1
+exp_name: -coef_r1_v1_c1-latent32H8-tf_nh8-fix2
 #agent_name: SSM_agent_v15_const
 agent_name: SSM_agent_v45
 
@@ -18,18 +18,18 @@ eval_freq: 10000
 # training
 steps: 10_000_000
 device: cuda
-replay_device: cpu
+replay_device: cuda
 batch_size: 256
-reward_coef: 2e2
-value_coef: 5e-1
-consistency_coef: 1e1
+reward_coef: 1
+value_coef: 1
+consistency_coef: 1
 rho: 1.0
 lr: 3e-4
 num_updates: 1
 l2_regularizer: 0
 enc_lr_scale: 0.3
 grad_clip_norm: 20
-tau: 0.1
+tau: 0.01
 discount_denom: 5
 param_noise_std: 2e-1
 discount_min: 0.95
@@ -51,7 +51,7 @@ dynamics_a_num_bases: 16
 
 # ssm transformer
 transformer_d_model: 128
-transformer_num_heads: 4
+transformer_num_heads: 8
 transformer_dff: 512
 transformer_num_layers: 6
 transformer_dropout: 0.1
@@ -59,7 +59,7 @@ history_horizon: 6
 
 # ssm controller
 apply_action_constraints: true
-jax_mpc_platform: gpu
+jax_mpc_platform: cuda
 jax_mpc_preallocate: false
 jax_mpc_mem_fraction: 0.20
 jax_mpc_disable_cuda_after_error: true
@@ -72,8 +72,8 @@ solver: jax_projected_adam
 mpc: true
 iterations: 6
 num_samples: 512
-horizon: 4
-control_horizon: 4
+horizon: 8
+control_horizon: 8
 min_std: 0.05
 max_std: 2
 temperature: 0.5
@@ -99,7 +99,7 @@ num_channels: 32
 mlp_dim: 512
 latent_dim: 32
 task_dim: 96
-num_q: 10
+num_q: 5
 dropout: 0.00
 simnorm_dim: 8
 policy_struct: [256, 256]
