@@ -6,9 +6,9 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: -coef_r1_v1_c1-latent32H8-tf_nh8-tau0.1
+exp_name: -coef_r1_v1_c1-latent256H3-lr3e-4-grad_z_Q
 #agent_name: SSM_agent_v15_const
-agent_name: SSM_agent_v45
+agent_name: SSM_agent_v46
 
 # evaluation
 checkpoint: ???
@@ -51,10 +51,10 @@ dynamics_a_num_bases: 16
 
 # ssm transformer
 transformer_d_model: 128
-transformer_num_heads: 8
+transformer_num_heads: 4
 transformer_dff: 512
 transformer_num_layers: 6
-transformer_dropout: 0.1
+transformer_dropout: 0.01
 history_horizon: 6
 
 # ssm controller
@@ -72,8 +72,8 @@ solver: jax_projected_adam
 mpc: true
 iterations: 6
 num_samples: 512
-horizon: 8
-control_horizon: 8
+horizon: 3
+control_horizon: 3
 min_std: 0.05
 max_std: 2
 temperature: 0.5
@@ -97,7 +97,7 @@ enc_dim: 256
 num_channels: 32
 
 mlp_dim: 512
-latent_dim: 32
+latent_dim: 256
 task_dim: 96
 num_q: 5
 dropout: 0.00

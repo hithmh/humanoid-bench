@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ssmrl.common import math
 from ssmrl.common import layers
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -192,20 +193,42 @@ class SSMWorldModel(nn.Module):
 
         # ---- Context-conditioned quadratic arrival Q-function ensemble ----
         # Q_arr(z, u | c) = X^T Q(c) X + q(c)^T X + b.
-        # As with reward, Q and q are context-conditioned while b is constant.
+        # Each ensemble head has its own basis banks for Q and q. The context
+        # net predicts nonnegative mixture weights over those bases.
         self.num_arrival_q = max(1, int(getattr(
             cfg, 'arrival_num_q', getattr(cfg, 'num_q', 2))))
-        self._arrival_param_split = param_split
+        self._arrival_Q_num_bases = int(getattr(cfg, 'arrival_Q_num_bases', 16))
+        self._arrival_q_num_bases = int(getattr(cfg, 'arrival_q_num_bases', 16))
+        arrival_basis_init = float(getattr(cfg, 'arrival_basis_init', 0.01))
         self._arrival_param_nets = nn.ModuleList([
             layers.mlp(
                 ctx_dim,
                 2 * [cfg.mlp_dim],
-                param_split + self.quadratic_dim,
+                self._arrival_Q_num_bases + self._arrival_q_num_bases,
             )
             for _ in range(self.num_arrival_q)
         ])
+        self._arrival_Q_basis_raw = nn.Parameter(
+            torch.randn(
+                self.num_arrival_q,
+                self._arrival_Q_num_bases,
+                self.quadratic_dim,
+                self.quadratic_dim,
+            ) * arrival_basis_init
+        )
+        self._arrival_q_basis = nn.Parameter(
+            torch.randn(
+                self.num_arrival_q,
+                self._arrival_q_num_bases,
+                self.quadratic_dim,
+            ) * arrival_basis_init
+        )
         self._arrival_b = nn.Parameter(torch.zeros(self.num_arrival_q, 1))
         self._arrival_param_nets_target = deepcopy(self._arrival_param_nets).requires_grad_(False)
+        self._arrival_Q_basis_raw_target = nn.Parameter(
+            self._arrival_Q_basis_raw.detach().clone(), requires_grad=False)
+        self._arrival_q_basis_target = nn.Parameter(
+            self._arrival_q_basis.detach().clone(), requires_grad=False)
         self._arrival_b_target = nn.Parameter(
             self._arrival_b.detach().clone(), requires_grad=False)
 
@@ -465,6 +488,7 @@ class SSMWorldModel(nn.Module):
         """Return the trainable parameters of the quadratic arrival Q head."""
         return (
             list(self._arrival_param_nets.parameters())
+            + [self._arrival_Q_basis_raw, self._arrival_q_basis]
             + [self._arrival_b]
         )
 
@@ -472,6 +496,7 @@ class SSMWorldModel(nn.Module):
         """Return target-network parameters of the quadratic arrival Q head."""
         return (
             list(self._arrival_param_nets_target.parameters())
+            + [self._arrival_Q_basis_raw_target, self._arrival_q_basis_target]
             + [self._arrival_b_target]
         )
 
@@ -501,19 +526,27 @@ class SSMWorldModel(nn.Module):
         batch_size = encoder_in.shape[0]
         if target:
             param_nets = self._arrival_param_nets_target
+            Q_basis_raw = self._arrival_Q_basis_raw_target
+            q_basis = self._arrival_q_basis_target
             b = self._arrival_b_target
         else:
             param_nets = self._arrival_param_nets
+            Q_basis_raw = self._arrival_Q_basis_raw
+            q_basis = self._arrival_q_basis
             b = self._arrival_b
 
         params = torch.stack([net(encoder_in) for net in param_nets], dim=1)
-        Q_raw, q = params.split(
-            [self._arrival_param_split, self.quadratic_dim], dim=-1)
-        Q_raw = Q_raw.view(
-            batch_size, self.num_arrival_q,
-            self.quadratic_dim, self.quadratic_dim)
-        Q = self._pd_from_raw_factor(Q_raw, eps=self.quadratic_pd_eps)
-        q = q.view(batch_size, self.num_arrival_q, self.quadratic_dim)
+        Q_weights, q_weights = params.split(
+            [self._arrival_Q_num_bases, self._arrival_q_num_bases], dim=-1)
+        Q_weights = torch.softmax(Q_weights, dim=-1)
+        q_weights = torch.softmax(q_weights, dim=-1)
+
+        Q_basis_raw = Q_basis_raw.to(device=encoder_in.device, dtype=encoder_in.dtype)
+        q_basis = q_basis.to(device=encoder_in.device, dtype=encoder_in.dtype)
+        Q_basis = self._pd_from_raw_factor(
+            Q_basis_raw, eps=self.quadratic_pd_eps)
+        Q = torch.einsum('bek,ekij->beij', Q_weights, Q_basis)
+        q = torch.einsum('bek,ekd->bed', q_weights, q_basis)
         b = b.to(device=encoder_in.device, dtype=encoder_in.dtype)
         if return_type == 'first':
             Q = Q[:, 0]
@@ -550,6 +583,9 @@ class SSMWorldModel(nn.Module):
         value = -quad + lin + b
         if return_type == 'all':
             return value
+
+        Q1, Q2 = value[np.random.choice(self.cfg.num_q, 2, replace=False)]
+        return torch.min(Q1, Q2) if return_type == "min" else (Q1 + Q2) / 2
         if return_type == 'avg':
             return value.mean(dim=0)
         return value.min(dim=0).values
@@ -574,4 +610,8 @@ class SSMWorldModel(nn.Module):
             for p_tgt, p in zip(self._arrival_param_nets_target.parameters(),
                                 self._arrival_param_nets.parameters()):
                 p_tgt.data.lerp_(p.data, tau)
+            self._arrival_Q_basis_raw_target.data.lerp_(
+                self._arrival_Q_basis_raw.data, tau)
+            self._arrival_q_basis_target.data.lerp_(
+                self._arrival_q_basis.data, tau)
             self._arrival_b_target.data.lerp_(self._arrival_b.data, tau)

@@ -304,16 +304,16 @@ class SSMAgent:
             'arrival_q': arrival_q_t,
             'arrival_b': arrival_b_t,
         }
-        # bad_inputs = [
-        #     name for name, tensor in input_tensors.items()
-        #     if not torch.isfinite(tensor).all()
-        # ]
-        # if bad_inputs:
-        #     self._record_convex_failure('input_nonfinite', ','.join(bad_inputs))
-        #     for name in bad_inputs:
-        #         self.convex_nonfinite_inputs[name] += 1
-        #     return self._sanitize_action(
-        #         self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
+        bad_inputs = [
+            name for name, tensor in input_tensors.items()
+            if not torch.isfinite(tensor).all()
+        ]
+        if bad_inputs:
+            self._record_convex_failure('input_nonfinite', ','.join(bad_inputs))
+            for name in bad_inputs:
+                self.convex_nonfinite_inputs[name] += 1
+            return self._sanitize_action(
+                self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
 
         def to_jax_via_numpy(t: torch.Tensor):
             return jnp.asarray(t.detach().cpu().numpy())
@@ -507,7 +507,7 @@ class SSMAgent:
                 arrival_Q_avg, arrival_q_avg, x_H_const, X_H_u)
 
             Q_qp = 0.5 * (Q_qp + Q_qp.T)
-            Q_qp = Q_qp + 1e-6 * jnp.eye(n)
+            Q_qp = Q_qp
 
             a_high_t = jnp.tile(a_high, CH)
             a_low_t = jnp.tile(a_low, CH)
@@ -650,12 +650,12 @@ class SSMAgent:
         self.pi_optim.zero_grad(set_to_none=True)
         self.model.track_critic_grad(False)
 
-        H = zs.size(0)
-        B = zs.size(1)
+        # H = zs.size(0)
+        B = zs.size(0)
 
         z0 = zs.detach().view(-1, self.latent_dim)
-        critic_context = encoder_in.detach().unsqueeze(0).expand(
-            H, B, -1).reshape(-1, encoder_in.shape[-1])
+        critic_context = encoder_in.detach().expand(
+            B, -1).reshape(-1, encoder_in.shape[-1])
         action, log_prob = self.model.pi(z0, return_log_prob=True)  # [B, act_dim], [B, 1]
 
         # Arrival Q at (z0, action) - critic grad frozen, actor grad flows via action.
@@ -667,7 +667,7 @@ class SSMAgent:
 
         # SAC loss: maximise (Q - alpha * log_pi)
         pi_loss_per_sample = (self.entropy_coef * log_prob - val).squeeze(-1)
-        pi_loss_per_sample = pi_loss_per_sample.view(H, B, 1)
+        pi_loss_per_sample = pi_loss_per_sample.view(B, 1)
         pi_loss_per_sample = pi_loss_per_sample.mean(dim=0)
 
         if sample_weight is None:
@@ -844,7 +844,7 @@ class SSMAgent:
 
         # ---- Update policy from detached latent states; critic still uses raw observations ----
         pi_loss = self.update_pi(
-            encoded_zs, encoder_in, sample_weight)
+            encoded_zs[0], encoder_in, sample_weight)
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()

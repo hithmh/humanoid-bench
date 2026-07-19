@@ -507,7 +507,7 @@ class SSMAgent:
                 arrival_Q_avg, arrival_q_avg, x_H_const, X_H_u)
 
             Q_qp = 0.5 * (Q_qp + Q_qp.T)
-            Q_qp = Q_qp + 1e-6 * jnp.eye(n)
+            Q_qp = Q_qp
 
             a_high_t = jnp.tile(a_high, CH)
             a_low_t = jnp.tile(a_low, CH)
@@ -650,12 +650,12 @@ class SSMAgent:
         self.pi_optim.zero_grad(set_to_none=True)
         self.model.track_critic_grad(False)
 
-        H = zs.size(0)
-        B = zs.size(1)
+        # H = zs.size(0)
+        B = zs.size(0)
 
         z0 = zs.detach().view(-1, self.latent_dim)
-        critic_context = encoder_in.detach().unsqueeze(0).expand(
-            H, B, -1).reshape(-1, encoder_in.shape[-1])
+        critic_context = encoder_in.detach().expand(
+            B, -1).reshape(-1, encoder_in.shape[-1])
         action, log_prob = self.model.pi(z0, return_log_prob=True)  # [B, act_dim], [B, 1]
 
         # Arrival Q at (z0, action) - critic grad frozen, actor grad flows via action.
@@ -667,7 +667,7 @@ class SSMAgent:
 
         # SAC loss: maximise (Q - alpha * log_pi)
         pi_loss_per_sample = (self.entropy_coef * log_prob - val).squeeze(-1)
-        pi_loss_per_sample = pi_loss_per_sample.view(H, B, 1)
+        pi_loss_per_sample = pi_loss_per_sample.view(B, 1)
         pi_loss_per_sample = pi_loss_per_sample.mean(dim=0)
 
         if sample_weight is None:
@@ -801,7 +801,7 @@ class SSMAgent:
         encoder_in_target = encoder_in.detach()
         encoded_zs = self.model.encode(obs[self.history_horizon:])
         for t in range(H):
-            z_for_q = encoded_zs[t]
+            z_for_q = zs[t]
             a_for_q = action[t+self.history_horizon]
             with torch.no_grad():
                 z_next = encoded_zs[t + 1].detach()
@@ -844,7 +844,7 @@ class SSMAgent:
 
         # ---- Update policy from detached latent states; critic still uses raw observations ----
         pi_loss = self.update_pi(
-            encoded_zs, encoder_in, sample_weight)
+            encoded_zs[0], encoder_in, sample_weight)
 
         # ---- Soft update targets ----
         self.model.soft_update_targets()
