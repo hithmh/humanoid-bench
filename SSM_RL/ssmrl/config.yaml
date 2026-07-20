@@ -6,7 +6,7 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: -coef_r1_v1_c1-latent256H3-lr3e-4-grad_z_Q-trial
+exp_name: -coef_r1_v1_c1-latent256H3-rho0.5
 #agent_name: SSM_agent_v15_const
 agent_name: SSM_agent_v46
 
@@ -23,7 +23,7 @@ batch_size: 256
 reward_coef: 1
 value_coef: 1
 consistency_coef: 1
-rho: 1.0
+rho: 0.5
 lr: 3e-4
 num_updates: 1
 l2_regularizer: 0

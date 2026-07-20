@@ -285,12 +285,23 @@ class SSMAgent:
             encoder_in, target=False, return_type='all')
         if eval_mode:
             arrival_head_idx = slice(None)
+            arrival_Q_t = arrival_Q[arrival_head_idx, 0]  # (E_arr, D+nU, D+nU)
+            arrival_q_t = arrival_q[arrival_head_idx, 0]  # (E_arr, D+nU)
+            arrival_b_t = arrival_b[arrival_head_idx, 0]  # (E_arr, 1), constant for MPC
         else:
-            idx = torch.randint(arrival_Q.shape[0], (1,), device=arrival_Q.device).item()
-            arrival_head_idx = slice(idx, idx + 1)
-        arrival_Q_t = arrival_Q[arrival_head_idx, 0]  # (E_arr, D+nU, D+nU)
-        arrival_q_t = arrival_q[arrival_head_idx, 0]  # (E_arr, D+nU)
-        arrival_b_t = arrival_b[arrival_head_idx, 0]  # (E_arr, 1), constant for MPC
+            num_arrival_heads = arrival_Q.shape[0]
+            if num_arrival_heads >= 2:
+                arrival_head_idx = torch.randperm(
+                    num_arrival_heads, device=arrival_Q.device)[:2]
+            else:
+                arrival_head_idx = torch.zeros(
+                    2, device=arrival_Q.device, dtype=torch.long)
+            arrival_Q_t = arrival_Q[arrival_head_idx, 0].mean(
+                dim=0, keepdim=True)  # (1, D+nU, D+nU)
+            arrival_q_t = arrival_q[arrival_head_idx, 0].mean(
+                dim=0, keepdim=True)  # (1, D+nU)
+            arrival_b_t = arrival_b[arrival_head_idx, 0].mean(
+                dim=0, keepdim=True)  # (1, 1), constant for MPC
 
         self.convex_solver_attempts += 1
         input_tensors = {
@@ -507,7 +518,6 @@ class SSMAgent:
                 arrival_Q_avg, arrival_q_avg, x_H_const, X_H_u)
 
             Q_qp = 0.5 * (Q_qp + Q_qp.T)
-            Q_qp = Q_qp
 
             a_high_t = jnp.tile(a_high, CH)
             a_low_t = jnp.tile(a_low, CH)
