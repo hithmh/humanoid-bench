@@ -2,7 +2,7 @@ import os
 import sys
 
 if sys.platform != "darwin":
-    os.environ["MUJOCO_GL"] = "egl"
+    os.environ.setdefault("MUJOCO_GL", "glfw")
 
 import warnings
 
