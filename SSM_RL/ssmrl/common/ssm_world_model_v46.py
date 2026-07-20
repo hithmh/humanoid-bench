@@ -145,6 +145,7 @@ class SSMWorldModel(nn.Module):
 
         # ---- A, B dynamics heads (conditioned on transformer_output || current_obs) ----
         ctx_dim = transformer_d_model + state_dim
+        self.ctx_dim = ctx_dim
         self._A_num_bases = int(getattr(cfg, 'dynamics_a_num_bases', 16))
         self._A_identity_scale = float(getattr(cfg, 'dynamics_a_identity_scale', 1.0))
         a_basis_init = float(getattr(cfg, 'dynamics_a_basis_init', 0.01))
@@ -166,17 +167,38 @@ class SSMWorldModel(nn.Module):
 
         # ---- Context-conditioned quadratic reward head ----
         # r(z, u | c) = X^T Q(c) X + q(c)^T X + b, where X = [z, u].
-        # The transformer context predicts Q and q; b remains a learned
-        # context-independent constant.
+        # The transformer context predicts horizon-wise mixture weights over
+        # learned Q and q bases; b remains a learned context-independent
+        # constant.
         self.quadratic_dim = latent_dim + act_dim
         self.quadratic_pd_eps = float(getattr(cfg, 'quadratic_pd_eps', 1e-6))
 
-        param_split = self.quadratic_dim * self.quadratic_dim
-        self._reward_param_split = param_split
+        self._reward_Q_num_bases = int(getattr(
+            cfg, 'reward_Q_num_bases',
+            getattr(cfg, 'reward_q_num_bases', self._A_num_bases)))
+        self._reward_q_num_bases = int(getattr(
+            cfg, 'reward_q_num_bases', self._reward_Q_num_bases))
+        reward_basis_init = float(getattr(
+            cfg, 'reward_basis_init',
+            getattr(cfg, 'reward_q_basis_init', a_basis_init)))
         self._reward_param_net = layers.mlp(
             ctx_dim,
             2 * [cfg.mlp_dim],
-            param_split + self.quadratic_dim,
+            (self._reward_Q_num_bases + self._reward_q_num_bases)
+            * prediction_horizon,
+        )
+        self._reward_Q_basis_raw = nn.Parameter(
+            torch.randn(
+                self._reward_Q_num_bases,
+                self.quadratic_dim,
+                self.quadratic_dim,
+            ) * reward_basis_init
+        )
+        self._reward_q_basis = nn.Parameter(
+            torch.randn(
+                self._reward_q_num_bases,
+                self.quadratic_dim,
+            ) * reward_basis_init
         )
         self._reward_b = nn.Parameter(torch.zeros(1))
         # ---- Policy (SAC-style stochastic: outputs mean + log_std) ----
@@ -389,6 +411,7 @@ class SSMWorldModel(nn.Module):
         """Return the trainable parameters of the quadratic reward head."""
         return (
             list(self._reward_param_net.parameters())
+            + [self._reward_Q_basis_raw, self._reward_q_basis]
             + [self._reward_b]
         )
 
@@ -400,19 +423,41 @@ class SSMWorldModel(nn.Module):
         The reward represents r = X^T Q X + q^T X + b for X = [z, a].
         """
 
+        if encoder_in is None:
+            assert batch_size is not None
+            if device is None:
+                device = self._reward_b.device
+            if dtype is None:
+                dtype = self._reward_b.dtype
+            encoder_in = torch.zeros(
+                batch_size, self.ctx_dim, device=device, dtype=dtype)
         batch_size = encoder_in.shape[0]
-        horizon = self.prediction_horizon
+        requested_horizon = (
+            self.prediction_horizon if horizon is None else int(horizon))
+        assert 1 <= requested_horizon <= self.prediction_horizon
+
         params = self._reward_param_net(encoder_in)
-        Q_raw, q = params.split(
-            [self._reward_param_split, self.quadratic_dim], dim=-1)
-        Q_raw = Q_raw.view(
-            batch_size, 1, self.quadratic_dim, self.quadratic_dim)
-        Q = self._pd_from_raw_factor(Q_raw, eps=self.quadratic_pd_eps)
-        Q = Q.expand(batch_size, horizon, -1, -1)
-        q = q.view(batch_size, 1, self.quadratic_dim)
-        q = q.expand(batch_size, horizon, -1)
+        params = params.view(
+            batch_size, self.prediction_horizon,
+            self._reward_Q_num_bases + self._reward_q_num_bases,
+        )
+        Q_weights, q_weights = params.split(
+            [self._reward_Q_num_bases, self._reward_q_num_bases], dim=-1)
+        Q_weights = Q_weights[:, :requested_horizon]
+        q_weights = q_weights[:, :requested_horizon]
+        Q_weights = torch.softmax(Q_weights, dim=-1)
+        q_weights = torch.softmax(q_weights, dim=-1)
+
+        Q_basis_raw = self._reward_Q_basis_raw.to(
+            device=encoder_in.device, dtype=encoder_in.dtype)
+        q_basis = self._reward_q_basis.to(
+            device=encoder_in.device, dtype=encoder_in.dtype)
+        Q_basis = self._pd_from_raw_factor(
+            Q_basis_raw, eps=self.quadratic_pd_eps)
+        Q = torch.einsum('bhk,kij->bhij', Q_weights, Q_basis)
+        q = torch.einsum('bhk,kd->bhd', q_weights, q_basis)
         b = self._reward_b.to(device=encoder_in.device, dtype=encoder_in.dtype)
-        b = b.view(1, 1, 1).expand(batch_size, horizon, -1)
+        b = b.view(1, 1, 1).expand(batch_size, requested_horizon, -1)
         return Q, q, b
 
     def reward(self, z, a, Q=None, q=None, b=None):
