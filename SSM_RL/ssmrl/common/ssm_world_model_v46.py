@@ -262,6 +262,44 @@ class SSMWorldModel(nn.Module):
     def total_params(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+    def world_model_parameters(self):
+        """Return non-policy parameters optimized by the world-model update."""
+        return (
+            list(self._encoder_mean.parameters())
+            + list(self._transformer.parameters())
+            + list(self._A_net.parameters())
+            + [self._A_basis]
+            + list(self._B_net.parameters())
+            + [self._B_basis]
+            + self.reward_head_parameters()
+            + self.arrival_head_parameters()
+        )
+
+    def policy_parameters(self):
+        """Return parameters optimized by the policy update."""
+        return list(self._pi.parameters())
+
+    def l2_regularization_loss(self, parameters=None):
+        """
+        Return 0.5 * sum ||p||_2^2 over trainable parameters.
+
+        Multiplying this by ``cfg.l2_regularizer`` gives the standard L2
+        penalty whose gradient is ``cfg.l2_regularizer * p``.
+        """
+        if parameters is None:
+            parameters = self.parameters()
+
+        reg_loss = None
+        for p in parameters:
+            if not p.requires_grad:
+                continue
+            term = p.pow(2).sum()
+            reg_loss = term if reg_loss is None else reg_loss + term
+
+        if reg_loss is None:
+            return self._reward_b.new_tensor(0.0)
+        return 0.5 * reg_loss
+
     # ------------------------------------------------------------------
     # Train / eval overrides
     # ------------------------------------------------------------------
