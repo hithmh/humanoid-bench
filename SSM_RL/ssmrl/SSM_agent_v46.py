@@ -82,6 +82,8 @@ class SSMAgent:
         enc_lr_scale = getattr(cfg, 'enc_lr_scale', 0.3)
         lr = cfg.lr
         self.l2_regularizer = float(getattr(cfg, 'l2_regularizer', 0.0))
+        # L2 is added explicitly to the training losses below, so optimizer
+        # weight decay stays disabled to avoid double-regularizing.
 
         # Group 1 – world-model parameters (encoder_mean at scaled lr)
         self.model_optim = torch.optim.Adam([
@@ -94,13 +96,13 @@ class SSMAgent:
             {'params': [self.model._B_basis]},
             {'params': self.model.reward_head_parameters()},
             {'params': self.model.arrival_head_parameters()},
-        ], lr=lr, weight_decay=self.l2_regularizer)
+        ], lr=lr, weight_decay=0.0)
 
 
         # Group 2 - TD-MPC2-style latent policy prior
         self.pi_optim = torch.optim.Adam(
-            self.model._pi.parameters(),
-            lr=lr, eps=1e-5, weight_decay=self.l2_regularizer
+            self.model.policy_parameters(),
+            lr=lr, eps=1e-5, weight_decay=0.0
         )
 
         self.model.eval()
@@ -655,7 +657,7 @@ class SSMAgent:
             zs:         [time, batch, latent_dim] encoded latent states.
             encoder_in: [batch, ctx_dim] transformer context for arrival Q.
         Returns:
-            pi_loss (float)
+            pi_loss, pi_l2_loss (float)
         """
         self.pi_optim.zero_grad(set_to_none=True)
         self.model.track_critic_grad(False)
@@ -681,9 +683,12 @@ class SSMAgent:
         pi_loss_per_sample = pi_loss_per_sample.mean(dim=0)
 
         if sample_weight is None:
-            pi_loss = pi_loss_per_sample.mean()
+            pi_objective_loss = pi_loss_per_sample.mean()
         else:
-            pi_loss = self._weighted_mean(pi_loss_per_sample, sample_weight)
+            pi_objective_loss = self._weighted_mean(pi_loss_per_sample, sample_weight)
+        pi_l2_loss = self.model.l2_regularization_loss(
+            self.model.policy_parameters())
+        pi_loss = pi_objective_loss + self.l2_regularizer * pi_l2_loss
         # if not torch.isfinite(pi_loss):
         #     self.pi_optim.zero_grad(set_to_none=True)
         #     self.model.track_critic_grad(True)
@@ -697,7 +702,7 @@ class SSMAgent:
         self.pi_optim.step()
         self.model.track_critic_grad(True)
 
-        return pi_loss.item()
+        return pi_loss.item(), pi_l2_loss.item()
 
     # ------------------------------------------------------------------
     # Main update (mirror SSMRL.update)
@@ -710,6 +715,10 @@ class SSMAgent:
             'value_loss': 0.0,
             'q_loss': 0.0,
             'arrival_q_loss': 0.0,
+            'model_l2_loss': 0.0,
+            'model_l2_penalty': 0.0,
+            'pi_l2_loss': 0.0,
+            'pi_l2_penalty': 0.0,
             'pi_loss': 0.0,
             'total_loss': 0.0,
             'grad_norm': 0.0,
@@ -836,10 +845,13 @@ class SSMAgent:
         arrival_q_loss = arrival_q_loss / H
         value_loss = arrival_q_loss
 
+        model_l2_loss = self.model.l2_regularization_loss(
+            self.model.world_model_parameters())
         total_loss = (
             self.consistency_coef * consistency_loss
             + self.reward_coef * reward_loss
             + self.value_coef * value_loss
+            + self.l2_regularizer * model_l2_loss
         )
         # if not torch.isfinite(total_loss):
         #     self.model_optim.zero_grad(set_to_none=True)
@@ -853,7 +865,7 @@ class SSMAgent:
         self.model_optim.step()
 
         # ---- Update policy from detached latent states; critic still uses raw observations ----
-        pi_loss = self.update_pi(
+        pi_loss, pi_l2_loss = self.update_pi(
             encoded_zs[0], encoder_in, sample_weight)
 
         # ---- Soft update targets ----
@@ -866,6 +878,11 @@ class SSMAgent:
             'reward_loss': float(reward_loss.item()),
             'value_loss': float(value_loss.item()),
             'arrival_q_loss': float(arrival_q_loss.item()),
+            'model_l2_loss': float(model_l2_loss.item()),
+            'model_l2_penalty': float(
+                (self.l2_regularizer * model_l2_loss).item()),
+            'pi_l2_loss': float(pi_l2_loss),
+            'pi_l2_penalty': float(self.l2_regularizer * pi_l2_loss),
             'pi_loss': pi_loss,
             'total_loss': float(total_loss.item()),
             'grad_norm': float(grad_norm),
