@@ -6,7 +6,7 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: -coef_r1_v1_c1-latent256H3-rho0.5-entro1e-1-l2r1
+exp_name: -coef_r1_v1_c1-rho1-entro1e-4-l2r1e-4-history_0
 #agent_name: SSM_agent_v15_const
 agent_name: SSM_agent_v46
 
@@ -23,10 +23,10 @@ batch_size: 256
 reward_coef: 1
 value_coef: 1
 consistency_coef: 1
-rho: 0.5
+rho: 1
 lr: 3e-4
 num_updates: 1
-l2_regularizer: 1
+l2_regularizer: 1e-4
 enc_lr_scale: 0.3
 grad_clip_norm: 20
 tau: 0.01
@@ -41,7 +41,7 @@ reward_priority_beta: 0.0
 reward_priority_eps: 1e-3
 reward_priority_uniform_mix: 0.1
 reward_priority_max_index_size: 50_000_000
-
+seed_steps: 5000
 data_dir: ???
 
 # ssm agent
@@ -55,11 +55,11 @@ transformer_num_heads: 4
 transformer_dff: 512
 transformer_num_layers: 6
 transformer_dropout: 0.1
-history_horizon: 6
+history_horizon: 1
 
 # ssm controller
 apply_action_constraints: true
-jax_mpc_platform: cuda
+jax_mpc_platform: cpu
 jax_mpc_preallocate: false
 jax_mpc_mem_fraction: 0.20
 jax_mpc_disable_cuda_after_error: true
@@ -82,7 +82,7 @@ u_penalty: 0
 # actor
 log_std_min: -10
 log_std_max: 2
-entropy_coef: 1e-1
+entropy_coef: 1e-4
 
 # critic
 num_bins: 101
@@ -128,7 +128,7 @@ episode_length: ???
 obs_shapes: ???
 action_dims: ???
 episode_lengths: ???
-seed_steps: ???
+
 bin_size: ???
 
 # humanoid envs

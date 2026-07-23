@@ -144,7 +144,8 @@ class SSMWorldModel(nn.Module):
         )
 
         # ---- A, B dynamics heads (conditioned on transformer_output || current_obs) ----
-        ctx_dim = transformer_d_model + state_dim
+        # ctx_dim = transformer_d_model + state_dim
+        ctx_dim = state_dim
         self.ctx_dim = ctx_dim
         self._A_num_bases = int(getattr(cfg, 'dynamics_a_num_bases', 16))
         self._A_identity_scale = float(getattr(cfg, 'dynamics_a_identity_scale', 1.0))
@@ -266,7 +267,7 @@ class SSMWorldModel(nn.Module):
         """Return non-policy parameters optimized by the world-model update."""
         return (
             list(self._encoder_mean.parameters())
-            + list(self._transformer.parameters())
+            # + list(self._transformer.parameters())
             + list(self._A_net.parameters())
             + [self._A_basis]
             + list(self._B_net.parameters())
@@ -348,6 +349,7 @@ class SSMWorldModel(nn.Module):
         ctx_input = torch.cat([state_history, action_history], dim=-1)
         transformer_out = self._transformer(ctx_input)  # [batch, d_model]
         encoder_in = torch.cat([transformer_out, current_obs], dim=-1)
+        encoder_in =  current_obs
 
         H = self.prediction_horizon
         A_weights = self._dynamics_weights(self._A_net, encoder_in, H, self._A_num_bases)
@@ -524,7 +526,7 @@ class SSMWorldModel(nn.Module):
         x = torch.cat([z, a], dim=-1)
         quad = torch.bmm(x.unsqueeze(1), torch.bmm(Q, x.unsqueeze(-1)))
         lin = (q * x).sum(dim=-1, keepdim=True)
-        return -quad.squeeze(-1) + lin + b
+        return -quad.squeeze(-1) + lin #+ b
 
     # ------------------------------------------------------------------
     # Policy
@@ -663,7 +665,7 @@ class SSMWorldModel(nn.Module):
         x = torch.cat([z, a], dim=-1)
         quad = torch.einsum('bd,ebdf,bf->eb', x, Q, x).unsqueeze(-1)
         lin = torch.einsum('ebd,bd->eb', q, x).unsqueeze(-1)
-        value = -quad + lin + b
+        value = -quad + lin #+ b
         if return_type == 'all':
             return value
 

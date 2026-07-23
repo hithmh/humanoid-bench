@@ -393,11 +393,11 @@ class SSMAgent:
         if not np.isfinite(u).all():
             self._record_convex_failure('solution_nonfinite')
             return self._sanitize_action(self.model.pi(z, deterministic=eval_mode)[0].cpu().numpy())
-        if not eval_mode:
-            std = self.model.get_pi_std(z)[0]
-            epsilon = (std * torch.randn(self.act_dim, device=std.device)
-                       ).detach().cpu().numpy()
-            u = u + epsilon
+        # if not eval_mode:
+        #     std = self.model.get_pi_std(z)[0]
+        #     epsilon = (std * torch.randn(self.act_dim, device=std.device)
+        #                ).detach().cpu().numpy()
+        #     u = u + epsilon
 
         return u
 
@@ -505,6 +505,10 @@ class SSMAgent:
                     Q_qp, c_qp, discount ** t,
                     reward_Q[t], reward_q[t], x_const, X_u)
 
+            Q_qp, c_qp = add_negated_concave_value(
+                Q_qp, c_qp, 10 * discount ** t,
+                reward_Q[t], reward_q[t], x_const, X_u)
+
             Tu_H = T_u_state_list[H - 1]
             f_H = f_state_list[H - 1]
             s_u_H = (CH - 1) * nU
@@ -519,7 +523,7 @@ class SSMAgent:
                 Q_qp, c_qp, discount ** H,
                 arrival_Q_avg, arrival_q_avg, x_H_const, X_H_u)
 
-            Q_qp = 0.5 * (Q_qp + Q_qp.T)
+            # Q_qp = 0.5 * (Q_qp + Q_qp.T)
 
             a_high_t = jnp.tile(a_high, CH)
             a_low_t = jnp.tile(a_low, CH)
