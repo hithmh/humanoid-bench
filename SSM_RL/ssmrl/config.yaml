@@ -6,7 +6,7 @@ defaults:
 task: humanoid_h1-walk-v0
 obs: state
 #exp_name: param_perturb-ucb-H=8-real_ensemble-10
-exp_name: -coef_r1_v1_c1-rho1-entro1e-4-l2r1e-4-history_0
+exp_name: -coef_r1_v1_c1-rho1-H8-l2r0-history_0
 #agent_name: SSM_agent_v15_const
 agent_name: SSM_agent_v46
 
@@ -26,7 +26,7 @@ consistency_coef: 1
 rho: 1
 lr: 3e-4
 num_updates: 1
-l2_regularizer: 1e-4
+l2_regularizer: 0
 enc_lr_scale: 0.3
 grad_clip_norm: 20
 tau: 0.01
@@ -72,8 +72,8 @@ solver: jax_projected_adam
 mpc: true
 iterations: 6
 num_samples: 512
-horizon: 3
-control_horizon: 3
+horizon: 8
+control_horizon: 8
 min_std: 0.05
 max_std: 2
 temperature: 0.5
